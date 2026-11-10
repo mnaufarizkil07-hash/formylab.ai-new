@@ -1,0 +1,18 @@
+Ingredient_id,nama_bahan,persen_w_w,quantity_g,supplier_id,supplier,key,stock,lead_time_hari
+ING-002,Disodium EDTA,0.025,0.25,SUP-05,Shandong Fine Chemical Co.,ING-002|SUP-05,available,17
+ING-003,Gliserin,3.0,30.0,SUP-04,Global Chemtrade Pte Ltd,ING-003|SUP-04,available,9
+ING-004,Acrylic acid copolymer,2.0,20.0,SUP-01,PT Kimia Sejahtera Nusantara,ING-004|SUP-01,available,5
+ING-005,Propilen glikol,1.0,10.0,SUP-05,Shandong Fine Chemical Co.,ING-005|SUP-05,available,49
+ING-006,Ekstrak Aloe vera,2.0,20.0,SUP-04,Global Chemtrade Pte Ltd,ING-006|SUP-04,available,28
+ING-007,Carbopol ETD 2020,0.5,5.0,SUP-04,Global Chemtrade Pte Ltd,ING-007|SUP-04,available,23
+ING-008,Mineral oil,10.0,100.0,SUP-02,CV Aneka Bahan Kosmetika,ING-008|SUP-02,available,10
+ING-009,Gliseril stearat,4.986,49.86,SUP-05,Shandong Fine Chemical Co.,ING-009|SUP-05,available,39
+ING-010,PEG-100 stearat,5.014,50.14,SUP-01,PT Kimia Sejahtera Nusantara,ING-010|SUP-01,available,3
+ING-011,Minyak almond,2.0,20.0,SUP-04,Global Chemtrade Pte Ltd,ING-011|SUP-04,available,20
+ING-012,Setil alkohol,4.5,45.0,SUP-01,PT Kimia Sejahtera Nusantara,ING-012|SUP-01,available,5
+ING-013,Dimethicone,0.01,0.1,SUP-05,Shandong Fine Chemical Co.,ING-013|SUP-05,available,13
+ING-014,Dimethiconol,0.19,1.9,SUP-04,Global Chemtrade Pte Ltd,ING-014|SUP-04,available,32
+ING-015,Alfa tokoferol (Vitamin E),0.5,5.0,SUP-01,PT Kimia Sejahtera Nusantara,ING-015|SUP-01,available,4
+ING-016,Phenoxyethanol & ethylhexylglycerin,1.0,10.0,SUP-05,Shandong Fine Chemical Co.,ING-016|SUP-05,available,17
+ING-017,NaOH,0.15,1.5,SUP-01,PT Kimia Sejahtera Nusantara,ING-017|SUP-01,available,5
+ING-001,Aquadest / purified water,63.125,631.25,SUP-04,Global Chemtrade Pte Ltd,ING-001|SUP-04,available,24

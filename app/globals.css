@@ -1,0 +1,81 @@
+@import "tailwindcss";
+
+@theme {
+  /* 4 Warna Paten Lu */
+  --color-brume: #C2F2E4;
+  --color-menthe: #35C8B4;
+  --color-limonade: #EDF7BE;
+  --color-verveine: #A4CF4A;
+  
+  --color-base: #F8FBFB; 
+  --color-navy: #1B2A4A; 
+}
+
+html,
+body {
+  background-color: var(--color-base);
+  color: var(--color-navy);
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+html::-webkit-scrollbar,
+body::-webkit-scrollbar,
+*::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+.glass-card {
+  background: rgba(255, 255, 255, 0.7);
+  backdrop-filter: blur(20px) saturate(140%);
+  -webkit-backdrop-filter: blur(20px) saturate(140%);
+  border: 1px solid rgba(255, 255, 255, 0.8);
+  border-radius: 24px;
+  box-shadow: 0 10px 40px rgba(53, 200, 180, 0.15);
+}
+
+/* --- ANIMASI GRADASI 4 WARNA (Buat Halaman Login) --- */
+.bg-gradasi-animasi {
+  background: linear-gradient(
+    -45deg,
+    var(--color-brume),
+    var(--color-menthe),
+    var(--color-limonade),
+    var(--color-verveine)
+  );
+  background-size: 400% 400%;
+  animation: gradientGerak 10s ease infinite;
+}
+
+@keyframes gradientGerak {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
+/* --- ANIMASI MESH GRADIENT (Buat Dashboard) --- */
+@keyframes gerakBlob {
+  0% { transform: translate(0px, 0px) scale(1) rotate(0deg); }
+  33% { transform: translate(80px, -100px) scale(1.2) rotate(10deg); }
+  66% { transform: translate(-60px, 80px) scale(0.8) rotate(-10deg); }
+  100% { transform: translate(0px, 0px) scale(1) rotate(0deg); }
+}
+
+.blob-animasi {
+  animation: gerakBlob 12s infinite alternate ease-in-out;
+}
+.delay-1 { animation-delay: 0s; }
+.delay-2 { animation-delay: -3s; }
+.delay-3 { animation-delay: -7s; }
+.delay-4 { animation-delay: -10s; }
+
+@keyframes progressFill {
+  0% { width: 0%; }
+  100% { width: 100%; }
+}
+
+.animate-progress-fill {
+  animation: progressFill 5s linear infinite;
+}
