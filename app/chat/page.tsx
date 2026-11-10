@@ -386,12 +386,12 @@ export default function ChatPage() {
         {/* MAIN CONSOLE AREA */}
         <main className="md:col-span-3 flex flex-col justify-between h-[680px] md:h-full min-h-0 bg-white/90 backdrop-blur-sm rounded-3xl p-5 sm:p-6 shadow-sm border border-white">
           {/* HEADER SESI AKTIF */}
-          <div className="shrink-0 pb-3 mb-3 border-b border-gray-100 flex items-center justify-between">
-            <div>
-              <h1 className="text-base font-extrabold text-gray-900">
+          <div className="shrink-0 pb-3 mb-3 border-b border-gray-100 flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <h1 className="text-base font-extrabold text-gray-900 truncate">
                 {activeSession?.title || "Konsultasi Formulasi"}
               </h1>
-              <div className="flex items-center gap-1.5 text-xs text-gray-500 mt-0.5">
+              <div className="flex flex-wrap items-center gap-1.5 text-xs text-gray-500 mt-0.5">
                 <span>Model:</span>
                 <span className="inline-flex items-center gap-1 font-bold text-[#234e42]">
                   <ModelIcon
@@ -400,6 +400,10 @@ export default function ChatPage() {
                     idSuffix="session-sub"
                   />
                   {activeModelOption.name}
+                </span>
+                <span className="hidden sm:inline text-gray-300">•</span>
+                <span className="hidden sm:inline text-[11px] text-emerald-700 font-medium truncate">
+                  {activeModelOption.description}
                 </span>
               </div>
             </div>
@@ -421,16 +425,16 @@ export default function ChatPage() {
                   saveStoredSessions(updated);
                 }
               }}
-              className="text-xs text-gray-500 hover:text-red-600 font-semibold px-2.5 py-1 rounded-lg border border-gray-200 hover:bg-gray-50 transition cursor-pointer"
+              className="shrink-0 text-xs text-gray-500 hover:text-red-600 font-semibold px-2.5 py-1 rounded-lg border border-gray-200 hover:bg-gray-50 transition cursor-pointer"
             >
               Bersihkan Chat
             </button>
           </div>
 
-          {/* DAFTAR PESAN PERCAKAPAN */}
+          {/* DAFTAR PESAN PERCAKAPAN (PENUH TANPA TERHALANG TOPIK CEPAT) */}
           <div
             ref={messagesContainerRef}
-            className="flex-1 min-h-0 overflow-y-auto space-y-4 pr-1"
+            className="flex-1 min-h-0 overflow-y-auto space-y-4 pr-1 pb-2"
           >
             {activeSession?.messages.map((msg, msgIdx) => {
               const isUser = msg.role === "user";
@@ -556,6 +560,29 @@ export default function ChatPage() {
               );
             })}
 
+            {/* TOPIK FORMULASI CEPAT: Hanya tampil di dalam ruang chat saat sesi masih kosong agar tidak menghalangi room chat saat percakapan berlangsung */}
+            {(activeSession?.messages.filter((m) => m.role === "user").length || 0) === 0 &&
+              !isLoading && (
+                <div className="pt-2 pl-12">
+                  <div className="text-[10px] font-bold text-green-900/70 mb-2 uppercase tracking-wider">
+                    💡 Topik Formulasi Cepat (Klik untuk Mulai):
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-w-[85%]">
+                    {quickPrompts.map((prompt, idx) => (
+                      <button
+                        key={idx}
+                        type="button"
+                        onClick={() => handleSendMessage(prompt, [])}
+                        disabled={isLoading}
+                        className="text-xs bg-green-50/90 hover:bg-green-100 text-[#234e42] font-semibold px-3.5 py-2.5 rounded-2xl border border-green-200/80 shadow-2xs transition cursor-pointer text-left disabled:opacity-50"
+                      >
+                        {prompt}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
             {isLoading && (
               <div className="flex gap-3 justify-start items-center">
                 <div className="w-9 h-9 rounded-full bg-[#17181c] text-white border border-gray-200 flex items-center justify-center shadow-xs">
@@ -566,7 +593,7 @@ export default function ChatPage() {
                   />
                 </div>
                 <div className="bg-white/80 backdrop-blur-sm px-5 py-3 rounded-2xl text-xs font-semibold text-green-900 border border-green-100 animate-pulse">
-                  {activeModelOption.name} sedang menganalisis & merumuskan
+                  {activeModelOption.name} sedang menganalisis &amp; merumuskan
                   jawaban...
                 </div>
               </div>
@@ -579,28 +606,8 @@ export default function ChatPage() {
             )}
           </div>
 
-          {/* QUICK PROMPTS INSPIRASI */}
-          <div className="my-2.5 pt-2">
-            <div className="text-[10px] font-bold text-green-900/70 mb-1.5 uppercase tracking-wider">
-              💡 Topik Formulasi Cepat:
-            </div>
-            <div className="flex flex-wrap gap-1.5">
-              {quickPrompts.map((prompt, idx) => (
-                <button
-                  key={idx}
-                  type="button"
-                  onClick={() => handleSendMessage(prompt, [])}
-                  disabled={isLoading}
-                  className="text-[11px] bg-green-50 hover:bg-green-100 text-[#234e42] font-semibold px-2.5 py-1 rounded-xl border border-green-200 shadow-2xs transition cursor-pointer text-left disabled:opacity-50"
-                >
-                  {prompt}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* CHAT BAR COMPOSER SESUAI GAMBAR KE-2 & KE-3 */}
-          <div className="mt-1">
+          {/* CHAT BAR COMPOSER */}
+          <div className="mt-3 shrink-0">
             <ChatComposerBar
               selectedModel={selectedModel}
               onSelectModel={handleSelectModel}

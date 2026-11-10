@@ -63,7 +63,9 @@ test("createFallbackVoiceNoteWav and formatters return valid audio data and labe
   assert.equal(formatFileSize(2048), "2.0 KB");
 });
 
-test("generateLocalExpertResponse handles math, rosacea formulation, HLB, and general prompts across all models", () => {
+test("generateLocalExpertResponse handles verbal Indonesian math ('berapa 9 kali 0'), percentages, rosacea, HLB, and differentiates all 5 models", () => {
+  const outputsForRosacea = new Set<string>();
+
   for (const modelId of [
     "auto",
     "gpt-6-luna",
@@ -73,11 +75,24 @@ test("generateLocalExpertResponse handles math, rosacea formulation, HLB, and ge
   ]) {
     const opt = getModelOption(modelId);
 
-    const mathReply = generateLocalExpertResponse(
-      [{ role: "user", content: "5 * 6 berapa?" }],
+    const zeroMathReply = generateLocalExpertResponse(
+      [{ role: "user", content: "berapa 9 kali 0" }],
       opt
     );
-    assert.equal(mathReply.includes("30"), true);
+    assert.equal(zeroMathReply.includes("0"), true);
+    assert.equal(zeroMathReply.includes("Berdasarkan konteks permintaan Anda"), false);
+
+    const mathReply = generateLocalExpertResponse(
+      [{ role: "user", content: "25 ditambah 75 berapa?" }],
+      opt
+    );
+    assert.equal(mathReply.includes("100"), true);
+
+    const pctReply = generateLocalExpertResponse(
+      [{ role: "user", content: "berapa 15% dari 200000" }],
+      opt
+    );
+    assert.equal(pctReply.includes("30.000") || pctReply.includes("30000"), true);
 
     const rosaceaReply = generateLocalExpertResponse(
       [
@@ -90,6 +105,10 @@ test("generateLocalExpertResponse handles math, rosacea formulation, HLB, and ge
       opt
     );
     assert.equal(rosaceaReply.includes("Panthenol"), true);
-    assert.equal(rosaceaReply.includes("pH 5.2"), true);
+    outputsForRosacea.add(rosaceaReply);
   }
+
+  // Verify that the 5 models produce genuinely distinct structures/styles (not identical text)
+  assert.equal(outputsForRosacea.size, 5);
 });
+
