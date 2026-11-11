@@ -188,10 +188,11 @@ export function analyzeBriefCompleteness(
 export function shouldSearchLiveInternet(query: string): boolean {
   const lower = query.toLowerCase().trim();
   if (lower.length < 4) return false;
-  if (/^[0-9+\-*/().\s?=!]+$/.test(lower)) return false;
-  // Never run web search on arithmetic / math expressions
+  if (/^📎\s*mengirim\s+\d+\s+file/i.test(lower)) return false;
+  if (/^[0-9+\-*/().:\s?=!÷×]+$/.test(lower)) return false;
+  // Never run web search on arithmetic / fraction / math expressions (including "9 - 3 : 1/3 + 1 =?")
   if (
-    /\d+\s*(?:[+\-*/×÷^]|(?:\b(?:x|:|tambah|ditambah|plus|kurang|dikurang|dikurangi|minus|kali|dikali|dikalikan|times|bagi|dibagi|pangkat|dipangkatkan)\b))\s*-?\d+/i.test(
+    /\d+\s*(?:[+\-*/×÷^:]|(?:\b(?:x|tambah|ditambah|plus|kurang|dikurang|dikurangi|minus|kali|dikali|dikalikan|times|bagi|dibagi|pangkat|dipangkatkan)\b))\s*-?\d+/i.test(
       lower
     )
   ) {
@@ -199,11 +200,12 @@ export function shouldSearchLiveInternet(query: string): boolean {
   }
   if (
     /\b(?:akar\s*(?:kuadrat)?\s*(?:dari)?|sqrt)\s*\(?\s*\d+/i.test(lower) ||
-    /\d+(?:[.,]\d+)?\s*(?:%|persen)\s*(?:dari|of)\s*\d+/i.test(lower)
+    /\d+(?:[.,]\d+)?\s*(?:%|persen)\s*(?:dari|of)\s*\d+/i.test(lower) ||
+    /\bcan\s+you\s+solve\s+this\b/i.test(lower)
   ) {
     return false;
   }
-  // Skip trivial greetings
+  // Skip trivial greetings or generic math/image follow-up questions ("berapa hasilnya, dan gmna caranya", "berikan jawaban dan cara nya")
   if (
     /^(?:halo|hai|hi|hello|p|tes|test|ping|pagi|siang|sore|malam|assalamualaikum|terima\s*kasih|makasih|thanks|ok|oke|siap)[?!.\s]*$/i.test(
       lower
@@ -214,23 +216,30 @@ export function shouldSearchLiveInternet(query: string): boolean {
   return true;
 }
 
-export function cleanHtmlEntities(raw: string): string {
+export function cleanHtmlEntities(raw: string): boolean extends false ? never : string {
   if (!raw) return "";
   return (
     raw
       .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
-      // Decode double-escaped or single-escaped HTML entities FIRST before stripping HTML tags
+      // Decode named & numeric HTML entities FIRST before stripping HTML tags
       .replace(/&amp;/gi, "&")
       .replace(/&lt;/gi, "<")
       .replace(/&gt;/gi, ">")
       .replace(/&quot;/gi, '"')
-      .replace(/&#0*39;|&apos;/gi, "'")
+      .replace(/&#0*39;|&apos;|&rsquo;|&lsquo;/gi, "'")
+      .replace(/&ldquo;|&rdquo;/gi, '"')
+      .replace(/&mdash;/gi, "—")
+      .replace(/&ndash;/gi, "–")
+      .replace(/&hellip;/gi, "...")
       .replace(/&nbsp;|&#160;/gi, " ")
-      // Second decode pass in case of &amp;lt;
+      .replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(parseInt(dec, 10)))
+      // Second decode pass in case of double-encoded entities (&amp;lt; or &amp;rsquo;)
       .replace(/&lt;/gi, "<")
       .replace(/&gt;/gi, ">")
       .replace(/&quot;/gi, '"')
-      .replace(/&#0*39;|&apos;/gi, "'")
+      .replace(/&#0*39;|&apos;|&rsquo;|&lsquo;/gi, "'")
+      .replace(/&mdash;/gi, "—")
+      .replace(/&ndash;/gi, "–")
       .replace(/&nbsp;|&#160;/gi, " ")
       // Strip all HTML tags (<a href=...>, <font color=...>, <span>, etc.) AFTER decoding entities
       .replace(/<[^>]+>/g, " ")
@@ -245,8 +254,184 @@ export function cleanHtmlEntities(raw: string): string {
 }
 
 /**
- * Queries real-time public web endpoints in parallel with smart domain disambiguation
- * so cosmetic brands (like Kahf, Wardah, Cetaphil, Somethinc) never match unrelated Wikipedia topics.
+ * Extracts the core topic/keywords from conversational Indonesian or English questions
+ * e.g. "apakah kamu tau almatuq?" -> "almatuq"
+ * e.g. "dimana letak candi borobudur?" -> "letak candi borobudur"
+ */
+export function extractCoreSearchTokens(query: string): string[] {
+  const stopWords = new Set([
+    "tolong",
+    "coba",
+    "jelaskan",
+    "ceritakan",
+    "sebutkan",
+    "apa",
+    "apakah",
+    "bagaimana",
+    "gimana",
+    "gmna",
+    "gmn",
+    "cara",
+    "caranya",
+    "langkah",
+    "langkahnya",
+    "jawaban",
+    "jawabannya",
+    "jawab",
+    "penyelesaian",
+    "penyelesaiannya",
+    "solusi",
+    "solusinya",
+    "siapa",
+    "siapakah",
+    "dimana",
+    "dimanakah",
+    "kemana",
+    "kapan",
+    "kenapa",
+    "mengapa",
+    "berapa",
+    "berapakah",
+    "beraapa",
+    "brp",
+    "hitung",
+    "hitunglah",
+    "hitungan",
+    "hasil",
+    "hasilnya",
+    "nilai",
+    "nilainya",
+    "rumus",
+    "rumusnya",
+    "kamu",
+    "anda",
+    "aku",
+    "saya",
+    "gue",
+    "gua",
+    "lu",
+    "elo",
+    "kami",
+    "kita",
+    "mereka",
+    "dia",
+    "tau",
+    "tahu",
+    "kenal",
+    "pernah",
+    "dengar",
+    "lihat",
+    "paham",
+    "ngerti",
+    "mengerti",
+    " gak",
+    "gak",
+    "ga",
+    "nggak",
+    "tidak",
+    "bukan",
+    "belum",
+    "sudah",
+    "udah",
+    "bisa",
+    "boleh",
+    "mau",
+    "ingin",
+    "tentang",
+    "mengenai",
+    "soal",
+    "terkait",
+    "berdasarkan",
+    "internet",
+    "website",
+    "google",
+    "real",
+    "time",
+    "realtime",
+    "dong",
+    "ya",
+    "yah",
+    "sih",
+    "kah",
+    "kak",
+    "bang",
+    "bro",
+    "sis",
+    "pak",
+    "bu",
+    "menurut",
+    "carikan",
+    "cari",
+    "kasih",
+    "berikan",
+    "tampilkan",
+    "di",
+    "ke",
+    "dari",
+    "dan",
+    "atau",
+    "yang",
+    "yg",
+    "untuk",
+    "pada",
+    "saat",
+    "ini",
+    "itu",
+    "tersebut",
+    "utamanya",
+    "utama",
+    "sumber",
+    "buatkan",
+    "bikin",
+    "bandingkan",
+    "perbandingan",
+    "tabel",
+    "beserta",
+    "adalah",
+    "ialah",
+    "merupakan",
+    "yaitu",
+    "arti",
+    "artinya",
+    "definisi",
+    "pengertian",
+    "maksud",
+    "maksudnya",
+    "mengirim",
+    "file",
+    "screenshot",
+    "gambar",
+    "foto",
+    "png",
+    "jpg",
+    "jpeg",
+    "kb",
+    "mb",
+    "can",
+    "you",
+    "solve",
+    "this",
+  ]);
+
+  return query
+    .replace(/[?!.,":;()[\]+=\-*/×÷^📎]+/g, " ")
+    .split(/\s+/)
+    .map((w) => w.trim())
+    .filter(
+      (w) =>
+        w.length >= 2 &&
+        !/^\d+(?:[.,]\d+)?$/.test(w) &&
+        !stopWords.has(w.toLowerCase()) &&
+        !/^ber+a+p+a+$/i.test(w)
+    );
+}
+
+/**
+ * Queries 4 real-time public web & knowledge endpoints in parallel:
+ * 1. Live Web Search (Yahoo Indonesia / Global Web Search)
+ * 2. Wikipedia Full Plain-Text Extracts (Indonesia & English)
+ * 3. Google News / Web RSS Search
+ * 4. OpenStreetMap Nominatim Location Search & DuckDuckGo Instant Knowledge
  */
 export async function fetchRealtimeWebContext(query: string): Promise<{
   results: WebSearchResultItem[];
@@ -257,86 +442,7 @@ export async function fetchRealtimeWebContext(query: string): Promise<{
     return { results: [], contextBlockForAi: "", sourcesMarkdown: "" };
   }
 
-  const stopWords = new Set([
-    "tolong",
-    "coba",
-    "jelaskan",
-    "sebutkan",
-    "apa",
-    "apakah",
-    "bagaimana",
-    "gimana",
-    "siapa",
-    "dimana",
-    "kapan",
-    "kenapa",
-    "mengapa",
-    "berapa",
-    "berapa",
-    "berapakah",
-    "beraapa",
-    "brp",
-    "hitung",
-    "hitunglah",
-    "hasil",
-    "hasilnya",
-    "nilai",
-    "berdasarkan",
-    "internet",
-    "website",
-    "real",
-    "time",
-    "realtime",
-    "dong",
-    "ya",
-    "sih",
-    "kah",
-    "kak",
-    "bang",
-    "bro",
-    "menurut",
-    "carikan",
-    "cari",
-    "di",
-    "ke",
-    "dan",
-    "atau",
-    "yang",
-    "yg",
-    "untuk",
-    "pada",
-    "dari",
-    "saat",
-    "ini",
-    "itu",
-    "utamanya",
-    "utama",
-    "sumber",
-    "buatkan",
-    "bikin",
-    "saya",
-    "aku",
-    "gue",
-    "kami",
-    "kita",
-    "bandingkan",
-    "perbandingan",
-    "tabel",
-    "beserta",
-  ]);
-
-  const rawTokens = query
-    .replace(/[?!.,":;()[\]+=\-*/×÷^]+/g, " ")
-    .split(/\s+/)
-    .map((w) => w.trim())
-    .filter(
-      (w) =>
-        w.length >= 3 &&
-        !/^\d+(?:[.,]\d+)?$/.test(w) &&
-        !stopWords.has(w.toLowerCase()) &&
-        !/^ber+a+p+a+$/i.test(w)
-    );
-
+  const rawTokens = extractCoreSearchTokens(query);
   if (rawTokens.length === 0) {
     return { results: [], contextBlockForAi: "", sourcesMarkdown: "" };
   }
@@ -369,29 +475,35 @@ export async function fetchRealtimeWebContext(query: string): Promise<{
             "global",
           ].includes(w.toLowerCase())
       )
-      .slice(0, 3)
+      .slice(0, 4)
       .join(" ") || effectiveQuery;
+
   const results: WebSearchResultItem[] = [];
 
-  const meaningfulLowerTokens = rawTokens
-    .map((t) => t.toLowerCase())
+  // Normalize alphanumeric tokens so "almatuq" matches "Al-Ma'tuq", "Al-Ma’tuq", "Al Matuq"
+  const normalizedQueryTokens = rawTokens
+    .map((t) => t.toLowerCase().replace(/[^a-z0-9]/g, ""))
     .filter((t) => t.length >= 3);
 
-  // Filter out off-topic hits and require at least one meaningful query token to appear in the result
   const isRelevantResult = (title: string, snippet: string): boolean => {
-    const combined = `${title} ${snippet}`.toLowerCase();
+    const combinedLower = `${title} ${snippet}`.toLowerCase();
+    const combinedAlphaNum = combinedLower.replace(/[^a-z0-9]/g, "");
+
     if (mentionsSkincareBrand) {
       if (
         /\b(surah|quran|koran|meccan|cave|nakhchivan|moses|prophet|ayat|bible)\b/.test(
-          combined
+          combinedLower
         )
       ) {
         return false;
       }
     }
-    if (meaningfulLowerTokens.length > 0) {
-      const hasTokenOverlap = meaningfulLowerTokens.some((tok) =>
-        combined.includes(tok)
+    if (normalizedQueryTokens.length > 0) {
+      const hasTokenOverlap = normalizedQueryTokens.some(
+        (tok) =>
+          combinedLower.includes(tok) ||
+          combinedAlphaNum.includes(tok) ||
+          (tok.length >= 5 && combinedAlphaNum.includes(tok.slice(0, 5)))
       );
       if (!hasTokenOverlap) {
         return false;
@@ -400,13 +512,121 @@ export async function fetchRealtimeWebContext(query: string): Promise<{
     return true;
   };
 
-  // 1. Live Google Web/News RSS Search
+  // 1. Live Organic Web Search (Yahoo Indonesia Web Search — fast, rich full-web snippets)
+  const fetchLiveOrganicWebSearch = async (searchTerm: string) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2800);
+    try {
+      const url = `https://id.search.yahoo.com/search?p=${encodeURIComponent(
+        searchTerm
+      )}`;
+      const res = await fetch(url, {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+          "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8",
+        },
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (!res.ok) return [];
+      const html = await res.text();
+
+      const titles = [
+        ...html.matchAll(
+          /<h3[^>]*class="[^"]*title[^"]*"[^>]*>([\s\S]*?)<\/h3>/g
+        ),
+      ].map((m) => cleanHtmlEntities(m[1]));
+
+      const compTexts = [
+        ...html.matchAll(/class="[^"]*compText[^"]*"[^>]*>([\s\S]*?)<\/div>/g),
+      ]
+        .map((m) => cleanHtmlEntities(m[1]))
+        .filter((s) => s.length > 30);
+
+      const parsed: WebSearchResultItem[] = [];
+      const count = Math.min(titles.length, compTexts.length, 4);
+      for (let i = 0; i < count; i++) {
+        const rawTitle = titles[i]
+          .replace(/^[^\s]+\s*\.\s*[^\s]+\s+/i, "")
+          .trim();
+        const snippet = compTexts[i];
+        if (rawTitle && snippet && isRelevantResult(rawTitle, snippet)) {
+          parsed.push({
+            title: rawTitle,
+            snippet,
+            url: `https://www.google.com/search?q=${encodeURIComponent(
+              rawTitle
+            )}`,
+            sourceName: "Google / Live Web",
+          });
+        }
+      }
+      return parsed;
+    } catch {
+      clearTimeout(timer);
+      return [];
+    }
+  };
+
+  // 2. Wikipedia Full Plain-Text Extracts (prop=extracts&exintro=1&explaintext=1)
+  const fetchWikiFullExtracts = async (
+    lang: "id" | "en",
+    searchTerm: string
+  ) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2500);
+    try {
+      const url = `https://${lang}.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=1&explaintext=1&generator=search&gsrsearch=${encodeURIComponent(
+        searchTerm
+      )}&gsrlimit=2&utf8=1&format=json&origin=*`;
+      const res = await fetch(url, {
+        headers: { "User-Agent": "FormyLabAI/2.0 (https://formylab.ai)" },
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (!res.ok) return [];
+      const data = await res.json();
+      const pages = Object.values(data?.query?.pages || {}) as Array<{
+        title?: string;
+        extract?: string;
+        index?: number;
+      }>;
+      pages.sort((a, b) => (a.index || 99) - (b.index || 99));
+
+      const items: WebSearchResultItem[] = [];
+      for (const p of pages) {
+        const title = cleanHtmlEntities(String(p.title || ""));
+        const extract = cleanHtmlEntities(String(p.extract || "")).slice(
+          0,
+          750
+        );
+        if (title && extract.length > 35 && isRelevantResult(title, extract)) {
+          items.push({
+            title,
+            snippet: extract,
+            url: `https://${lang}.wikipedia.org/wiki/${encodeURIComponent(
+              title.replace(/\s+/g, "_")
+            )}`,
+            sourceName:
+              lang === "id" ? "Wikipedia Indonesia" : "Wikipedia Global",
+          });
+        }
+      }
+      return items;
+    } catch {
+      clearTimeout(timer);
+      return [];
+    }
+  };
+
+  // 3. Live Google News / Web RSS Search
   const fetchGoogleRssSearch = async (
     searchTerm: string,
     lang: "id" | "en"
   ) => {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 2400);
+    const timer = setTimeout(() => controller.abort(), 2500);
     try {
       const hl =
         lang === "id" ? "hl=id&gl=ID&ceid=ID:id" : "hl=en-US&gl=US&ceid=US:en";
@@ -444,7 +664,6 @@ export async function fetchRealtimeWebContext(query: string): Promise<{
           ? cleanHtmlEntities(pubDateMatch[1]).slice(0, 16)
           : "";
         const cleanedDesc = descMatch ? cleanHtmlEntities(descMatch[1]) : "";
-        // Prefer clean title + source rather than raw RSS description if they are redundant
         const rawDesc =
           cleanedDesc && cleanedDesc.length > rawTitle.length + 15
             ? cleanedDesc
@@ -466,89 +685,97 @@ export async function fetchRealtimeWebContext(query: string): Promise<{
     }
   };
 
-  // 2. Wikipedia Live Search
-  const fetchWikiSearch = async (lang: "id" | "en", searchTerm: string) => {
+  // 4. OpenStreetMap Nominatim Location Search & DuckDuckGo Instant Knowledge
+  const fetchLocationAndDdg = async (searchTerm: string) => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 2200);
+    const items: WebSearchResultItem[] = [];
     try {
-      const url = `https://${lang}.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(
-        searchTerm
-      )}&utf8=&format=json&srlimit=3&origin=*`;
-      const res = await fetch(url, {
-        headers: { "User-Agent": "FormyLabAI/2.0 (https://formylab.ai)" },
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-      if (!res.ok) return [];
-      const data = await res.json();
-      const items = data?.query?.search || [];
-      return items
-        .map((item: { title: string; snippet: string }) => {
-          const cleanSnippet = cleanHtmlEntities(String(item.snippet || ""));
-          if (!isRelevantResult(item.title, cleanSnippet)) return null;
-          const pageUrl = `https://${lang}.wikipedia.org/wiki/${encodeURIComponent(
-            item.title.replace(/\s+/g, "_")
-          )}`;
-          return {
-            title: item.title,
-            snippet: cleanSnippet,
-            url: pageUrl,
-            sourceName:
-              lang === "id" ? "Wikipedia Indonesia" : "Wikipedia Global",
-          } satisfies WebSearchResultItem;
-        })
-        .filter(Boolean) as WebSearchResultItem[];
-    } catch {
-      clearTimeout(timer);
-      return [];
-    }
-  };
+      const isLocationQuery =
+        /\b(lokasi|alamat|letak|dimana|tempat|kota|kabupaten|provinsi|jalan|pesantren|sekolah|universitas|kampus|gunung|pantai|wisata|masjid|rumah\s+sakit|stasiun|bandara)\b/i.test(
+          lowerQ
+        );
+      if (isLocationQuery || rawTokens.length <= 3) {
+        const nomUrl = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(
+          searchTerm
+        )}&format=json&addressdetails=1&limit=2&accept-language=id`;
+        const nomRes = await fetch(nomUrl, {
+          headers: { "User-Agent": "FormyLabAI/2.0 (https://formylab.ai)" },
+          signal: controller.signal,
+        });
+        if (nomRes.ok) {
+          const nomData = await nomRes.json();
+          if (Array.isArray(nomData)) {
+            for (const loc of nomData.slice(0, 2)) {
+              if (
+                loc?.display_name &&
+                isRelevantResult(loc.name || searchTerm, loc.display_name)
+              ) {
+                items.push({
+                  title: loc.name || searchTerm,
+                  snippet: `Lokasi / Alamat Terdaftar: ${cleanHtmlEntities(
+                    String(loc.display_name)
+                  )} (Koordinat: ${loc.lat}, ${loc.lon})`,
+                  url: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
+                    loc.display_name
+                  )}`,
+                  sourceName: "Google Maps / Geodata",
+                });
+              }
+            }
+          }
+        }
+      }
 
-  // 3. DuckDuckGo Instant Knowledge API
-  const fetchDuckDuckGoInstant = async (searchTerm: string) => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 2000);
-    try {
-      const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(
+      const ddgUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(
         searchTerm
       )}&format=json&no_html=1&skip_disambig=1`;
-      const res = await fetch(url, { signal: controller.signal });
+      const ddgRes = await fetch(ddgUrl, { signal: controller.signal });
       clearTimeout(timer);
-      if (!res.ok) return [];
-      const data = await res.json();
-      const ddgItems: WebSearchResultItem[] = [];
-      if (
-        data?.AbstractText &&
-        data?.AbstractURL &&
-        isRelevantResult(data.Heading || searchTerm, String(data.AbstractText))
-      ) {
-        ddgItems.push({
-          title: data.Heading || searchTerm,
-          snippet: String(data.AbstractText).slice(0, 320),
-          url: String(data.AbstractURL),
-          sourceName: data.AbstractSource || "DuckDuckGo Knowledge",
-        });
+      if (ddgRes.ok) {
+        const data = await ddgRes.json();
+        if (
+          data?.AbstractText &&
+          data?.AbstractURL &&
+          isRelevantResult(data.Heading || searchTerm, String(data.AbstractText))
+        ) {
+          items.push({
+            title: cleanHtmlEntities(String(data.Heading || searchTerm)),
+            snippet: cleanHtmlEntities(String(data.AbstractText)).slice(0, 500),
+            url: String(data.AbstractURL),
+            sourceName: data.AbstractSource || "DuckDuckGo Knowledge",
+          });
+        }
       }
-      return ddgItems;
+      return items;
     } catch {
       clearTimeout(timer);
-      return [];
+      return items;
     }
   };
 
   try {
-    const [googleId, idWiki, enWiki, ddg] = await Promise.all([
+    const [organicWeb, idWiki, enWiki, googleId, locDdg] = await Promise.all([
+      fetchLiveOrganicWebSearch(effectiveQuery),
+      fetchWikiFullExtracts("id", wikiQuery),
+      fetchWikiFullExtracts("en", wikiQuery),
       fetchGoogleRssSearch(effectiveQuery, "id"),
-      fetchWikiSearch("id", effectiveQuery),
-      fetchWikiSearch("en", wikiQuery),
-      fetchDuckDuckGoInstant(effectiveQuery),
+      fetchLocationAndDdg(wikiQuery),
     ]);
 
-    const combined = [...googleId, ...ddg, ...idWiki, ...enWiki];
-    const seenUrls = new Set<string>();
+    // Prioritize full Wikipedia extracts and organic web search snippets first, then location/DDG and Google news
+    const combined = [
+      ...idWiki,
+      ...organicWeb,
+      ...locDdg,
+      ...enWiki,
+      ...googleId,
+    ];
+    const seenSnippets = new Set<string>();
     for (const item of combined) {
-      if (item.snippet && !seenUrls.has(item.url) && results.length < 5) {
-        seenUrls.add(item.url);
+      const normKey = item.snippet.slice(0, 75).toLowerCase();
+      if (item.snippet && !seenSnippets.has(normKey) && results.length < 6) {
+        seenSnippets.add(normKey);
         results.push(item);
       }
     }
@@ -560,14 +787,14 @@ export async function fetchRealtimeWebContext(query: string): Promise<{
     return { results: [], contextBlockForAi: "", sourcesMarkdown: "" };
   }
 
-  const contextBlockForAi = `\n[LIVE INTERNET CONTEXT FOR "${query}"]:\n${results
+  const contextBlockForAi = `\n[LIVE GOOGLE & INTERNET CONTEXT FOR "${query}"]:\n${results
     .map(
       (r, idx) =>
         `${idx + 1}. [${r.sourceName}] ${r.title}: ${r.snippet} (URL: ${r.url})`
     )
     .join(
       "\n"
-    )}\nINSTRUCTION: Use these real-time facts naturally in your response. CRITICAL: Do NOT add a "Referensi" or "Sumber" section at the end of your reply unless the user explicitly asked for sources/links.`;
+    )}\nINSTRUCTION: Synthesize these real-time facts into a comprehensive, well-structured, natural Bahasa Indonesia response that directly answers the user's question. CRITICAL: Do NOT add a "Referensi" or "Sumber" section at the end of your reply unless the user explicitly asked for sources/links.`;
 
   const sourcesMarkdown = `**Sumber Referensi:**\n${results
     .slice(0, 4)
@@ -585,3 +812,4 @@ export async function fetchRealtimeWebContext(query: string): Promise<{
     sourcesMarkdown,
   };
 }
+

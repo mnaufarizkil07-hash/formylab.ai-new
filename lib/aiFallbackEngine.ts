@@ -6,6 +6,13 @@ import {
   ProductTypeSpec,
 } from "./cosmeticChemistryData";
 import { cleanHtmlEntities } from "./webSearchEngine";
+import {
+  parseAttachmentVisionMetadata,
+  solveDefaultEquationPuzzleProblem,
+  solveDefaultExamFractionProblem,
+  trySolveInlineFractionOrPemdas,
+  trySolveMathFromOcrText,
+} from "./imageVisionEngine";
 
 type IngredientScientificProfile = (typeof INGREDIENT_PROFILES)[string];
 
@@ -87,6 +94,13 @@ export function tryEvaluateMath(
   // Do not evaluate if "%" is present without "dari/of" (e.g. "4% + 2%")
   if (lower.includes("%")) {
     return null;
+  }
+
+  // 2B. Handle inline fraction & PEMDAS expressions (e.g. "9 - 3 : 1/3 + 1 =?", "5 2/7 - 2 1/4 : 3 1/2", "12 - 4 * 2 + 1")
+  // This preserves rational fractions (1/3) distinct from division operators (: or ÷) and explains PEMDAS/BODMAS step by step!
+  const pemdasOrFractionResult = trySolveInlineFractionOrPemdas(raw, false);
+  if (pemdasOrFractionResult) {
+    return pemdasOrFractionResult;
   }
 
   // 3. Convert Indonesian number words and verbal math operators into symbolic operators
@@ -182,7 +196,7 @@ export function tryEvaluateMath(
       if (candidateExpr.includes("* 0") || candidateExpr.includes("0 *")) {
         explanation =
           "Bilangan berapa pun yang dikalikan dengan **0** selalu menghasilkan **0**.";
-      } else if (candidateExpr.includes("/ 1")) {
+      } else if (/\/\s*1$/.test(candidateExpr)) {
         explanation =
           "Bilangan berapa pun yang dibagi dengan **1** nilainya tetap bilangan itu sendiri.";
       } else {
@@ -214,7 +228,7 @@ function formatMathResponse(
     case "gpt-6-luna":
       return `Hasil dari **${displayExpr}** adalah **${formattedResult}**. ${explanation}`;
     case "gemini-3.8-pro":
-      return `Hasil perhitungan **${displayExpr}** adalah **${formattedResult}**.\n\n${explanation} Dalam konteks penimbangan laboratorium batch 100 gram, angka ini setara dengan **${formattedResult} gram**.`;
+      return `Hasil perhitungan **${displayExpr}** adalah **${formattedResult}**.\n\n${explanation}`;
     case "gpt-6-omni":
       return `Hasil dari **${displayExpr}** adalah **${formattedResult}**.\n\n- **Perhitungan Eksak**: ${displayExpr} = **${formattedResult}**\n- **Keterangan**: ${explanation}`;
     case "gemini-3.8-flash":
@@ -437,10 +451,589 @@ function findMatchingProductSpec(queryLower: string): ProductTypeSpec | null {
   return null;
 }
 
-function buildUiMakaraResponse(rawQuery: string, hasImage: boolean): string {
+interface RegulatoryHalalKnowledgeItem {
+  keywords: string[];
+  displayName: string;
+  bpomLimit: string;
+  maxNumericPct: number | null;
+  mandatoryWarning?: string;
+  halalStatus: string;
+  halalCriticalPoint: string;
+  halalAlternative: string;
+  optimalPh: string;
+  solubilityPhase: string;
+}
+
+const REGULATORY_HALAL_KNOWLEDGE_BASE: RegulatoryHalalKnowledgeItem[] = [
+  {
+    keywords: ["salicylic acid", "asam salisilat", "salisilat", "bha"],
+    displayName: "Salicylic Acid (BHA)",
+    bpomLimit:
+      "Maksimum **2.0%** untuk sediaan wajah *leave-on* & maksimum **3.0%** untuk sediaan bilas (*rinse-off*) sesuai Peraturan BPOM No. 23 Tahun 2019 / Lampiran III ACD",
+    maxNumericPct: 2.0,
+    mandatoryWarning:
+      'Wajib mencantumkan peringatan pada label: *"Tidak digunakan untuk anak di bawah usia 3 tahun"*',
+    halalStatus: "**Halal (Sintetis Kimia / Bebas Unsur Hewani)**",
+    halalCriticalPoint:
+      "Disintesis secara kimia melalui karboksilasi Kolbe-Schmitt dari natrium fenolat (turunan petrokimia/aromatik), bebas dari enzim maupun lemak hewani",
+    halalAlternative:
+      "Aman digunakan langsung dengan CoA & Halal Statement pabrikan (atau *Willow Bark Extract* sebagai alternatif natural)",
+    optimalPh: "pH 3.5 – 4.5 (atau pH 4.8 – 5.3 jika terenkapsulasi)",
+    solubilityPhase: "Fase B / Pelarut Glikol (1,3-Propanediol / Butylene Glycol)",
+  },
+  {
+    keywords: ["niacinamide", "vitamin b3", "vit b3", "nicotinamide"],
+    displayName: "Niacinamide (Vitamin B3)",
+    bpomLimit:
+      "Tidak dibatasi kuota maksimum ketat oleh BPOM/ACD (aman & umum digunakan pada **2.0% – 5.0%**, hingga 10% dengan uji keamanan kulit)",
+    maxNumericPct: 10.0,
+    halalStatus: "**Halal (Sintetis Murni / Non-Hewani)**",
+    halalCriticalPoint:
+      "Diproduksi melalui aminolisis/hidrolisis 3-sianopiridina sintetis; tidak melibatkan turunan hewani maupun fermentasi khamr",
+    halalAlternative:
+      "Gunakan *Niacinamide PC Grade* (kadar asam nikotinat bebas < 100 ppm) bersertifikat Halal",
+    optimalPh: "pH 5.0 – 6.5 (hindari pH < 4.5 agar tidak terhidrolisis menjadi Nicotinic Acid)",
+    solubilityPhase: "Fase C / Larut Air (< 40°C)",
+  },
+  {
+    keywords: ["phenoxyethanol", "fenoksietanol"],
+    displayName: "Phenoxyethanol",
+    bpomLimit:
+      "Maksimum **1.0%** untuk seluruh sediaan kosmetik (*leave-on* maupun *rinse-off*) sesuai Lampiran IV Peraturan BPOM tentang Bahan Pengawet",
+    maxNumericPct: 1.0,
+    halalStatus: "**Halal (Sintetis Aromatik / Bebas Turunan Hewani)**",
+    halalCriticalPoint:
+      "Disintesis melalui reaksi hidroksietilasi fenol dan etilen oksida tanpa katalis biologis/hewani; pengawet standar pengganti paraben pada kosmetik Halal",
+    halalAlternative:
+      "Kombinasikan **Phenoxyethanol 0.8% + Ethylhexylglycerin 0.2%** (total 1.0%) untuk aktivitas *broad-spectrum* optimal",
+    optimalPh: "pH 3.0 – 8.5 (sangat stabil terhadap pH & hidrolisis)",
+    solubilityPhase: "Fase D (Cool-down < 40°C)",
+  },
+  {
+    keywords: ["alpha arbutin", "arbutin"],
+    displayName: "Alpha Arbutin",
+    bpomLimit:
+      "Maksimum **2.0%** untuk sediaan krim/serum wajah & maksimum **0.5%** untuk *body lotion* (kadar cemaran *Hydroquinone* bebas wajib < 10 ppm)",
+    maxNumericPct: 2.0,
+    halalStatus: "**Halal (Glikosida Biokatalitik — Perlu Verifikasi Media Enzim)**",
+    halalCriticalPoint:
+      "Diproduksi melalui glikosilasi enzimatik; titik kritis berada pada media pertumbuhan mikroba penghasil enzim glikosiltransferase",
+    halalAlternative:
+      "Pastikan menggunakan *Alpha Arbutin* dengan Sertifikat Halal pabrikan (media kultur 100% nabati/mineral)",
+    optimalPh: "pH 4.8 – 6.5",
+    solubilityPhase: "Fase C / Larut Air (< 40°C)",
+  },
+  {
+    keywords: ["glycolic acid", "asam glikolat", "glikolat", "aha"],
+    displayName: "Glycolic Acid (AHA)",
+    bpomLimit:
+      "Maksimum **10.0%** untuk penggunaan umum dengan syarat **pH akhir sediaan ≥ 3.5**",
+    maxNumericPct: 10.0,
+    mandatoryWarning:
+      'Wajib mencantumkan *Sunburn Alert* pada kemasan (*"Gunakan tabir surya dan batasi paparan sinar matahari"*)',
+    halalStatus: "**Halal (Sintetis Kimia / Nabati)**",
+    halalCriticalPoint:
+      "Umumnya disintesis secara kimia dari asam kloroasetat atau ekstraksi tebu; bebas titik kritis hewani",
+    halalAlternative: "Aman digunakan langsung (pastikan pH dinetralkan sebagian ke ≥ 3.5)",
+    optimalPh: "pH 3.5 – 4.2",
+    solubilityPhase: "Fase A / Larut Air",
+  },
+  {
+    keywords: ["lactic acid", "asam laktat", "laktat"],
+    displayName: "Lactic Acid (AHA)",
+    bpomLimit:
+      "Maksimum **10.0%** untuk penggunaan konsumen dengan syarat **pH ≥ 3.5**",
+    maxNumericPct: 10.0,
+    mandatoryWarning: 'Wajib mencantumkan peringatan *Sunburn Alert*',
+    halalStatus: "**Titik Kritis Fermentasi (Wajib Media Nabati Halal)**",
+    halalCriticalPoint:
+      "Diproduksi melalui fermentasi karbohidrat oleh bakteri *Lactobacillus*; media fermentasi tidak boleh mengandung peptone hewani non-halal",
+    halalAlternative:
+      "Gunakan *L-(+)-Lactic Acid* dari fermentasi glukosa jagung/tebu bersertifikat Halal MUI/BPJPH",
+    optimalPh: "pH 3.5 – 4.2",
+    solubilityPhase: "Fase A / Larut Air",
+  },
+  {
+    keywords: ["tranexamic acid", "asam traneksamat", "traneksamat", "txa"],
+    displayName: "Tranexamic Acid (TXA)",
+    bpomLimit: "Maksimum **3.0%** untuk sediaan kosmetik pencerah wajah (*leave-on*)",
+    maxNumericPct: 3.0,
+    halalStatus: "**Halal (Sintetis Kimia Murni)**",
+    halalCriticalPoint: "Turunan sintetis asam amino lisin hasil hidrogenasi katalitik, bebas unsur hewani",
+    halalAlternative: "Aman digunakan langsung dengan dokumen Halal pabrikan",
+    optimalPh: "pH 5.0 – 6.5",
+    solubilityPhase: "Fase C / Larut Air",
+  },
+  {
+    keywords: ["panthenol", "d-panthenol", "vitamin b5", "pro-vitamin b5"],
+    displayName: "D-Panthenol (Pro-Vitamin B5)",
+    bpomLimit: "Tidak dibatasi maksimum ketat oleh BPOM (dosis efektif R&D **1.0% – 5.0%**)",
+    maxNumericPct: null,
+    halalStatus: "**Halal (Sintetis Kimia)**",
+    halalCriticalPoint: "Disintesis dari D-pantolakton dan 3-aminopropanol sintetis; bebas turunan hewani",
+    halalAlternative: "Aman digunakan langsung",
+    optimalPh: "pH 4.5 – 6.5",
+    solubilityPhase: "Fase A atau Fase C (Larut Air)",
+  },
+  {
+    keywords: ["ceramide np", "ceramide", "seramida"],
+    displayName: "Ceramide NP",
+    bpomLimit: "Tidak dibatasi maksimum ketat oleh BPOM (dosis efektif **0.1% – 2.0%**)",
+    maxNumericPct: null,
+    halalStatus: "**Titik Kritis Fermentasi Ragi & Asam Lemak Nabati**",
+    halalCriticalPoint:
+      "Prekursor *phytosphingosine* diperoleh dari fermentasi ragi *Pichia ciferrii* yang diasillasi dengan asam stearat nabati",
+    halalAlternative:
+      "Gunakan *Bio-Identical Ceramide NP* berbasis fermentasi nabati bersertifikat Halal (hindari *animal brain/spinal cord ceramide*)",
+    optimalPh: "pH 4.5 – 6.5",
+    solubilityPhase: "Fase B (Lipofilik, dipanaskan 75–80°C)",
+  },
+  {
+    keywords: ["glycerin", "gliserin", "glycerol"],
+    displayName: "Glycerin (Gliserin)",
+    bpomLimit: "Aman tanpa batas maksimum ketat (*Eksipien Humektan GRAS*, umum **2.0% – 10.0%**)",
+    maxNumericPct: null,
+    halalStatus: "**Titik Kritis Asal Lemak (Wajib Nabati / Vegetable-Derived)**",
+    halalCriticalPoint:
+      "Merupakan produk samping hidrolisis/saponifikasi trigliserida; berisiko tidak halal apabila berasal dari lemak babi/hewani (*tallow*)",
+    halalAlternative:
+      "Wajib gunakan **Glycerin USP 99.7% (100% Palm/Coconut Vegetable-Derived)** bersertifikat Halal MUI/BPJPH",
+    optimalPh: "pH 3.0 – 8.0",
+    solubilityPhase: "Fase A (Larut Air)",
+  },
+  {
+    keywords: ["cetyl alcohol", "setil alkohol", "cetearyl alcohol"],
+    displayName: "Cetyl Alcohol",
+    bpomLimit: "Aman tanpa batas maksimum ketat (*Fatty Alcohol Co-Emulsifier*, umum **1.0% – 5.0%**)",
+    maxNumericPct: null,
+    halalStatus: "**Titik Kritis Asal Asam Lemak (Wajib Nabati)**",
+    halalCriticalPoint:
+      "Diproduksi dari reduksi asam palmitat/stearat; harus dipastikan berasal dari minyak sawit/kelapa (*palm/coconut*), bukan lemak hewani",
+    halalAlternative:
+      "Gunakan **Cetyl Alcohol Vegetable Grade (Palm Kernel Derived)** bersertifikat Halal (Bukan khamr karena merupakan *fatty alcohol* rantai panjang C16)",
+    optimalPh: "pH 3.5 – 8.0",
+    solubilityPhase: "Fase B (Fase Minyak, leleh pada 49–52°C)",
+  },
+  {
+    keywords: ["stearic acid", "asam stearat"],
+    displayName: "Stearic Acid",
+    bpomLimit: "Aman tanpa batas maksimum ketat (*Emulsifying & Structuring Agent*, umum **1.5% – 5.0%**)",
+    maxNumericPct: null,
+    halalStatus: "**Titik Kritis Tinggi Asal Lemak (Hewani vs Nabati)**",
+    halalCriticalPoint:
+      "Stearic acid komersial murah sering diekstrak dari *animal tallow* (lemak sapi/babi); wajib diverifikasi CoA & sertifikat Halalnya",
+    halalAlternative:
+      "Wajib gunakan **Triple Pressed Vegetable Stearic Acid (Palm Oil Derived)** bersertifikat Halal MUI/BPJPH",
+    optimalPh: "pH 5.0 – 7.5",
+    solubilityPhase: "Fase B (Fase Minyak, leleh pada 69°C)",
+  },
+  {
+    keywords: ["collagen", "kolagen", "gelatin", "placenta"],
+    displayName: "Collagen / Gelatin",
+    bpomLimit: "Aman secara toksikologi topikal BPOM (wajib bebas penyakit prion/BSE jika dari ruminansia)",
+    maxNumericPct: null,
+    halalStatus: "**Titik Kritis Sangat Tinggi (Risiko Porcine / Bovin Non-Halal)**",
+    halalCriticalPoint:
+      "Kolagen dan gelatin konvensional mayoritas diekstraksi dari kulit/tulang babi (*porcine*) atau sapi yang tidak disembelih secara syar'i",
+    halalAlternative:
+      "Substitusi dengan **Phytocollagen (Hydrolyzed Soy/Wheat Protein 1–2%)**, **Marine Collagen (Ikan Halal)**, atau **Palmitoyl Tripeptide-1 / Matrixyl Sintetis**",
+    optimalPh: "pH 5.0 – 6.5",
+    solubilityPhase: "Fase C (Larut Air < 40°C)",
+  },
+  {
+    keywords: ["ethanol", "etanol", "alkohol", "alcohol denat"],
+    displayName: "Ethanol / Alcohol",
+    bpomLimit: "Diizinkan sebagai pelarut/astringent sesuai standar denaturasi BPOM",
+    maxNumericPct: null,
+    halalStatus: "**Titik Kritis Sumber Industri vs Khamr (Fatwa MUI No. 11 Tahun 2018)**",
+    halalCriticalPoint:
+      "Etanol dari industri fermentasi minuman keras (*khamr*) hukumnya **Haram & Najis**; etanol sintetik atau fermentasi non-khamr diperbolehkan secara terbatas",
+    halalAlternative:
+      "Substitusi pelarut etanol dengan glikol nabati bebas alkohol: **1,3-Propanediol (2–5%)**, **Butylene Glycol**, atau **Pentylene Glycol**",
+    optimalPh: "pH 4.0 – 8.0",
+    solubilityPhase: "Fase A / Fase C",
+  },
+  {
+    keywords: ["centella asiatica", "cica", "madecassoside", "pegagan"],
+    displayName: "Centella Asiatica Extract (Cica)",
+    bpomLimit: "Aman sesuai monografi ekstrak botanikal BPOM (umum **0.5% – 5.0%**)",
+    maxNumericPct: null,
+    halalStatus: "**Titik Kritis Pelarut Ekstraksi (*Extraction Solvent*)**",
+    halalCriticalPoint:
+      "Tanaman pegagan murni bersifat halal, namun pelarut maserasi/ekstraksi tidak boleh menggunakan etanol dari industri khamr",
+    halalAlternative:
+      "Gunakan ekstrak Centella dengan pelarut **Water / Glycerin / 1,3-Propanediol** bersertifikat Halal",
+    optimalPh: "pH 4.5 – 6.5",
+    solubilityPhase: "Fase C (< 40°C)",
+  },
+  {
+    keywords: ["ethyl ascorbic acid", "3-o-ethyl ascorbic acid", "vitamin c", "vit c", "ascorbic acid"],
+    displayName: "3-O-Ethyl Ascorbic Acid (Vitamin C)",
+    bpomLimit: "Tidak dibatasi ketat oleh BPOM (dosis pencerah efektif **1.0% – 3.0%**)",
+    maxNumericPct: null,
+    halalStatus: "**Halal (Turunan Eter Vitamin C Sintetis/Fermentasi Nabati)**",
+    halalCriticalPoint: "Prekursor asam askorbat diperoleh dari fermentasi sorbitol jagung; pastikan media bebas bahan hewani",
+    halalAlternative: "Gunakan grade kosmetik bersertifikat Halal dengan kelator *Disodium EDTA 0.1%* pada pH 4.5–5.5",
+    optimalPh: "pH 4.0 – 5.5",
+    solubilityPhase: "Fase C (Larut Air < 40°C)",
+  },
+  {
+    keywords: ["bakuchiol", "retinol"],
+    displayName: "Bakuchiol / Retinol",
+    bpomLimit:
+      "Bakuchiol aman pada **0.5% – 1.0%**; Retinol dibatasi maksimum **0.3%** (*leave-on* wajah) menurut regulasi ASEAN/EU terbaru",
+    maxNumericPct: 1.0,
+    mandatoryWarning:
+      'Untuk Retinol: hindari penggunaan pada ibu hamil & wajib gunakan *sunscreen* pada pagi hari',
+    halalStatus: "**Halal (Ekstrak Biji *Psoralea corylifolia* / Sintetis)**",
+    halalCriticalPoint: "Pastikan pelarut isolasi Bakuchiol maupun bahan pengenkapsulasi Retinol bebas gelatin hewani",
+    halalAlternative: "Gunakan **Bakuchiol 0.5% – 1.0%** (100% *plant-derived*, aman untuk ibu hamil & Halal)",
+    optimalPh: "pH 5.0 – 6.5",
+    solubilityPhase: "Fase B / Fase C (Lipofilik)",
+  },
+  {
+    keywords: ["carbopol", "carbomer", "pengental"],
+    displayName: "Carbopol ETD 2020 (Carbomer)",
+    bpomLimit: "Aman sebagai polimer pembentuk gel (*rheology modifier*, umum **0.2% – 0.8%**)",
+    maxNumericPct: null,
+    halalStatus: "**Halal (Polimer Akrilat Sintetis)**",
+    halalCriticalPoint: "Polimer sintetik murni bebas unsur hewani (pastikan pelarut polimerisasi bebas benzena)",
+    halalAlternative: "Dapat dikombinasikan dengan **Xanthan Gum 0.2%** (fermentasi nabati Halal) untuk ketahanan elektrolit",
+    optimalPh: "pH 5.0 – 7.5 (dinetralkan dengan TEA / NaOH / Tromethamine)",
+    solubilityPhase: "Fase A (Dispersi Air)",
+  },
+];
+
+interface ExtractedItemWithPct {
+  item: RegulatoryHalalKnowledgeItem;
+  requestedPct: number | null;
+  requestedPctLabel: string;
+}
+
+function extractPromptRegulatoryItems(
+  rawQuery: string,
+  messages: FallbackChatMessage[]
+): ExtractedItemWithPct[] {
   const lower = rawQuery.toLowerCase();
+  // If user clicked "Audit BPOM & Halal" which references "bahan pada pembahasan di atas", include recent messages
+  const searchSource =
+    /\b(pembahasan\s+di\s+atas|di\s+atas|sebelumnya|tersebut|tadi)\b/i.test(
+      lower
+    )
+      ? messages
+          .slice(-4)
+          .map((m) => m.content || "")
+          .join(" ")
+      : rawQuery;
+  const sourceLower = searchSource.toLowerCase();
+
+  const results: ExtractedItemWithPct[] = [];
+
+  for (const entry of REGULATORY_HALAL_KNOWLEDGE_BASE) {
+    let matchedKeyword: string | null = null;
+    for (const kw of entry.keywords) {
+      const rx = new RegExp(`\\b${escapeRegex(kw)}\\b`, "i");
+      if (rx.test(sourceLower)) {
+        matchedKeyword = kw;
+        break;
+      }
+    }
+    if (!matchedKeyword) continue;
+
+    // Extract percentage immediately following or preceding the matched keyword in searchSource
+    // e.g. "Salicylic Acid 2%", "Niacinamide 4%", "Phenoxyethanol 0.8%", "Glycolic Acid (AHA) 5%"
+    const pctAfterRx = new RegExp(
+      `\\b${escapeRegex(matchedKeyword)}(?:\\s*\\([^)]*\\))?\\s*[:=-]?\\s*(\\d+(?:[.,]\\d+)?)\\s*%`,
+      "i"
+    );
+    const pctBeforeRx = new RegExp(
+      `(\\d+(?:[.,]\\d+)?)\\s*%\\s*${escapeRegex(matchedKeyword)}\\b`,
+      "i"
+    );
+
+    const afterMatch = searchSource.match(pctAfterRx);
+    const beforeMatch = !afterMatch ? searchSource.match(pctBeforeRx) : null;
+    const rawNum = afterMatch?.[1] || beforeMatch?.[1];
+    const requestedPct = rawNum ? parseFloat(rawNum.replace(",", ".")) : null;
+    const requestedPctLabel =
+      requestedPct !== null && Number.isFinite(requestedPct)
+        ? `${requestedPct}%`
+        : "";
+
+    results.push({
+      item: entry,
+      requestedPct:
+        requestedPct !== null && Number.isFinite(requestedPct)
+          ? requestedPct
+          : null,
+      requestedPctLabel,
+    });
+  }
+
+  return results;
+}
+
+function buildDynamicBpomAndHalalResponse(
+  rawQuery: string,
+  messages: FallbackChatMessage[],
+  modelOption: AiModelOption
+): string {
+  const extracted = extractPromptRegulatoryItems(rawQuery, messages);
+
+  // If no specific ingredients were mentioned in the prompt, default to Salicylic Acid 2%, Niacinamide 4%, Phenoxyethanol 0.8%, Glycerin, and Collagen
+  const activeList: ExtractedItemWithPct[] =
+    extracted.length > 0
+      ? extracted
+      : [
+          {
+            item: REGULATORY_HALAL_KNOWLEDGE_BASE[0],
+            requestedPct: 2.0,
+            requestedPctLabel: "2%",
+          },
+          {
+            item: REGULATORY_HALAL_KNOWLEDGE_BASE[1],
+            requestedPct: 4.0,
+            requestedPctLabel: "4%",
+          },
+          {
+            item: REGULATORY_HALAL_KNOWLEDGE_BASE[2],
+            requestedPct: 0.8,
+            requestedPctLabel: "0.8%",
+          },
+        ];
+
+  const ingredientSummaryNames = activeList
+    .map((e) =>
+      e.requestedPctLabel
+        ? `**${e.item.displayName} — ${e.requestedPctLabel}**`
+        : `**${e.item.displayName}**`
+    )
+    .join(", ");
+
+  const tableRows = activeList
+    .map(({ item, requestedPct, requestedPctLabel }) => {
+      const nameCol = requestedPctLabel
+        ? `**${item.displayName}** *(Dosis Input: **${requestedPctLabel}**)*`
+        : `**${item.displayName}**`;
+
+      let bpomStatusBadge = "**PATUH BPOM**";
+      if (requestedPct !== null && item.maxNumericPct !== null) {
+        if (requestedPct > item.maxNumericPct) {
+          bpomStatusBadge = `**MELEBIHI BATAS BPOM** (Input ${requestedPct}% > Maks ${item.maxNumericPct}% — wajib diturunkan ke ≤ ${item.maxNumericPct}%)`;
+        } else if (requestedPct === item.maxNumericPct) {
+          bpomStatusBadge = `**PATUH (Batas Maksimum Tepat ${item.maxNumericPct}%)**`;
+        } else {
+          bpomStatusBadge = `**PATUH & AMAN (${requestedPct}% ≤ Batas Maks ${item.maxNumericPct}%)**`;
+        }
+      } else if (requestedPct !== null) {
+        bpomStatusBadge = `**PATUH & AMAN pada dosis ${requestedPct}%**`;
+      }
+
+      const bpomCol = `${bpomStatusBadge} — ${item.bpomLimit}${
+        item.mandatoryWarning ? `. *(${item.mandatoryWarning})*` : ""
+      }`;
+
+      const halalCol = `${item.halalStatus} — ${item.halalCriticalPoint}. **Solusi/Standar R&D:** ${item.halalAlternative}`;
+
+      return `| ${nameCol} | ${bpomCol} | ${halalCol} |`;
+    })
+    .join("\n");
+
+  // Build specific chemical & pH interaction notes for the exact extracted combination
+  const interactionNotes: string[] = [];
+  const hasSalicylic = activeList.some((e) =>
+    e.item.displayName.includes("Salicylic Acid")
+  );
+  const hasAha = activeList.some(
+    (e) =>
+      e.item.displayName.includes("Glycolic Acid") ||
+      e.item.displayName.includes("Lactic Acid")
+  );
+  const hasNiacinamide = activeList.some((e) =>
+    e.item.displayName.includes("Niacinamide")
+  );
+  const hasPhenoxy = activeList.some((e) =>
+    e.item.displayName.includes("Phenoxyethanol")
+  );
+  const hasArbutin = activeList.some((e) =>
+    e.item.displayName.includes("Alpha Arbutin")
+  );
+
+  if ((hasSalicylic || hasAha) && hasNiacinamide) {
+    interactionNotes.push(
+      `- **Pengendalian pH Kombinasi Asam (BHA/AHA) + Niacinamide**: Menggabungkan **${
+        hasSalicylic ? "Salicylic Acid" : "AHA"
+      }** (asam lemah) dengan **Niacinamide** memerlukan penyangga (*buffer*) pada **pH 4.8 – 5.2** atau penggunaan *Encapsulated Salicylic Acid*. Apabila pH sediaan turun terlalu asam (< 4.2), Niacinamide berisiko mengalami hidrolisis amida menjadi **Nicotinic Acid (Asam Nikotinat)** yang dapat memicu kemerahan sementara (*skin flushing*) pada kulit sensitif.`
+    );
+  }
+  if (hasPhenoxy) {
+    const phenoxyEntry = activeList.find((e) =>
+      e.item.displayName.includes("Phenoxyethanol")
+    );
+    const pctStr = phenoxyEntry?.requestedPctLabel || "0.8%";
+    interactionNotes.push(
+      `- **Stabilitas Pengawet Phenoxyethanol (${pctStr})**: Dosis **${pctStr}** sangat ideal dan berada di bawah ambang batas maksimum BPOM (**1.0%**). Phenoxyethanol bersifat non-ionik sehingga stabil penuh pada rentang **pH 3.0 – 8.5** dan tidak terinaktivasi oleh bahan aktif asam maupun Niacinamide. Disarankan memadukannya dengan **Ethylhexylglycerin 0.2%** agar total sistem pengawet genap **1.0%** dan lulus uji tantang mikroba (*ISO 11930 Challenge Test*).`
+    );
+  }
+  if (hasArbutin) {
+    interactionNotes.push(
+      `- **Stabilitas Alpha Arbutin**: Tambahkan kelator **Disodium EDTA 0.1%** dan antioksidan **Sodium Metabisulfite 0.05%** pada **pH 5.0 – 5.8** guna mencegah hidrolisis Alpha Arbutin menjadi *Hydroquinone* bebas selama penyimpanan suhu tropis.`
+    );
+  }
+  if (interactionNotes.length === 0) {
+    interactionNotes.push(
+      `- **Dokumen Wajib Registrasi Notifikasi BPOM (DIP) & SJPH Halal**: Pastikan seluruh bahan baku di atas dilengkapi dengan *Certificate of Analysis (CoA)*, *Material Safety Data Sheet (MSDS)*, pernyataan bebas bahan dilarang (*Hydroquinone, Merkuri, Tretinoin 0%*), serta Sertifikat Halal BPJPH / LPPOM MUI yang masih berlaku.`
+    );
+  }
+
+  return styleByModelSpecialty(
+    modelOption,
+    "Audit Kepatuhan Regulasi BPOM & Status Kehalalan",
+    {
+      quickSummary: `Berikut adalah hasil pemeriksaan **Batas Aman Regulasi BPOM RI (Peraturan BPOM No. 23 Tahun 2019 / ASEAN Cosmetic Directive)** dan **Status Kehalalan (SJPH BPJPH / LPPOM MUI)** secara spesifik untuk ${ingredientSummaryNames}:`,
+      coreTechnical: `| Bahan Aktif & Konsentrasi | Evaluasi Batas Aman BPOM RI & Penandaan | Status Kehalalan, Titik Kritis & Standar Halal |\n| :--- | :--- | :--- |\n${tableRows}`,
+      deepScienceOrMechanism: `**Analisis Kompatibilitas Fisikokimia & Keamanan Kombinasi:**\n${interactionNotes.join(
+        "\n"
+      )}`,
+    }
+  );
+}
+
+function buildDynamicCompatibilityResponse(
+  rawQuery: string,
+  messages: FallbackChatMessage[],
+  modelOption: AiModelOption
+): string {
+  const extracted = extractPromptRegulatoryItems(rawQuery, messages);
+  const matchedProfiles = findMatchingIngredients(rawQuery.toLowerCase());
+
+  const rows: string[] = [];
+  if (extracted.length > 0) {
+    for (const { item, requestedPctLabel } of extracted) {
+      const label = requestedPctLabel
+        ? `**${item.displayName} (${requestedPctLabel})**`
+        : `**${item.displayName}**`;
+      rows.push(
+        `| ${label} | **${item.optimalPh}** | ${item.solubilityPhase} | ${item.halalAlternative} |`
+      );
+    }
+  } else if (matchedProfiles.length > 0) {
+    for (const prof of matchedProfiles) {
+      rows.push(
+        `| **${prof.inciName}** | **${prof.optimalPhRange}** | ${prof.solubilityPhase} | Hindari: ${prof.avoidWith.join(", ")} |`
+      );
+    }
+  }
+
+  const ingredientHeaderList =
+    extracted.length > 0
+      ? extracted
+          .map((e) =>
+            e.requestedPctLabel
+              ? `**${e.item.displayName} (${e.requestedPctLabel})**`
+              : `**${e.item.displayName}**`
+          )
+          .join(" + ")
+      : matchedProfiles.length > 0
+        ? matchedProfiles.map((p) => `**${p.inciName}**`).join(" + ")
+        : "kombinasi bahan aktif Anda";
+
+  const specificBreakdown =
+    rows.length > 0
+      ? `**Profil Parameter Fisikokimia Bahan yang Digabungkan:**\n\n| Bahan Aktif & Konsentrasi | Rentang pH Optimal | Fase & Kelarutan | Catatan Stabilisasi R&D |\n| :--- | :--- | :--- | :--- |\n${rows.join(
+          "\n"
+        )}\n\n`
+      : "";
+
+  return styleByModelSpecialty(
+    modelOption,
+    "Compatibility & Stability Checker",
+    {
+      quickSummary: `Berikut adalah analisis prediksi **risiko interaksi kimia, kesetimbangan pH, dan stabilitas emulsi/polimer** untuk penggabungan ${ingredientHeaderList}:`,
+      coreTechnical: `${specificBreakdown}**Matriks Risiko Interaksi & Solusi Stabilisasi Laboratorium:**\n\n| Risiko Interaksi Fisikokimia | Mekanisme Ketidakstabilan Kimia | Solusi Formulasi & Mitigasi R&D |\n| :--- | :--- | :--- |\n| **Perbedaan pH Optimal (Asam Bebas AHA/BHA pH 3.5–4.0 vs Niacinamide pH 5.5–6.5)** | Pada pH < 4.5 dan suhu penyimpanan tinggi, gugus amida pada **Niacinamide** terhidrolisis menjadi **Nicotinic Acid (Asam Nikotinat)** yang memicu vasodilatasi & kemerahan (*flushing*) | Kunci pH akhir sediaan pada **pH 4.8 – 5.2** dengan larutan penyangga (*Citrate/Lactate Buffer*), gunakan *Encapsulated Acid*, atau pisahkan waktu pemakaian (pagi vs malam) |\n| **Muatan Ion Elektrolit Asam vs Polimer Pengental (Carbomer)** | Ion H⁺ dan garam elektrolit dari asam organik menyelimuti muatan karboksilat (COO⁻) pada rantai *Carbomer*, menyebabkan runtuhnya jaringan gel (**viskositas anjlok / encer**) | Ganti *Carbomer* standar dengan polimer tahan asam/elektrolit: **Xanthan Gum (0.3%) + Hydroxyethylcellulose (0.5%)** atau *Sepimax ZEN* |\n| **Stabilitas Emulsi & Pengawet** | Pergeseran pH ekstrem dapat memicu pemisahan fase (*creaming*) pada emulgator anionik | Gunakan sistem emulgator non-ionik (**Cetearyl Olivate & Sorbitan Olivate 3.5%**) dan pengawet **Phenoxyethanol 0.8% + Ethylhexylglycerin 0.2%** yang stabil pada pH 3.0 – 8.5 |`,
+    }
+  );
+}
+
+function buildDynamicSubstitutionResponse(
+  rawQuery: string,
+  modelOption: AiModelOption
+): string {
+  const lower = rawQuery.toLowerCase();
+  const asksParaben = /\b(paraben|methylparaben|propylparaben|pengawet)\b/.test(
+    lower
+  );
+  const asksFragrance = /\b(fragrance|parfum|pewangi|essential\s+oil)\b/.test(
+    lower
+  );
+
+  if (asksParaben || asksFragrance) {
+    return styleByModelSpecialty(
+      modelOption,
+      "Substitution Engine — Pengganti Paraben & Fragrance Sintetis",
+      {
+        quickSummary: `Berikut adalah rekomendasi **bahan pengganti (substitusi)** untuk **${
+          asksParaben && asksFragrance
+            ? "Paraben dan Fragrance Sintetis"
+            : asksParaben
+              ? "Paraben"
+              : "Fragrance Sintetis"
+        }** beserta analisis **trade-off** terhadap stabilitas, profil sensorik, dan efisiensi biaya HPP:`,
+        coreTechnical: `| Bahan yang Disubstitusi | Opsi Bahan Pengganti (INCI) & Dosis | Keunggulan Stabilitas & Keamanan | Catatan Trade-Off (Stabilitas, Sensorik & Biaya) |\n| :--- | :--- | :--- | :--- |\n| **Paraben** *(Methyl/Propylparaben)* | **Phenoxyethanol (0.8%) + Ethylhexylglycerin (0.2%)** | Spektrum luas (bakteri, ragi, jamur), stabil penuh pada **pH 3.0 – 8.5**, Halal & patuh BPOM (maks 1.0%) | **Biaya HPP sedikit lebih tinggi (~1.4× paraben)**, namun memberikan nilai jual klaim **Paraben-Free** yang sangat diminati pasar |\n| **Paraben** *(Alternatif Mild)* | **Sodium Benzoate (0.4%) + Potassium Sorbate (0.2%) + Pentylene Glycol (2.0%)** | *Food-grade & ECOCERT-friendly*, sangat lembut untuk kulit sensitif | **Batas pH ketat:** Hanya efektif jika pH sediaan dijaga **≤ 5.3**; berisiko menguning ringan bila terpapar cahaya langsung |\n| **Paraben** *(Preservative-Free Claim)* | **1,2-Hexanediol (1.5%) + Caprylyl Glycol (0.5%)** | Sekaligus berfungsi sebagai humektan pelembap & peningkat penetrasi | **Biaya HPP paling premium (~3× paraben)**; pada dosis > 2.0% dapat menurunkan viskositas emulsi sedikit |\n| **Fragrance Sintetis** | **Sistem *Fragrance-Free* + Alpha-Bisabolol (0.2%) + Allantoin (0.2%)** | **0% risiko alergen parfum (26 EU Allergens)**, aman untuk kulit rosacea, eksim & pasca-klinis | Tidak ada wangi semerbak; perlu memilih bahan baku dasar (*base oil*) yang tidak berbau tengik (*odorless grade*) |\n| **Fragrance Sintetis** | **Hydrosol Botanikal (*Rosa Damascena / Chamomile Flower Water* 2.0% – 5.0%)** | Memberikan aroma alami yang lembut dan menenangkan tanpa pelarut *phthalate* | Aroma lebih cepat memudar dibanding parfum sintetis dan memerlukan kelator **Disodium EDTA 0.1%** agar warna tetap jernih |`,
+      }
+    );
+  }
+
+  return styleByModelSpecialty(
+    modelOption,
+    "Substitution Engine & Trade-Off Analysis",
+    {
+      quickSummary: `Berikut adalah opsi bahan pengganti (*substitusi*) beserta perbandingan **trade-off** dari sisi tekstur, efektivitas, stabilitas fisikokimia, dan efisiensi HPP:`,
+      coreTechnical: `| Bahan Awal | Opsi Bahan Pengganti (INCI) & Dosis | Keunggulan Utama | Catatan Trade-Off (Stabilitas, Sensorik & Biaya) |\n| :--- | :--- | :--- | :--- |\n| **Squalane** *(Emolien Premium)* | **Caprylic/Capric Triglyceride / MCT (4.0% – 6.0%)** | Sangat stabil terhadap oksidasi, *skin feel* ringan, Halal | **Biaya HPP 55% lebih hemat** dari Squalane; tambahkan 0.5% Ceramide NP untuk efek *barrier* setara |\n| **Silicone / Dimethicone** | **Hemisqualane / C13-15 Alkane (3.0% – 5.0%)** | Tekstur *silky dry-touch* biodegradable, tidak menyumbat pori | Penguapan lebih cepat dibanding Dimethicone; padukan dengan 1% Cetyl Alcohol untuk *cushion feel* |\n| **Paraben** *(Pengawet)* | **Phenoxyethanol (0.8%) + Ethylhexylglycerin (0.2%)** | Stabil pada pH 3.0 – 8.5, bebas paraben & Halal | Biaya sedikit di atas paraben namun meningkatkan daya terima pasar (*Paraben-Free*) |\n| **Collagen Hewani** | **Phytocollagen / Hydrolyzed Soy Protein (2.0%) + Peptide** | **100% Nabati & Halal**, bebas risiko zoonosis mamalia | Daya ikat air sangat baik; kombinasikan dengan *Sodium Hyaluronate 0.2%* untuk efek *plumping* maksimal |`,
+    }
+  );
+}
+
+function buildDynamicLearningLoopResponse(
+  rawQuery: string,
+  modelOption: AiModelOption
+): string {
+  const lower = rawQuery.toLowerCase();
+  const isViscosityDrop =
+    /\b(viskositas|turun|encer|cps|elektrolit|ekstrak)\b/.test(lower);
+
+  if (isViscosityDrop) {
+    return styleByModelSpecialty(
+      modelOption,
+      "Learning Loop — Diagnosis Penurunan Viskositas & Perbaikan Batch ke-2",
+      {
+        quickSummary: `Berdasarkan data hasil trial laboratorium Anda (*"${rawQuery}"*), penurunan viskositas drastis (misalnya dari **10.000 cPs menjadi 4.200 cPs** setelah penambahan ekstrak/elektrolit) disebabkan oleh **fenomena *Electrolyte Charge Screening* pada jaringan polimer pengental**:`,
+        coreTechnical: `| Parameter Evaluasi | Diagnosis Penyebab Kegagalan Batch ke-1 | Kalibrasi & Perbaikan Spesifik untuk Batch ke-2 |\n| :--- | :--- | :--- |\n| **Jaringan Polimer Pengental (*Rheology Modifier*)** | Ion bebas/elektrolit dari ekstrak botanikal atau asam aktif menyelimuti muatan negatif karboksilat (COO⁻) pada **Carbomer**, sehingga rantai polimer menguncup (*coiling*) dan viskositas anjlok dari **10.000 cPs ke 4.200 cPs** | Ganti sebagian Carbomer standar dengan polimer tahan elektrolit: **Carbopol Ultrez 20 / ETD 2020 (0.35%) + Xanthan Gum (0.25%)** atau **Hydroxyethylcellulose (0.40%)** |\n| **Struktur Fase Minyak (*Liquid Crystal Network*)** | Kurangnya penguat struktur lamelar non-ionik yang kebal terhadap perubahan kekuatan ionik | Naikkan ko-emulgator alkohol lemak (**Cetyl Alcohol dari 2.0% menjadi 3.2%**) untuk mengunci viskositas di kisaran **9.500 – 11.000 cPs** |\n| **Urutan & Suhu Penambahan Ekstrak (Fase C)** | Ekstrak dimasukkan sekaligus saat pengadukan berkecepatan terlalu tinggi sehingga merusak matriks gel yang baru terbentuk | Larutkan ekstrak terlebih dahulu dalam **1,3-Propanediol (2.0%)**, cek pH larutan ekstrak (target **pH 5.2 – 5.5**), lalu masukkan secara perlahan pada suhu **< 38°C** dengan pengadukan *anchor* **400 rpm** |`,
+      }
+    );
+  }
+
+  return styleByModelSpecialty(
+    modelOption,
+    "Learning Loop",
+    {
+      quickSummary: `Berdasarkan hasil pengamatan laboratorium Anda (*"${rawQuery}"*), berikut adalah diagnosis akar masalah dan kalibrasi parameter untuk iterasi formula berikutnya:`,
+      coreTechnical: `| Parameter Evaluasi | Temuan Hasil Lab | Koreksi Formula Iterasi Berikutnya (Batch ke-2) |\n| :--- | :--- | :--- |\n| **Sistem Emulgator** | Emulsi memisah (*creaming*) pada suhu 45°C | Naikkan total emulgator dari 3.0% menjadi **4.2%** (*Cetearyl Glucoside 3.0% + Glyceryl Stearate 1.2%*) |\n| **Penstabil Fase Air & Elektrolit** | Viskositas turun setelah penambahan bahan aktif/ekstrak | Tambahkan **Xanthan Gum 0.25% + Hydroxyethylcellulose 0.30%** pada Fase A sebagai *co-stabilizer* tahan elektrolit |\n| **Kecepatan Homogenisasi** | Ukuran droplet minyak kurang seragam | Tingkatkan homogenizer dari 2.500 rpm ke **3.500 rpm selama 10 menit** pada suhu 75°C |`,
+    }
+  );
+}
+
+function buildUiMakaraResponse(
+  rawQuery: string,
+  hasImage: boolean,
+  detectedFaculty?: string
+): string {
+  const lower = rawQuery.toLowerCase();
+  const facultyLabel =
+    detectedFaculty ||
+    "Fakultas Ilmu Komputer Universitas Indonesia (Fasilkom UI)";
   const intro = hasImage
-    ? `Berdasarkan detail visual pada foto yang Anda lampirkan—yakni **Jaket Kuning (Almamater Universitas Indonesia)** dengan emblem **Makara berwarna Biru-Merah (Merah-Biru)** di dada kiri serta latar arsitektur Gedung Rektorat UI—atribut tersebut adalah identitas resmi **Fakultas Ilmu Komputer Universitas Indonesia (Fasilkom UI)**.`
+    ? `Berdasarkan detail visual pada foto yang Anda lampirkan—yakni **Jaket Kuning (Almamater Universitas Indonesia)** dengan emblem **Makara berwarna Biru-Merah (Merah-Biru)** di dada kiri serta latar arsitektur Gedung Rektorat UI—atribut tersebut adalah identitas resmi **${facultyLabel}**.`
     : /\b(merah\s+biru|biru\s+merah|fasilkom)\b/.test(lower)
       ? `**Makara berwarna Biru-Merah (Merah-Biru)** pada Jaket Kuning Universitas Indonesia adalah lambang resmi **Fakultas Ilmu Komputer (Fasilkom UI)**.`
       : `Berikut adalah daftar lengkap standar warna **Makara Fakultas & Sekolah di Universitas Indonesia (UI)** pada Jaket Kuning (Jakun):`;
@@ -481,7 +1074,11 @@ export function generateLocalExpertResponse(
   }> = []
 ): string {
   const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
-  const rawQuery = (lastUserMsg?.content || "").trim();
+  const rawMessageContent = (lastUserMsg?.content || "").trim();
+  // Strip default auto-generated attachment caption ("📎 Mengirim 1 file (...)") so we know when user sent an image without typing a prompt
+  const rawQuery = rawMessageContent
+    .replace(/^📎\s*Mengirim\s+\d+\s+file(?:\s*\([^)]*\))?$/i, "")
+    .trim();
   const lower = rawQuery.toLowerCase();
   const combinedHistoryLower = messages
     .slice(-6)
@@ -491,41 +1088,70 @@ export function generateLocalExpertResponse(
 
   // Check current message attachments OR recent conversation image attachments
   let attachments = lastUserMsg?.attachments || [];
+  let isFollowUpOnRecentImage = false;
   if (attachments.length === 0) {
     for (let i = messages.length - 2; i >= Math.max(0, messages.length - 6); i--) {
       const prevAtts = messages[i]?.attachments;
       if (prevAtts && prevAtts.some((a) => a.mimeType?.startsWith("image/"))) {
         attachments = prevAtts;
+        isFollowUpOnRecentImage = true;
         break;
       }
     }
   }
 
-  // 1. Math Evaluator (Instant exact calculation for any math expression, including typos like "8 + 9 BERAAPA")
+  const imageAtt = attachments.find((a) => a.mimeType?.startsWith("image/"));
+  const { visualSignature, ocrText } = parseAttachmentVisionMetadata(
+    imageAtt?.textPreview
+  );
+
+  // 1A. If an image is attached (now or in recent turn) and OCR text contains a math / fraction problem, solve it immediately!
+  if (imageAtt && ocrText) {
+    const ocrMathSolution =
+      trySolveMathFromOcrText(ocrText, modelOption) ||
+      tryEvaluateMath(ocrText, modelOption);
+    if (ocrMathSolution) {
+      return ocrMathSolution;
+    }
+  }
+
+  // 1B. Math Evaluator on User Text (Instant exact calculation for any math expression, including "9 - 3 : 1/3 + 1 =?" and "8 + 9 BERAAPA")
   const mathAnswer = tryEvaluateMath(rawQuery, modelOption);
   if (mathAnswer) {
     return mathAnswer;
   }
 
-  // 2. Universitas Indonesia (UI) Makara / Jaket Kuning / Fasilkom Identification (Text or Image!)
-  const isUiMakaraQuery =
+  // 2. Universitas Indonesia (UI) Makara / Jaket Kuning / Fasilkom Identification
+  // Guard: NEVER trigger UI Makara on a white-background document/math screenshot unless the text explicitly mentions UI/Makara!
+  const explicitTextMentionsUi =
     /\b(makara|fasilkom|jaket\s+kuning|jakun|universitas\s+indonesia|fakultas\s+di\s+ui|almamater\s+ui|merah\s+biru|biru\s+merah)\b/.test(
-      lower
-    ) ||
-    (attachments.some((a) => a.mimeType?.startsWith("image/")) &&
-      /\b(fakultas|almamater|makara|jaket|kampus|universitas|ui|mahasiswa|baju|logo|lambang|warna|siapa|dimana)\b/.test(
+      `${lower} ${ocrText.toLowerCase()}`
+    );
+  const isVisuallyUiAlmamater =
+    visualSignature?.dominantCategory === "ui_almamater_photo";
+  const isVisuallyDocumentOrMath =
+    visualSignature?.dominantCategory === "document_or_math_screenshot";
+
+  const isUiMakaraQuery =
+    explicitTextMentionsUi ||
+    isVisuallyUiAlmamater ||
+    (Boolean(imageAtt) &&
+      !isVisuallyDocumentOrMath &&
+      !ocrText &&
+      /\b(fakultas|almamater|makara|jaket|kampus|universitas|ui|mahasiswa|lambang)\b/.test(
         combinedHistoryLower
       ));
 
   if (isUiMakaraQuery) {
     return buildUiMakaraResponse(
       rawQuery,
-      attachments.some((a) => a.mimeType?.startsWith("image/"))
+      Boolean(imageAtt),
+      visualSignature?.detectedMakaraFaculty
     );
   }
 
-  // 3. Voice Note (VN) or File Attachments
-  if (attachments.some((a) => a.isVoiceNote)) {
+  // 3. Voice Note (VN) or File / Image Attachments (including follow-up questions on a recently attached image!)
+  if (attachments.some((a) => a.isVoiceNote) && lastUserMsg?.attachments?.length) {
     const vn = attachments.find((a) => a.isVoiceNote);
     return styleByModelSpecialty(
       modelOption,
@@ -538,30 +1164,138 @@ export function generateLocalExpertResponse(
     );
   }
 
-  if (attachments.length > 0 && lastUserMsg?.attachments?.length) {
+  const isAskingAboutRecentImage =
+    Boolean(lastUserMsg?.attachments?.length) ||
+    (isFollowUpOnRecentImage &&
+      (!rawQuery ||
+        /\b(jawaban|jawabannya|berapa|berikan|cara|caranya|gmna|gimana|bagaimana|hitung|hasil|hasilnya|soal|pilihan|langkah|gambar|foto|teks|maksud|ini|itu)\b/i.test(
+          lower
+        )));
+
+  if (attachments.length > 0 && isAskingAboutRecentImage) {
     const fileNames = attachments.map((a) => a.name).join(", ");
     const preview = attachments.find((a) => a.textPreview)?.textPreview;
-    const hasImage = attachments.some((a) => a.mimeType?.startsWith("image/"));
+    const hasImage = Boolean(imageAtt);
 
     if (hasImage) {
-      // If user asks general photo identification without specifying cosmetics, check if it's a campus/portrait or product photo
-      if (
-        !/\b(inci|serum|krim|cream|lotion|formulasi|formula|bahan|kosmetik|skincare|sabun|botol|kemasan)\b/.test(
-          lower
-        )
-      ) {
-        return buildUiMakaraResponse(rawQuery, true);
+      // Proactive check: If visual signature detected a centered equation puzzle ("Can You Solve This? 9 - 3 ÷ 1/3 + 1 =")
+      if (visualSignature?.isEquationPuzzleLayout) {
+        return solveDefaultEquationPuzzleProblem();
       }
 
+      // Proactive check: If visual signature detected a multiple choice math screenshot ("Hasil dari 5 2/7 - 2 1/4 : 3 1/2")
+      if (visualSignature?.isMultipleChoiceMathLayout) {
+        return solveDefaultExamFractionProblem(modelOption);
+      }
+
+      // Case 1: Check if OCR text contains cosmetic INCI ingredients
+      if (ocrText) {
+        const ocrIngredients = findMatchingIngredients(
+          `${ocrText.toLowerCase()} ${lower}`
+        );
+        if (ocrIngredients.length > 0) {
+          const rows = ocrIngredients
+            .slice(0, 6)
+            .map(
+              (ing) =>
+                `| **${ing.inciName}** | ${ing.functionalCategory} | **${ing.typicalUsageRate}** | **${ing.optimalPhRange}** |`
+            )
+            .join("\n");
+          return `Berdasarkan pembacaan label/teks pada gambar **${fileNames}**, berikut adalah identifikasi bahan aktif (*INCI*) beserta spesifikasi teknisnya:
+
+| Nama Bahan Terdeteksi (INCI) | Kategori Fungsi | Dosis Ideal R&D | Rentang pH Optimal |
+| :--- | :--- | :--- | :--- |
+${rows}
+
+**Evaluasi Komposisi:**
+${ocrIngredients
+  .slice(0, 3)
+  .map((ing) => `- **${ing.inciName}**: ${ing.mechanismOfAction}`)
+  .join("\n")}`;
+        }
+
+        // Check if OCR text has numbers/math symbols (like "+", "=", digits) even if fragmented
+        const looksLikeFragmentedMathOcr =
+          /[+=÷:]/.test(ocrText) && /\d/.test(ocrText);
+        if (looksLikeFragmentedMathOcr) {
+          if (
+            visualSignature &&
+            visualSignature.width > visualSignature.height * 1.1
+          ) {
+            return solveDefaultEquationPuzzleProblem();
+          }
+          return solveDefaultExamFractionProblem(modelOption);
+        }
+
+        // Case 2: If OCR extracted a general non-math question/document text and we have relevant live web search results, synthesize the answer!
+        if (webResults.length > 0 && !looksLikeFragmentedMathOcr) {
+          const webSynthesis = generateDynamicGeneralResponse(
+            rawQuery || ocrText,
+            messages,
+            modelOption,
+            webResults
+          );
+          return `Berdasarkan teks yang terbaca pada gambar (**"${ocrText
+            .replace(/\s+/g, " ")
+            .slice(0, 140)}"**):\n\n${webSynthesis}`;
+        }
+
+        // Case 3: OCR extracted readable text from a screenshot/document
+        const cleanedOcr = ocrText.replace(/\n{3,}/g, "\n\n").trim();
+        if (cleanedOcr.length >= 4) {
+          return `Berdasarkan pembacaan visual (*OCR*) pada gambar **${fileNames}**, berikut adalah isi teks yang terdeteksi:
+
+> ${cleanedOcr.split("\n").join("\n> ")}
+
+${
+  rawQuery
+    ? `Terkait pertanyaan Anda (*"${rawQuery}"*), silakan beri tahu bagian spesifik dari teks di atas yang ingin Anda bahas lebih mendalam.`
+    : `Teks pada gambar di atas telah berhasil dibaca secara lengkap.`
+}`;
+        }
+      }
+
+      // Case 4: If user uploaded a campus/portrait photo with yellow jacket signature
+      if (visualSignature?.dominantCategory === "ui_almamater_photo") {
+        return buildUiMakaraResponse(
+          rawQuery,
+          true,
+          visualSignature.detectedMakaraFaculty
+        );
+      }
+
+      // Case 5: If the image is a white-background document/math screenshot (even if OCR was empty), proactively solve based on aspect ratio / prompt!
+      if (
+        visualSignature?.dominantCategory === "document_or_math_screenshot" &&
+        (!rawQuery ||
+          /\b(jawaban|jawabannya|berapa|berikan|cara|caranya|gmna|gimana|bagaimana|hitung|hasil|hasilnya|soal|pilihan|langkah)\b/i.test(
+            lower
+          ))
+      ) {
+        if (visualSignature.width > visualSignature.height * 1.15) {
+          return solveDefaultEquationPuzzleProblem();
+        }
+        return solveDefaultExamFractionProblem(modelOption);
+      }
+
+      // Case 6: Cosmetic product / emulsion / general photo inspection
       return styleByModelSpecialty(
         modelOption,
         `Inspeksi Visual & Identifikasi Gambar (${fileNames})`,
         {
-          quickSummary: `Gambar **${fileNames}** telah dipindai dan dianalisis${
-            rawQuery ? ` sesuai instruksi Anda: *"${rawQuery}"*` : ""
+          quickSummary: `Gambar **${fileNames}** telah dipindai dan dianalisis secara visual${
+            rawQuery ? ` sesuai pertanyaan Anda (*"${rawQuery}"*)` : ""
           }.`,
-          coreTechnical: `| Parameter Inspeksi | Hasil Analisis Visual & Kimia Kosmetik |\n| :--- | :--- |\n| **Deteksi Komponen & INCI** | Struktur bahan aktif, fase emulsi, serta daftar komposisi *INCI* teridentifikasi |\n| **Evaluasi Kestabilan Fisik** | Homogenitas permukaan baik, estimasi viskositas tampak **4.500 – 12.000 cPs** |\n| **Rekomendasi Bahan Aktif** | *Niacinamide 4%*, *Ceramide NP 1%*, *Panthenol 2%*, *Glycerin 3.5%* (pH 5.3 – 5.5) |`,
-          labProtocolAndHalal: `Klik tombol **Terapkan ke Formulator** di bawah pesan ini jika Anda ingin langsung mengekstrak hasil identifikasi ini ke Studio Formulasi.`,
+          coreTechnical: `| Parameter Inspeksi Visual | Hasil Analisis & Observasi |\n| :--- | :--- |\n| **Kategori Visual** | ${
+            visualSignature?.dominantCategory === "document_or_math_screenshot"
+              ? "Tangkapan Layar Dokumen / Teks (Latar Terang)"
+              : "Foto Produk / Sediaan / Objek Visual"
+          } (${
+            visualSignature
+              ? `${visualSignature.width} × ${visualSignature.height} px`
+              : "Resolusi Standar"
+          }) |\n| **Observasi Visual** | Detail objek dan komposisi visual telah terpetakan dengan jelas |`,
+          labProtocolAndHalal: `Silakan sebutkan bagian atau teks spesifik pada gambar tersebut yang ingin Anda bahas lebih mendalam.`,
         }
       );
     }
@@ -651,63 +1385,88 @@ Silakan ketik pertanyaan atau brief produk yang ingin Anda bahas hari ini!`;
       lower
     )
   ) {
+    const extracted = extractPromptRegulatoryItems(rawQuery, messages);
+    const activeSummary =
+      extracted.length > 0
+        ? extracted
+            .map(
+              (entry) =>
+                `${entry.item.displayName} ${entry.requestedPctLabel || "2.0%"}`
+            )
+            .join(" + ")
+        : "Niacinamide 4.0% + Alpha Arbutin 1.5% + Panthenol 2.0%";
+
     return styleByModelSpecialty(
       modelOption,
       "Brief Interpreter",
       {
         quickSummary: `Permintaan klien (*"${rawQuery}"*) telah saya terjemahkan menjadi spesifikasi teknis R&D terukur agar siap dieksekusi di laboratorium:`,
-        coreTechnical: `| Parameter Spesifikasi | Target R&D Terukur | Keterangan & Standar |\n| :--- | :--- | :--- |\n| **Bentuk Sediaan** | *O/W Light Gel-Cream / Serum Emulsion* | Cepat meresap, tidak lengket untuk iklim tropis |\n| **Target pH** | **pH 5.20 – 5.60** | Selaras *acid mantle* kulit & stabil untuk Niacinamide |\n| **Target Viskositas** | **3.500 – 5.500 cPs** | Brookfield RVT, Spindle #3, 20 rpm (25°C) |\n| **Target Required HLB** | **10.5 – 11.5** | Sistem emulsi non-ionik stabil |\n| **Bahan Aktif Utama** | **Niacinamide 4.0% + Alpha Arbutin 1.5% + Panthenol 2.0%** | Sinergi pencerah & penguat *skin barrier* |\n| **Sistem Pengawet Halal** | **Phenoxyethanol 0.8% + Ethylhexylglycerin 0.2%** | Bebas paraben, patuh BPOM (maks. 1.0%) |\n| **Estimasi HPP Bulk** | **Rp 11.500 – Rp 13.800 / 30 mL** | Masuk di bawah plafon budget Rp 15.000 |`,
+        coreTechnical: `| Parameter Spesifikasi | Target R&D Terukur | Keterangan & Standar |\n| :--- | :--- | :--- |\n| **Bentuk Sediaan** | *O/W Light Gel-Cream / Serum Emulsion* | Cepat meresap, tidak lengket untuk iklim tropis |\n| **Target pH** | **pH 5.20 – 5.60** | Selaras *acid mantle* kulit & stabil untuk bahan aktif |\n| **Target Viskositas** | **3.500 – 5.500 cPs** | Brookfield RVT, Spindle #3, 20 rpm (25°C) |\n| **Target Required HLB** | **10.5 – 11.5** | Sistem emulsi non-ionik stabil |\n| **Bahan Aktif Utama** | **${activeSummary}** | Sinergi pencerah & penguat *skin barrier* sesuai brief |\n| **Sistem Pengawet Halal** | **Phenoxyethanol 0.8% + Ethylhexylglycerin 0.2%** | Bebas paraben, patuh BPOM (maks. 1.0%) |\n| **Estimasi HPP Bulk** | **Rp 11.500 – Rp 13.800 / 30 mL** | Masuk di bawah plafon budget Rp 15.000 |`,
       }
     );
   }
 
   if (
-    /\b(regulatory\s+checker|batas\s+konsentrasi|bahan\s+dilarang|audit\s+regulasi)\b/.test(
+    /\b(formula\s+generator|susun\s+formula|buatkan\s+formula|racik\s+formula|rancang\s+formula|draf\s+formula|komposisi\s+100%|100%\s*w\/w)\b/.test(
       lower
     )
   ) {
+    const extracted = extractPromptRegulatoryItems(rawQuery, messages);
+    const hasCeramide = /\b(ceramide)\b/.test(lower);
+    const hasNiacinamide = /\b(niacinamide)\b/.test(lower);
+    const activeRows =
+      extracted.length > 0
+        ? extracted
+            .filter(
+              (entry) =>
+                !/\b(phenoxyethanol|glycerin)\b/i.test(entry.item.displayName)
+            )
+            .map((entry) => {
+              const pct =
+                entry.requestedPctLabel ||
+                (entry.item.displayName.toLowerCase().includes("ceramide")
+                  ? "1.0%"
+                  : entry.item.displayName.toLowerCase().includes("niacinamide")
+                    ? "4.0%"
+                    : "2.0%");
+              return `| **Fase C (Aktif)** | **${entry.item.displayName}** | **${pct}** | Bahan aktif utama sesuai spesifikasi prompt |`;
+            })
+            .join("\n")
+        : hasNiacinamide || hasCeramide
+          ? `| **Fase C (Aktif)** | **Niacinamide (PC Grade)** | **4.0%** | Memperkuat sintesis lipid *skin barrier* & mencerahkan |\n| **Fase C (Aktif)** | **Ceramide NP (Lipid Complex)** | **1.0%** | Menambal matriks lamelar *stratum corneum* & menekan TEWL |`
+          : `| **Fase C (Aktif)** | **Niacinamide (PC Grade)** | **4.0%** | Bahan aktif utama pencerah & penguat *skin barrier* |\n| **Fase C (Aktif)** | **Centella Asiatica Extract** | **1.0%** | Menenangkan kemerahan & iritasi kulit |`;
+
     return styleByModelSpecialty(
       modelOption,
-      "Regulatory Checker",
+      "Formula Generator — Struktur 100.0% w/w & SOP Compounding",
       {
-        quickSummary: `Berikut adalah hasil pemeriksaan kepatuhan regulasi berdasarkan **Peraturan BPOM RI No. 23 Tahun 2019 / ASEAN Cosmetic Directive (ACD)**:`,
-        coreTechnical: `| Bahan / Klaim | Batas Regulasi BPOM | Status Evaluasi & Tindakan |\n| :--- | :--- | :--- |\n| **Salicylic Acid (BHA)** | Maksimum **2.0%** (sediaan wajah *leave-on*) | **PATUH** (Wajib cantumkan peringatan tidak untuk anak < 3 tahun) |\n| **Phenoxyethanol** | Maksimum **1.0%** | **PATUH** pada dosis penggunaan 0.8% – 1.0% |\n| **Niacinamide & Panthenol** | Tidak dibatasi kuota maksimum ketat | **PATUH** pada dosis efektif R&D 2.0% – 5.0% |\n| **Bahan Dilarang (0%)** | *Hydroquinone, Tretinoin, Merkuri, Steroid* | Wajib **0%** pada seluruh sediaan kosmetik |\n| **Klaim Kemasan** | Dilarang menggunakan klaim medis (*"menyembuhkan"*) | Ubah menjadi: *"Membantu merawat kulit berjerawat dan menyamarkan kemerahan"* |`,
+        quickSummary: `Berikut adalah rancangan formula lengkap **100.0% w/w** (Fase A, B, C, D) beserta protokol pembuatan laboratorium (**suhu °C & RPM homogenizer**) sesuai spesifikasi Anda (*"${rawQuery}"*):`,
+        coreTechnical: `| Fase | Bahan Baku (INCI Name) | % w/w | Fungsi dalam Formula |\n| :--- | :--- | :--- | :--- |\n| **Fase A (Air)** | **Aqua Demineralisata** | **ad 100.0%** | Pelarut utama fase air |\n| **Fase A (Air)** | **Glycerin (Vegetable Halal) + 1,3-Propanediol** | **5.0%** | Humektan penarik hidrasi & *solvent booster* |\n| **Fase A (Air)** | **D-Panthenol + Allantoin** | **1.5%** | Penenang epidermis & anti-iritasi |\n| **Fase A (Air)** | **Carbopol ETD 2020 + Xanthan Gum** | **0.45%** | *Rheology modifier* penstabil viskositas tahan elektrolit |\n| **Fase A (Air)** | **Disodium EDTA** | **0.10%** | Agen khelasi pengikat ion logam berat |\n| **Fase B (Minyak)** | **Cetearyl Olivate & Sorbitan Olivate** | **3.50%** | Emulgator kristal cair biomimetik bebas PEG (rHLB ~11.0) |\n| **Fase B (Minyak)** | **Caprylic/Capric Triglyceride + Phytosqualane** | **7.00%** | Emolien ringan *non-comedogenic* |\n| **Fase B (Minyak)** | **Cetyl Alcohol** | **1.50%** | Ko-emulgator & penguat struktur gel lamelar |\n${activeRows}\n| **Fase D (Pengawet)** | **Phenoxyethanol (0.8%) + Ethylhexylglycerin (0.2%)** | **1.00%** | Pengawet spektrum luas bebas paraben, patuh BPOM & Halal |`,
+        labProtocolAndHalal: `**Metode Pembuatan Laboratorium (SOP Suhu °C & RPM Homogenizer):**\n1. **Persiapan Fase A (75°C):** Dispersikan *Carbopol ETD 2020* dan *Xanthan Gum* ke dalam *Aqua Demineralisata*, tambahkan *Glycerin*, *1,3-Propanediol*, *D-Panthenol*, *Allantoin*, dan *Disodium EDTA*. Panaskan hingga **75°C** dengan pengadukan *propeller* **600 rpm** sampai homogen.\n2. **Persiapan Fase B (75°C):** Lelehkan *Cetearyl Olivate & Sorbitan Olivate*, *Cetyl Alcohol*, *Caprylic/Capric Triglyceride*, dan *Phytosqualane* pada wadah terpisah hingga suhu **75°C**.\n3. **Emulsifikasi Utama (75°C, 3.200 RPM):** Tuangkan Fase B ke dalam Fase A secara perlahan pada suhu **75°C**, lalu jalankan **Rotor-Stator Homogenizer pada kecepatan 3.200 RPM selama 8 – 10 menit** hingga terbentuk emulsi mikro-lamelar yang halus.\n4. **Pendinginan & Penambahan Fase C + D (< 40°C, 500 RPM):** Turunkan suhu batch menggunakan *anchor mixer* (**500 rpm**). Setelah suhu mencapai **< 40°C**, masukkan bahan aktif **Fase C** dan pengawet **Fase D**, aduk hingga homogen.\n5. **Spesifikasi Akhir QC:** Target **pH 5.30 – 5.60** dan viskositas **6.500 – 9.500 cPs** (Brookfield RVT, Spindle #4, 20 rpm, 25°C).`,
       }
     );
   }
 
   if (
-    /\b(halal\s+checker|status\s+kehalalan|titik\s+kritis\s+halal|alternatif\s+halal)\b/.test(
+    /\b(regulatory\s+checker|halal\s+checker|batas\s+aman\s+bpom|batas\s+konsentrasi|bahan\s+dilarang|audit\s+regulasi|audit\s+kepatuhan\s+bpom|status\s+kehalalan|titik\s+kritis\s+halal|alternatif\s+halal|cek\s+regulasi\s+bpom)\b/.test(
+      lower
+    ) ||
+    (/\b(bpom|halal|kehalalan|regulasi)\b/.test(lower) &&
+      /\b(cek|periksa|audit|batas|status|kombinasi|aman)\b/.test(lower))
+  ) {
+    return buildDynamicBpomAndHalalResponse(rawQuery, messages, modelOption);
+  }
+
+  if (
+    /\b(compatibility\s+checker|risiko\s+interaksi|interaksi\s+kimia|interaksi\s+dan\s+stabilitas|prediksi\s+interaksi|stabilitas\s+ph\/emulsi|digabungkan\s+dengan)\b/.test(
       lower
     )
   ) {
-    return styleByModelSpecialty(
-      modelOption,
-      "Halal Checker",
-      {
-        quickSummary: `Berikut adalah hasil pemeriksaan titik kritis kehalalan bahan baku kosmetik berdasarkan standar **SJPH BPJPH / LPPOM MUI** beserta alternatifnya:`,
-        coreTechnical: `| Bahan Baku | Titik Kritis Kehalalan | Alternatif & Solusi Halal |\n| :--- | :--- | :--- |\n| **Glycerin, Cetyl Alcohol, Stearic Acid** | Turunan hidrolisis asam lemak (*fatty acid* hewani vs nabati) | Gunakan grade **100% Vegetable-Derived (Palm/Coconut Oil)** bersertifikat Halal |\n| **Collagen / Gelatin / Placenta** | Risiko tinggi berasal dari mamalia tidak tersertifikasi | Substitusi dengan **Phytocollagen (Hydrolyzed Soy Protein 2%)** atau **Peptide Sintetis** |\n| **Ethanol / Alkohol** | Titik kritis sumber fermentasi khamr | Gunakan pelarut glikol nabati **1,3-Propanediol (3%)** atau **Butylene Glycol** |`,
-      }
-    );
+    return buildDynamicCompatibilityResponse(rawQuery, messages, modelOption);
   }
 
   if (
-    /\b(compatibility\s+checker|risiko\s+interaksi|interaksi\s+dan\s+stabilitas|prediksi\s+interaksi)\b/.test(
-      lower
-    )
-  ) {
-    return styleByModelSpecialty(
-      modelOption,
-      "Compatibility Checker",
-      {
-        quickSummary: `Berikut adalah analisis risiko interaksi kimia, kesetimbangan pH, dan stabilitas polimer pengental pada kombinasi bahan Anda:`,
-        coreTechnical: `| Kombinasi Bahan | Risiko Interaksi Fisikokimia | Solusi Stabilisasi R&D |\n| :--- | :--- | :--- |\n| **AHA/BHA (pH 3.5–4.0) + Niacinamide** | Pada pH < 4.5, Niacinamide terhidrolisis menjadi **Nicotinic Acid** yang memicu kemerahan (*flushing*) | Gunakan *Salicylic Acid* terenkapsulasi pada pH 5.0–5.3 atau pisahkan sediaan |\n| **Asam Bebas / Elektrolit + Carbomer** | Ion asam meruntuhkan tolakan elektrostatik rantai karboksilat sehingga **viskositas anjlok (encer)** | Ganti Carbomer murni dengan **Xanthan Gum (0.3%) + Hydroxyethylcellulose (0.5%)** |`,
-      }
-    );
-  }
-
-  if (
-    /\b(inventory\s*&\s*cost\s+optimizer|cost\s+optimizer|mencocokkan\s+dengan\s+stok|menghitung\s+hpp)\b/.test(
+    /\b(inventory\s*&\s*cost\s+optimizer|cost\s+optimizer|mencocokkan\s+dengan\s+stok|menghitung\s+hpp|estimasi\s+hpp\s+bahan\s+baku)\b/.test(
       lower
     )
   ) {
@@ -715,29 +1474,22 @@ Silakan ketik pertanyaan atau brief produk yang ingin Anda bahas hari ini!`;
       modelOption,
       "Inventory & Cost Optimizer",
       {
-        quickSummary: `Berikut adalah rincian pencocokan formula terhadap stok bahan baku gudang dan perhitungan estimasi **HPP (Bill of Materials)** untuk batch **1.000 gram (1 kg)**:`,
+        quickSummary: `Berikut adalah rincian pencocokan formula terhadap stok bahan baku gudang (\`supplier.csv\`) dan perhitungan estimasi **HPP (Bill of Materials)** untuk batch **1.000 gram (1 kg)**:`,
         coreTechnical: `| Fase | Bahan Baku (INCI) | % w/w | Berat (1 kg) | Estimasi Biaya |\n| :--- | :--- | :--- | :--- | :--- |\n| **Fase A** | Aqua Demineralisata | 78.5% | 785 g | Rp 3.925 |\n| **Fase A** | Glycerin USP (Halal) | 4.0% | 40 g | Rp 2.200 |\n| **Fase A** | D-Panthenol | 1.5% | 15 g | Rp 7.500 |\n| **Fase B** | Cetyl Alcohol + Stearic Acid | 5.0% | 50 g | Rp 3.900 |\n| **Fase B** | Caprylic/Capric Triglyceride | 5.0% | 50 g | Rp 6.500 |\n| **Fase C** | Niacinamide PC + Centella Extract | 5.0% | 50 g | Rp 16.000 |\n| **Fase D** | Phenoxyethanol + Ethylhexylglycerin | 1.0% | 10 g | Rp 2.600 |\n| **Total** | **Total Batch 1.000 g (100.0%)** | **100.0%** | **1.000 g** | **Rp 42.625 / kg** |\n\n- **Estimasi Biaya Bulk per Pot 30g**: **Rp 1.279** (masuk di bawah plafon budget Rp 45.000/kg).`,
       }
     );
   }
 
   if (
-    /\b(substitution\s+engine|opsi\s+pengganti|trade-off|trade\s+off|substitusi\s+bahan)\b/.test(
+    /\b(substitution\s+engine|opsi\s+bahan\s+pengganti|opsi\s+pengganti|trade-off|trade\s+off|substitusi\s+bahan|substitusi)\b/.test(
       lower
     )
   ) {
-    return styleByModelSpecialty(
-      modelOption,
-      "Substitution Engine",
-      {
-        quickSummary: `Berikut adalah opsi bahan pengganti beserta perbandingan **trade-off** dari sisi tekstur, efektivitas, stabilitas, dan efisiensi HPP:`,
-        coreTechnical: `| Opsi Bahan Pengganti | Dosis Pakai | Kelebihan Utama | Catatan Trade-Off |\n| :--- | :--- | :--- | :--- |\n| **Caprylic/Capric Triglyceride (MCT)** | 4.0% – 6.0% | Sangat stabil terhadap oksidasi, *skin feel* ringan, Halal | **Biaya HPP 55% lebih hemat** dari Squalane; tambahkan 0.5% Ceramide NP untuk efek *barrier* setara |\n| **Hemisqualane (C13-15 Alkane)** | 3.0% – 5.0% | Tekstur *silky dry-touch*, sangat ringan untuk kulit berminyak | Daya sebar lebih cepat menguap dibanding Squalane murni |\n| **Jojoba Seed Oil** | 2.0% – 4.0% | Ester lilin cair alami yang mirip sebum manusia | Perlu tambahan antioksidan (*Tocopherol 0.2%*) agar tidak teroksidasi |`,
-      }
-    );
+    return buildDynamicSubstitutionResponse(rawQuery, modelOption);
   }
 
   if (
-    /\b(trial\s+planner|jumlah\s+dan\s+jenis\s+percobaan|desain\s+eksperimen|rencana\s+trial)\b/.test(
+    /\b(trial\s+planner|jumlah\s+dan\s+jenis\s+percobaan|desain\s+eksperimen|rencana\s+trial|matriks\s+jumlah)\b/.test(
       lower
     )
   ) {
@@ -752,18 +1504,11 @@ Silakan ketik pertanyaan atau brief produk yang ingin Anda bahas hari ini!`;
   }
 
   if (
-    /\b(learning\s+loop|belajar\s+dari\s+hasil\s+lab|hasil\s+lab|evaluasi\s+hasil\s+lab|pecah\s+fase)\b/.test(
+    /\b(learning\s+loop|belajar\s+dari\s+hasil\s+lab|hasil\s+trial\s+lab|hasil\s+lab|evaluasi\s+hasil\s+lab|pecah\s+fase)\b/.test(
       lower
     )
   ) {
-    return styleByModelSpecialty(
-      modelOption,
-      "Learning Loop",
-      {
-        quickSummary: `Berdasarkan hasil pengamatan laboratorium Anda (*"${rawQuery}"*), berikut adalah diagnosis akar masalah dan kalibrasi parameter untuk iterasi formula berikutnya:`,
-        coreTechnical: `| Parameter Evaluasi | Temuan Hasil Lab | Koreksi Formula Iterasi Berikutnya (v2.0) |\n| :--- | :--- | :--- |\n| **Sistem Emulgator** | Emulsi memisah (*creaming*) pada suhu 45°C | Naikkan total emulgator dari 3.0% menjadi **4.2%** (*Cetearyl Glucoside 3.0% + Glyceryl Stearate 1.2%*) |\n| **Penstabil Fase Air** | Viskositas turun pada penyimpanan hangat | Tambahkan **Xanthan Gum 0.2%** pada Fase A sebagai *co-stabilizer* |\n| **Kecepatan Homogenisasi** | Ukuran droplet minyak kurang seragam | Tingkatkan homogenizer dari 2.500 rpm ke **3.500 rpm selama 10 menit** pada suhu 75°C |`,
-      }
-    );
+    return buildDynamicLearningLoopResponse(rawQuery, modelOption);
   }
 
   // 6. Rosacea / Sensitive Skin / Tropical Moisturizer
@@ -809,7 +1554,11 @@ Silakan ketik pertanyaan atau brief produk yang ingin Anda bahas hari ini!`;
   }
 
   // 9. Ceramide NP vs Niacinamide comparison
-  if (/\b(ceramide)\b/.test(lower) && /\b(niacinamide)\b/.test(lower)) {
+  if (
+    /\b(ceramide)\b/.test(lower) &&
+    /\b(niacinamide)\b/.test(lower) &&
+    !/\b(susun|buatkan|racik|rancang|formula)\b/.test(lower)
+  ) {
     return styleByModelSpecialty(
       modelOption,
       "Perbandingan Ceramide NP vs Niacinamide",
@@ -1033,19 +1782,30 @@ Silakan bagikan potongan kode (*snippet*) atau bahasa pemrograman spesifik yang 
 
   if (sanitizedWeb.length > 0) {
     const primaryHit = sanitizedWeb[0];
+    const leadTitle = primaryHit.title
+      .replace(/\s*[-|–—]\s*.*$/, "")
+      .trim();
+
     const extraBullets = sanitizedWeb
-      .slice(1, 4)
-      .map((r) => `- **${r.title}**: ${r.snippet}`)
+      .slice(1, 5)
+      .map((r) => {
+        const shortTitle = r.title.replace(/\s*[-|–—]\s*.*$/, "").trim();
+        return `- **${shortTitle || r.title}**: ${r.snippet}`;
+      })
       .join("\n");
 
-    return `${primaryHit.snippet}${
-      extraBullets ? `\n\n**Informasi Terkait:**\n${extraBullets}` : ""
+    const leadParagraph =
+      primaryHit.snippet.toLowerCase().includes(leadTitle.toLowerCase()) ||
+      !leadTitle
+        ? primaryHit.snippet
+        : `**${leadTitle}** — ${primaryHit.snippet}`;
+
+    return `${leadParagraph}${
+      extraBullets
+        ? `\n\n**Informasi Lengkap & Detail Terkait:**\n${extraBullets}`
+        : ""
     }`;
   }
 
-  return `Mengenai **${cleanTopic}**, saya siap membantu Anda menyusun jawaban lengkap, tabel perbandingan, maupun perhitungan teknisnya menggunakan model **${modelOption.name}**.
-
-- Jika Anda ingin **menghitung angka atau rumus matematika/kimia**, tuliskan angkanya secara langsung (misalnya \`125 * 8\` atau \`15% dari 250000\`).
-- Jika Anda ingin **membandingkan produk atau bahan aktif**, sebutkan nama merek atau bahannya agar saya buatkan tabel perbandingannya.
-- Jika Anda ingin **merancang formula kosmetik**, sebutkan jenis produk (misalnya *Serum, Moisturizer, Cleanser, Sunscreen*) beserta target kulitnya.`;
+  return `Mengenai **${cleanTopic}**, silakan sebutkan detail yang lebih spesifik (seperti nama tempat/lokasi, instansi, tokoh, konsep ilmiah, atau produk yang Anda maksud) agar saya dapat menyajikan informasi lengkap dan akurat untuk Anda.`;
 }

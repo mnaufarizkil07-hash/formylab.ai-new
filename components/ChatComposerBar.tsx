@@ -13,6 +13,10 @@ import {
   formatDuration,
   formatFileSize,
 } from "../lib/chatStorage";
+import {
+  analyzeImageInBrowser,
+  downscaleImageInBrowser,
+} from "../lib/imageVisionEngine";
 
 interface ChatComposerBarProps {
   selectedModel: AiModelId;
@@ -52,6 +56,8 @@ export default function ChatComposerBar({
   const audioChunksRef = useRef<Blob[]>([]);
   const timerIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const attachCounterRef = useRef(1);
+  const pendingOcrMapRef = useRef<Map<string, Promise<string>>>(new Map());
+  const resolvedOcrTextMapRef = useRef<Map<string, string>>(new Map());
 
   const currentModelOpt = getModelOption(selectedModel);
 
@@ -132,6 +138,17 @@ export default function ChatComposerBar({
         });
       }
 
+      // If image, immediately compute visual pixel signature & downscale (<20ms) for fast server OCR
+      if (file.type.startsWith("image/") && dataUrl) {
+        const [sig, optimizedDataUrl] = await Promise.all([
+          analyzeImageInBrowser(dataUrl),
+          downscaleImageInBrowser(dataUrl, 760),
+        ]);
+        dataUrl = optimizedDataUrl || dataUrl;
+        const sigBlock = sig ? `[VISUAL_SIGNATURE: ${JSON.stringify(sig)}]` : "";
+        textPreview = sigBlock || undefined;
+      }
+
       newAttachments.push({
         id,
         name: file.name,
@@ -148,6 +165,8 @@ export default function ChatComposerBar({
   };
 
   const handleRemoveAttachment = (id: string) => {
+    pendingOcrMapRef.current.delete(id);
+    resolvedOcrTextMapRef.current.delete(id);
     setAttachments((prev) => prev.filter((a) => a.id !== id));
   };
 
@@ -328,7 +347,7 @@ export default function ChatComposerBar({
   const hasContentToSend =
     inputText.trim().length > 0 || attachments.length > 0 || isRecordingVn;
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
     if (isLoading) return;
     if (isRecordingVn) {
       finishVoiceNoteRecording();
@@ -336,12 +355,40 @@ export default function ChatComposerBar({
     }
     if (!inputText.trim() && attachments.length === 0) return;
 
-    onSend(inputText.trim(), attachments);
+    const textToSend = inputText.trim();
+    const currentAttachments = [...attachments];
     setInputText("");
     setAttachments([]);
     if (textareaRef.current) {
       textareaRef.current.style.height = "24px";
     }
+
+    // If any uploaded image still has browser OCR running, wait up to 2.2s so OCR text is included
+    const pendingPromises: Promise<string>[] = [];
+    for (const att of currentAttachments) {
+      const p = pendingOcrMapRef.current.get(att.id);
+      if (p) pendingPromises.push(p);
+    }
+    if (pendingPromises.length > 0) {
+      try {
+        await Promise.race([
+          Promise.all(pendingPromises),
+          new Promise((resolve) => setTimeout(resolve, 2200)),
+        ]);
+      } catch {
+        // ignore
+      }
+    }
+
+    const enrichedAttachments = currentAttachments.map((att) => {
+      const resolvedMeta = resolvedOcrTextMapRef.current.get(att.id);
+      if (resolvedMeta) {
+        return { ...att, textPreview: resolvedMeta };
+      }
+      return att;
+    });
+
+    onSend(textToSend, enrichedAttachments);
   };
 
   const handlePrimaryRightButtonClick = () => {

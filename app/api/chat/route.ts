@@ -1,3 +1,4 @@
+import path from "path";
 import { NextRequest, NextResponse } from "next/server";
 import { GoogleGenAI, Part } from "@google/genai";
 import { ChatAttachment } from "../../../lib/chatStorage";
@@ -11,6 +12,10 @@ import {
   fetchRealtimeWebContext,
   userExplicitlyAskedForSources,
 } from "../../../lib/webSearchEngine";
+import {
+  parseAttachmentVisionMetadata,
+  trySolveMathFromOcrText,
+} from "../../../lib/imageVisionEngine";
 import { cleanComputerArtifacts } from "../../../components/FormattedChatText";
 
 interface ApiChatMessage {
@@ -273,6 +278,108 @@ function enrichFinalReply(
   return finalReply;
 }
 
+type WarmWorkerType = {
+  recognize: (img: Buffer) => Promise<{ data?: { text?: string } }>;
+};
+
+const globalForOcr = globalThis as unknown as {
+  __formylabOcrWorkerPromise?: Promise<WarmWorkerType | null>;
+};
+
+async function getWarmTesseractWorker(): Promise<WarmWorkerType | null> {
+  if (!globalForOcr.__formylabOcrWorkerPromise) {
+    globalForOcr.__formylabOcrWorkerPromise = (async () => {
+      try {
+        const TesseractModule = await import("tesseract.js");
+        const createWorker =
+          TesseractModule.createWorker ||
+          TesseractModule.default?.createWorker;
+        if (!createWorker) return null;
+        const workerPath = path.join(
+          process.cwd(),
+          "node_modules",
+          "tesseract.js",
+          "src",
+          "worker-script",
+          "node",
+          "index.js"
+        );
+        const worker = await createWorker("eng", 1, { workerPath });
+        return worker as unknown as WarmWorkerType;
+      } catch {
+        globalForOcr.__formylabOcrWorkerPromise = undefined;
+        return null;
+      }
+    })();
+  }
+  return globalForOcr.__formylabOcrWorkerPromise;
+}
+
+async function ensureImageOcrEnriched(
+  messages: ApiChatMessage[]
+): Promise<string> {
+  const lastMsg = messages[messages.length - 1];
+  let targetAttachments = lastMsg?.attachments;
+
+  if (!targetAttachments || targetAttachments.length === 0) {
+    for (let i = messages.length - 2; i >= Math.max(0, messages.length - 6); i--) {
+      const prevAtts = messages[i]?.attachments;
+      if (prevAtts && prevAtts.some((a) => a.mimeType?.startsWith("image/"))) {
+        targetAttachments = prevAtts;
+        break;
+      }
+    }
+  }
+
+  if (!targetAttachments || targetAttachments.length === 0) {
+    return "";
+  }
+
+  const collectedOcr: string[] = [];
+
+  for (const att of targetAttachments) {
+    if (!att.mimeType?.startsWith("image/")) continue;
+
+    const existingMeta = parseAttachmentVisionMetadata(att.textPreview);
+    if (existingMeta.ocrText) {
+      collectedOcr.push(existingMeta.ocrText);
+      continue;
+    }
+
+    // Run server-side Tesseract OCR using warm worker with explicit workerPath
+    if (att.dataUrl && att.dataUrl.startsWith("data:image/")) {
+      const commaIdx = att.dataUrl.indexOf(",");
+      if (commaIdx !== -1) {
+        const base64Data = att.dataUrl.slice(commaIdx + 1);
+        if (base64Data) {
+          try {
+            const extracted = await Promise.race([
+              (async () => {
+                const worker = await getWarmTesseractWorker();
+                if (!worker) return "";
+                const imgBuf = Buffer.from(base64Data, "base64");
+                const res = await worker.recognize(imgBuf);
+                return (res?.data?.text || "").trim().slice(0, 2500);
+              })(),
+              new Promise<string>((resolve) =>
+                setTimeout(() => resolve(""), 6500)
+              ),
+            ]);
+            if (extracted) {
+              att.textPreview = `${att.textPreview || ""}\n[OCR_TEXT]:\n${extracted}`.trim();
+              collectedOcr.push(extracted);
+            }
+          } catch {
+            // ignore OCR error
+          }
+        }
+      }
+    }
+  }
+
+  return collectedOcr.join("\n").trim();
+}
+
 async function generateWithResilientCascade(
   messages: ApiChatMessage[],
   modelOption: AiModelOption,
@@ -285,12 +392,31 @@ async function generateWithResilientCascade(
 }> {
   const lastMsg = messages[messages.length - 1];
   const lastUserText = (lastMsg?.content || "").trim();
+
+  // Enrich any image attachments with OCR text if not already extracted
+  const extractedImageOcr = await ensureImageOcrEnriched(messages);
+
   const { inlineParts, attachmentSummary } =
     extractConversationAttachments(messages);
 
-  // Instant deterministic path for pure math expressions
+  // Instant deterministic path for pure math expressions (text or OCR math image!)
+  if (extractedImageOcr) {
+    const ocrMathSolution = trySolveMathFromOcrText(
+      extractedImageOcr,
+      modelOption
+    );
+    if (ocrMathSolution) {
+      return {
+        reply: ocrMathSolution,
+        engineUsed: `${modelOption.id}-vision-math-engine`,
+        missingBriefFields: [],
+        webSourcesCount: 0,
+      };
+    }
+  }
+
   const exactMathReply = tryEvaluateMath(lastUserText, modelOption);
-  if (exactMathReply && inlineParts.length === 0 && !attachmentSummary) {
+  if (exactMathReply && (!lastMsg?.attachments || lastMsg.attachments.length === 0)) {
     return {
       reply: exactMathReply,
       engineUsed: `${modelOption.id}-math-engine`,
@@ -308,10 +434,25 @@ async function generateWithResilientCascade(
     prevUserMessages.length >= 2
       ? prevUserMessages[prevUserMessages.length - 2]?.content.slice(0, 60) || ""
       : "";
-  const combinedSearchQuery =
+
+  let combinedSearchQuery =
     isPronounFollowUp && prevUserText
       ? `${prevUserText} ${lastUserText}`
       : lastUserText;
+
+  // If an image has meaningful OCR text and the user prompt is short/generic (e.g., "apa ini?", "berapa jawabannya?"),
+  // include the OCR text in the web search query so Google/Wikipedia can answer questions inside screenshots!
+  if (extractedImageOcr && lastUserText.split(/\s+/).length <= 6) {
+    const cleanOcrWords = extractedImageOcr
+      .replace(/[^a-zA-Z0-9\s]/g, " ")
+      .split(/\s+/)
+      .filter((w) => w.length >= 4)
+      .slice(0, 10)
+      .join(" ");
+    if (cleanOcrWords) {
+      combinedSearchQuery = `${combinedSearchQuery} ${cleanOcrWords}`.trim();
+    }
+  }
 
   const [briefReport, webContext] = await Promise.all([
     Promise.resolve(analyzeBriefCompleteness(messages)),

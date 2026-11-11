@@ -44,4 +44,5 @@ next-env.d.ts
 /.aistudio
 /.playwright-cli
 /public/assets/aistudio/Screenshot*
+*.traineddata
 
