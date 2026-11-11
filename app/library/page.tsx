@@ -172,7 +172,7 @@ export default function LibraryPage() {
         </div>
 
         {/* Filter & Search Bar */}
-        <div className="bg-white/95 backdrop-blur-md rounded-2xl p-4 sm:p-5 shadow-sm border border-emerald-900/10 mb-6 space-y-4">
+        <div className="bg-white rounded-2xl p-4 sm:p-5 shadow-sm border border-emerald-900/10 mb-6 space-y-4">
           <div className="grid grid-cols-1 md:grid-cols-12 gap-3 items-center">
             {/* Search Input */}
             <div className="md:col-span-5 relative">
@@ -328,7 +328,7 @@ export default function LibraryPage() {
             {/* RIGHT 6 COLUMNS: STICKY 3D WEBGL MOLECULE VIEWER & FULL SCIENTIFIC DOSSIER */}
             {activeIng && (
               <div className="lg:col-span-6 lg:sticky lg:top-6 space-y-5">
-                <div className="bg-white/95 backdrop-blur-md rounded-[2rem] p-6 sm:p-7 shadow-[0_22px_55px_-15px_rgba(16,68,56,0.16)] border border-emerald-900/10">
+                <div className="bg-white rounded-[2rem] p-6 sm:p-7 shadow-[0_22px_55px_-15px_rgba(16,68,56,0.16)] border border-emerald-900/10">
                   {/* Dossier Header */}
                   <div className="flex items-start justify-between gap-4 mb-4">
                     <div>

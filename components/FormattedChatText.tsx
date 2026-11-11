@@ -9,6 +9,19 @@ export function cleanComputerArtifacts(raw: string): string {
 
   return (
     raw
+      // Decode any escaped HTML entities first so tags can be cleanly stripped
+      .replace(/&lt;/gi, "<")
+      .replace(/&gt;/gi, ">")
+      .replace(/&quot;/gi, '"')
+      .replace(/&#039;|&apos;/gi, "'")
+      .replace(/&nbsp;/gi, " ")
+      .replace(/&amp;/gi, "&")
+      // Convert raw HTML <a href="url">label</a> into plain text "label"
+      .replace(/<a\s+[^>]*>([\s\S]*?)<\/a>/gi, "$1")
+      // Remove <font ...>text</font> keeping inner text
+      .replace(/<font\s+[^>]*>([\s\S]*?)<\/font>/gi, "$1")
+      // Strip any remaining raw HTML tags like <a ...>, </font>, <br>, <div>, <span>
+      .replace(/<\/?(?:a|font|span|div|p|br|hr|img|table|tr|td|th|ul|ol|li|b|i|u|strong|em)\b[^>]*>/gi, " ")
       // Convert block $$...$$ into clean inline lines
       .replace(/\$\$([\s\S]*?)\$\$/g, (_, inner) => `\n${inner.trim()}\n`)
       // Convert LaTeX commands into clean Unicode typography

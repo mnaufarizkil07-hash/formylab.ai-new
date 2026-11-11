@@ -21,12 +21,17 @@
   --color-navy: #1B2A4A;
 }
 
+html {
+  scroll-behavior: smooth;
+}
+
 html,
 body {
   background-color: #F8FBFB;
   color: var(--color-navy);
   scrollbar-width: none;
   -ms-overflow-style: none;
+  -webkit-overflow-scrolling: touch;
 }
 
 html::-webkit-scrollbar,
@@ -38,12 +43,10 @@ body::-webkit-scrollbar,
 }
 
 .glass-card {
-  background: rgba(255, 255, 255, 0.7);
-  backdrop-filter: blur(20px) saturate(140%);
-  -webkit-backdrop-filter: blur(20px) saturate(140%);
-  border: 1px solid rgba(255, 255, 255, 0.8);
+  background: rgba(255, 255, 255, 0.96);
+  border: 1px solid rgba(255, 255, 255, 0.9);
   border-radius: 24px;
-  box-shadow: 0 10px 40px rgba(53, 200, 180, 0.15);
+  box-shadow: 0 10px 32px rgba(53, 200, 180, 0.12);
 }
 
 /* ==========================================================================
@@ -242,19 +245,15 @@ body::-webkit-scrollbar,
 
 .tilt-card-body {
   position: relative;
-  transform-style: preserve-3d;
-  will-change: transform;
 }
 
-/* Parallax kedalaman untuk ikon/judul di dalam TiltCard (translateZ 20-40px) */
+/* Parallax kedalaman untuk ikon/judul di dalam TiltCard */
 .tilt-depth-sm {
-  transform: translateZ(22px);
-  transform-style: preserve-3d;
+  position: relative;
 }
 
 .tilt-depth-lg {
-  transform: translateZ(34px);
-  transform-style: preserve-3d;
+  position: relative;
 }
 
 /* ==========================================================================
@@ -314,23 +313,15 @@ body::-webkit-scrollbar,
   }
 }
 
-/* --- ANIMASI GRADASI 4 WARNA (Buat Halaman Login) --- */
+/* --- GRADASI 4 WARNA (GPU-Friendly Static Multi-Stop Gradient, Zero Scroll Repaint) --- */
 .bg-gradasi-animasi {
   background: linear-gradient(
-    -45deg,
-    var(--color-brume),
-    var(--color-menthe),
-    var(--color-limonade),
-    var(--color-verveine)
+    135deg,
+    var(--color-brume) 0%,
+    #bfece0 35%,
+    var(--color-limonade) 70%,
+    #b6e8d4 100%
   );
-  background-size: 400% 400%;
-  animation: gradientGerak 10s ease infinite;
-}
-
-@keyframes gradientGerak {
-  0% { background-position: 0% 50%; }
-  50% { background-position: 100% 50%; }
-  100% { background-position: 0% 50%; }
 }
 
 /* --- ANIMASI MESH GRADIENT (Buat Dashboard) --- */

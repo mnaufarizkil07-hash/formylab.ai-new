@@ -168,13 +168,50 @@ export default function ResultPage() {
 
       if (savedForm && savedCandidates) {
         try {
-          setFormData(JSON.parse(savedForm));
-          setCandidates(JSON.parse(savedCandidates));
-          return;
+          const parsedForm = JSON.parse(savedForm);
+          const parsedCands = JSON.parse(savedCandidates);
+          if (parsedForm && Array.isArray(parsedCands) && parsedCands.length > 0) {
+            setFormData(parsedForm);
+            setCandidates(parsedCands);
+            return;
+          }
         } catch {
           // fallback below
         }
       }
+
+      const loadDefaultFormulation = () => {
+        const defaultForm: FormData = {
+          productType: "Facial Moisturizer (Cream)",
+          skinTarget: "Sensitive & Redness",
+          desiredTexture: "Light Gel-Cream (Cepat Meresap, Non-Sticky)",
+          targetPh: "5.5",
+          targetViscosity: "6,000 – 10,000 cPs",
+          batchSize: "100",
+          targetHppPerUnit: "12500",
+          trialBudgetRp: "300000",
+          halalRequirement: "Wajib Halal (LPPOM MUI / BPJPH)",
+          projectDeadline: "8 Minggu (Standar R&D + Stabilitas 28 Hari)",
+          targetMoq: "1000",
+          customIngredients: ["Niacinamide 4%", "Panthenol 2%", "Ceramide NP 1%"],
+          viewCost: true,
+        };
+        fetch("/api/formulate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(defaultForm),
+        })
+          .then((r) => r.json())
+          .then((resData) => {
+            if (resData.success && Array.isArray(resData.candidates)) {
+              setFormData(defaultForm);
+              setCandidates(resData.candidates);
+              localStorage.setItem("currentFormulation", JSON.stringify(defaultForm));
+              localStorage.setItem("aiGeneratedCandidates", JSON.stringify(resData.candidates));
+            }
+          })
+          .catch(() => {});
+      };
 
       fetch("/api/formulations")
         .then((r) => r.json())
@@ -191,9 +228,13 @@ export default function ResultPage() {
               viewCost: true,
             });
             setCandidates(latest.candidates || []);
+          } else {
+            loadDefaultFormulation();
           }
         })
-        .catch(() => {});
+        .catch(() => {
+          loadDefaultFormulation();
+        });
     });
   }, []);
 
@@ -369,7 +410,7 @@ export default function ResultPage() {
 
       <main className="relative z-10 max-w-7xl mx-auto px-4 sm:px-6 pt-4">
         {/* Top Action & Study Report Toolbar */}
-        <div className="bg-white/95 backdrop-blur-md rounded-[2rem] p-6 sm:p-8 shadow-[0_20px_50px_-15px_rgba(16,68,56,0.15)] border border-emerald-900/10 mb-8">
+        <div className="bg-white rounded-[2rem] p-6 sm:p-8 shadow-[0_20px_50px_-15px_rgba(16,68,56,0.15)] border border-emerald-900/10 mb-8">
           <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-6">
             <div>
               <div className="flex flex-wrap items-center gap-2 text-xs font-mono text-[#0f766e] font-bold mb-2">
@@ -600,7 +641,7 @@ export default function ResultPage() {
           {candidates.map((cand) => (
             <div
               key={cand.id}
-              className="bg-white/95 backdrop-blur-md p-6 sm:p-7 rounded-[2rem] shadow-[0_22px_55px_-15px_rgba(16,68,56,0.15)] border border-emerald-900/10 flex flex-col justify-between"
+              className="bg-white p-6 sm:p-7 rounded-[2rem] shadow-[0_22px_55px_-15px_rgba(16,68,56,0.15)] border border-emerald-900/10 flex flex-col justify-between"
             >
               <div>
                 {/* Candidate Header */}
@@ -769,7 +810,7 @@ export default function ResultPage() {
         {/* TAHAP 6, 7, 8 & 9: RENCANA PERCOBAAN (TRIAL PLANNER), LEARNING LOOP & DOKUMENTASI BPOM/HALAL */}
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
           {/* TAHAP 6: RENCANA PERCOBAAN LAB (TRIAL PLANNER) */}
-          <div className="lg:col-span-4 bg-white/95 backdrop-blur-md p-6 sm:p-7 rounded-[2rem] shadow-sm border border-emerald-900/10">
+          <div className="lg:col-span-4 bg-white p-6 sm:p-7 rounded-[2rem] shadow-sm border border-emerald-900/10">
             <span className="text-[11px] font-mono font-extrabold text-[#0f766e] uppercase">
               TAHAP 6 · TRIAL PLANNER
             </span>
@@ -806,7 +847,7 @@ export default function ResultPage() {
           </div>
 
           {/* TAHAP 7 & 8: INPUT HASIL RACIKAN LAB & AI LEARNING LOOP */}
-          <div className="lg:col-span-5 bg-white/95 backdrop-blur-md p-6 sm:p-7 rounded-[2rem] shadow-sm border border-emerald-900/10 flex flex-col justify-between">
+          <div className="lg:col-span-5 bg-white p-6 sm:p-7 rounded-[2rem] shadow-sm border border-emerald-900/10 flex flex-col justify-between">
             <div>
               <span className="text-[11px] font-mono font-extrabold text-[#0f766e] uppercase">
                 TAHAP 7 &amp; 8 · TIM R&amp;D MERACIK &amp; LEARNING LOOP
@@ -890,7 +931,7 @@ export default function ResultPage() {
           </div>
 
           {/* TAHAP 9: DOKUMENTASI FINAL (FORMULA SHEET, NOTIFIKASI BPOM & HALAL) */}
-          <div className="lg:col-span-3 bg-white/95 backdrop-blur-md p-6 sm:p-7 rounded-[2rem] shadow-sm border border-emerald-900/10 flex flex-col justify-between">
+          <div className="lg:col-span-3 bg-white p-6 sm:p-7 rounded-[2rem] shadow-sm border border-emerald-900/10 flex flex-col justify-between">
             <div>
               <span className="text-[11px] font-mono font-extrabold text-[#0f766e] uppercase">
                 TAHAP 9 · DOKUMENTASI FINAL

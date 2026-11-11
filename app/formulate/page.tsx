@@ -438,7 +438,7 @@ export default function FormulatePage() {
 
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
           {/* LEFT 7 COLUMNS: FORMULATOR INPUT CONSOLE */}
-          <div className="lg:col-span-7 bg-white/95 backdrop-blur-md p-7 sm:p-9 rounded-[2rem] shadow-[0_20px_50px_-15px_rgba(16,68,56,0.15)] border border-emerald-900/10">
+          <div className="lg:col-span-7 bg-white p-7 sm:p-9 rounded-[2rem] shadow-[0_20px_50px_-15px_rgba(16,68,56,0.15)] border border-emerald-900/10">
             <form onSubmit={handleSubmit} className="space-y-6">
               {/* PARAMETER GROUP 1: TARGET KULIT & TEKSTUR YANG DIINGINKAN */}
               <div className="p-4 sm:p-5 rounded-2xl bg-slate-50/90 border border-slate-200/80 space-y-4">
@@ -995,7 +995,7 @@ export default function FormulatePage() {
             </div>
 
             {/* REAL-TIME INTERACTIVE AI CO-PILOT (4-PILLAR LIVE ASSISTANT) */}
-            <div className="bg-white/95 backdrop-blur-md p-6 rounded-[2rem] shadow-[0_20px_50px_-15px_rgba(16,68,56,0.15)] border border-emerald-900/10">
+            <div className="bg-white p-6 rounded-[2rem] shadow-[0_20px_50px_-15px_rgba(16,68,56,0.15)] border border-emerald-900/10">
               <div className="flex items-center justify-between gap-2 mb-3">
                 <div>
                   <span className="text-[11px] font-mono text-[#0f766e] font-bold block">
@@ -1084,7 +1084,7 @@ export default function FormulatePage() {
             </div>
 
             {/* Validated Product Specification Card */}
-            <div className="bg-white/95 backdrop-blur-md p-6 sm:p-7 rounded-[2rem] shadow-[0_20px_50px_-15px_rgba(16,68,56,0.15)] border border-emerald-900/10">
+            <div className="bg-white p-6 sm:p-7 rounded-[2rem] shadow-[0_20px_50px_-15px_rgba(16,68,56,0.15)] border border-emerald-900/10">
               <div className="flex items-start justify-between gap-3 mb-4">
                 <div>
                   <span className="text-[11px] font-mono uppercase tracking-wider text-[#0f766e] font-bold block">
@@ -1137,7 +1137,7 @@ export default function FormulatePage() {
             </div>
 
             {/* Live 3D Molecule Preview of Selected Active */}
-            <div className="bg-white/95 backdrop-blur-md p-6 rounded-[2rem] shadow-[0_20px_50px_-15px_rgba(16,68,56,0.15)] border border-emerald-900/10">
+            <div className="bg-white p-6 rounded-[2rem] shadow-[0_20px_50px_-15px_rgba(16,68,56,0.15)] border border-emerald-900/10">
               <div className="flex items-center justify-between gap-2 mb-3">
                 <div className="flex items-center gap-2">
                   <Atom className="w-4 h-4 text-[#0f766e]" />

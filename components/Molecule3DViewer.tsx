@@ -265,30 +265,48 @@ export default function Molecule3DViewer({
       }
     };
 
-    const onWheel = (e: WheelEvent) => {
-      e.preventDefault();
-      cameraDistanceRef.current = Math.max(
-        4.2,
-        Math.min(14.5, cameraDistanceRef.current + e.deltaY * 0.005)
-      );
-    };
-
     mount.addEventListener("pointerdown", onPointerDown);
     mount.addEventListener("pointermove", onPointerMove);
     mount.addEventListener("pointerup", onPointerUp);
-    mount.addEventListener("wheel", onWheel, { passive: false });
 
     const scratchVec = new THREE.Vector3();
     let rafId = 0;
     let stepTimer = 0;
     let disposed = false;
+    let cachedW = width;
+    let cachedH = height;
+    let isVisible = true;
+    let isPageScrolling = false;
+    let scrollPauseTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const onWindowScroll = () => {
+      isPageScrolling = true;
+      if (scrollPauseTimer !== null) clearTimeout(scrollPauseTimer);
+      scrollPauseTimer = setTimeout(() => {
+        isPageScrolling = false;
+      }, 160);
+    };
+    window.addEventListener("scroll", onWindowScroll, { passive: true });
+
+    let observer: IntersectionObserver | null = null;
+    if (typeof IntersectionObserver !== "undefined") {
+      observer = new IntersectionObserver(
+        (entries) => {
+          if (entries[0]) {
+            isVisible = entries[0].isIntersecting;
+          }
+        },
+        { threshold: 0.05 }
+      );
+      observer.observe(mount);
+    }
 
     const updateOverlayLabels = () => {
       const overlay = labelsOverlayRef.current;
       if (!overlay) return;
       const currentMol = profileRef.current.molecule3D;
-      const w = mount.clientWidth || width;
-      const h = mount.clientHeight || height;
+      const w = cachedW;
+      const h = cachedH;
 
       let minX = Infinity,
         maxX = -Infinity,
@@ -334,6 +352,11 @@ export default function Molecule3DViewer({
     const renderFrame = () => {
       if (disposed || !renderer) return;
 
+      if (!isVisible || (isPageScrolling && !isDragging) || document.hidden) {
+        stepTimer = window.setTimeout(renderFrame, 120);
+        return;
+      }
+
       if (autoRotateRef.current && !isDragging) {
         rotationTargetRef.current.y += isSoftwareGl ? 0.015 : 0.007;
       }
@@ -367,27 +390,32 @@ export default function Molecule3DViewer({
       }
     };
 
+    // Initial render
+    renderer.render(scene, camera);
+    updateOverlayLabels();
     renderFrame();
 
     const onResize = () => {
       if (!mount || !renderer) return;
-      const nw = mount.clientWidth || 480;
-      const nh = mount.clientHeight || 340;
-      camera.aspect = nw / nh;
+      cachedW = mount.clientWidth || 480;
+      cachedH = mount.clientHeight || 340;
+      camera.aspect = cachedW / cachedH;
       camera.updateProjectionMatrix();
-      renderer.setSize(nw, nh);
+      renderer.setSize(cachedW, cachedH);
     };
-    window.addEventListener("resize", onResize);
+    window.addEventListener("resize", onResize, { passive: true });
 
     return () => {
       disposed = true;
       cancelAnimationFrame(rafId);
       clearTimeout(stepTimer);
+      if (scrollPauseTimer !== null) clearTimeout(scrollPauseTimer);
+      observer?.disconnect();
+      window.removeEventListener("scroll", onWindowScroll);
       window.removeEventListener("resize", onResize);
       mount.removeEventListener("pointerdown", onPointerDown);
       mount.removeEventListener("pointermove", onPointerMove);
       mount.removeEventListener("pointerup", onPointerUp);
-      mount.removeEventListener("wheel", onWheel);
       sphereGeo.dispose();
       cylGeo.dispose();
       ringGeo.dispose();

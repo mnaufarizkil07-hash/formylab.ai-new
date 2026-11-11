@@ -48,69 +48,50 @@ export default function LandingAndLoginPage() {
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  // Interactive Glowing Molecular Polygon Network Canvas
+  // Interactive Glowing Molecular Polygon Network Canvas (auto-paused during scroll for 60fps smoothness)
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext("2d");
+    const ctx = canvas.getContext("2d", { alpha: true });
     if (!ctx) return;
 
     let animationFrameId = 0;
-    let stepTimer = 0;
     let width = (canvas.width = window.innerWidth);
     let height = (canvas.height = window.innerHeight);
-
-    const handleResize = () => {
-      if (!canvas) return;
-      width = canvas.width = window.innerWidth;
-      height = canvas.height = window.innerHeight;
-    };
-    window.addEventListener("resize", handleResize);
-
-    const mouse = {
-      x: -1000,
-      y: -1000,
-      targetX: -1000,
-      targetY: -1000,
-      radius: 220,
-    };
-    const handleMouseMove = (e: MouseEvent) => {
-      mouse.targetX = e.clientX;
-      mouse.targetY = e.clientY;
-    };
-    const handleMouseLeave = () => {
-      mouse.targetX = -1000;
-      mouse.targetY = -1000;
-    };
-    window.addEventListener("mousemove", handleMouseMove);
-    document.addEventListener("mouseleave", handleMouseLeave);
+    let isScrolling = false;
+    let scrollTimer: ReturnType<typeof setTimeout> | null = null;
 
     const palette = ["#a4cf4a", "#00f5d4", "#38bdf8", "#2dd4bf"];
-    const particles: {
-      x: number;
-      y: number;
-      vx: number;
-      vy: number;
-      radius: number;
-      color: string;
-    }[] = [];
+    const particles = Array.from({ length: 22 }, (_, i) => ({
+      x: ((i * 239) % Math.max(width - 80, 600)) + 40,
+      y: ((i * 173) % Math.max(height - 80, 500)) + 40,
+      vx: ((i % 5) - 2) * 0.16 || 0.14,
+      vy: ((i % 7) - 3) * 0.14 || -0.12,
+      radius: (i % 3) + 3.0,
+      color: palette[i % palette.length],
+    }));
 
-    for (let i = 0; i < 52; i++) {
-      particles.push({
-        x: ((i * 179) % Math.max(width, 900)) + 25,
-        y: ((i * 137) % Math.max(height, 700)) + 25,
-        vx: ((i % 5) - 2) * 0.26 || 0.22,
-        vy: ((i % 7) - 3) * 0.22 || -0.18,
-        radius: (i % 4) + 3.2,
-        color: palette[i % palette.length],
-      });
-    }
+    const maxDistSq = 160 * 160;
 
-    const render = () => {
+    const drawFrame = () => {
       ctx.clearRect(0, 0, width, height);
 
-      mouse.x += (mouse.targetX - mouse.x) * 0.08;
-      mouse.y += (mouse.targetY - mouse.y) * 0.08;
+      ctx.lineWidth = 1.15;
+      ctx.strokeStyle = "rgba(0, 225, 195, 0.22)";
+      ctx.beginPath();
+      for (let i = 0; i < particles.length; i++) {
+        const p = particles[i];
+        for (let j = i + 1; j < particles.length; j++) {
+          const p2 = particles[j];
+          const dx = p.x - p2.x;
+          const dy = p.y - p2.y;
+          if (dx * dx + dy * dy < maxDistSq) {
+            ctx.moveTo(p.x, p.y);
+            ctx.lineTo(p2.x, p2.y);
+          }
+        }
+      }
+      ctx.stroke();
 
       for (let i = 0; i < particles.length; i++) {
         const p = particles[i];
@@ -120,62 +101,55 @@ export default function LandingAndLoginPage() {
         if (p.x < 0 || p.x > width) p.vx *= -1;
         if (p.y < 0 || p.y > height) p.vy *= -1;
 
-        const dxMouse = mouse.x - p.x;
-        const dyMouse = mouse.y - p.y;
-        const distMouse = Math.sqrt(dxMouse * dxMouse + dyMouse * dyMouse);
-        if (distMouse < mouse.radius && distMouse > 1) {
-          const force = (mouse.radius - distMouse) / mouse.radius;
-          p.x += (dxMouse / distMouse) * force * 1.4;
-          p.y += (dyMouse / distMouse) * force * 1.4;
-        }
-
-        for (let j = i + 1; j < particles.length; j++) {
-          const p2 = particles[j];
-          const dx = p.x - p2.x;
-          const dy = p.y - p2.y;
-          const dist = Math.sqrt(dx * dx + dy * dy);
-
-          if (dist < 165) {
-            ctx.save();
-            ctx.beginPath();
-            ctx.moveTo(p.x, p.y);
-            ctx.lineTo(p2.x, p2.y);
-            let alpha = (1 - dist / 165) * 0.45;
-            if (distMouse < mouse.radius) alpha = Math.min(0.85, alpha * 1.6);
-
-            ctx.strokeStyle = `rgba(0, 245, 212, ${alpha.toFixed(3)})`;
-            ctx.lineWidth = dist < 95 ? 1.8 : 1.1;
-            ctx.stroke();
-            ctx.restore();
-          }
-        }
-
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, p.radius * 2.3, 0, Math.PI * 2);
         ctx.fillStyle = p.color;
-        ctx.globalAlpha = 0.22;
+        ctx.globalAlpha = 0.2;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.radius * 2.2, 0, Math.PI * 2);
         ctx.fill();
 
+        ctx.globalAlpha = 0.88;
         ctx.beginPath();
         ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
-        ctx.fillStyle = p.color;
-        ctx.globalAlpha = 0.92;
         ctx.fill();
-        ctx.globalAlpha = 1;
       }
-
-      stepTimer = window.setTimeout(() => {
-        animationFrameId = requestAnimationFrame(render);
-      }, 80);
+      ctx.globalAlpha = 1;
     };
 
-    render();
+    const handleResize = () => {
+      if (!canvas) return;
+      width = canvas.width = window.innerWidth;
+      height = canvas.height = window.innerHeight;
+      drawFrame();
+    };
+
+    const handleScroll = () => {
+      isScrolling = true;
+      if (scrollTimer !== null) clearTimeout(scrollTimer);
+      scrollTimer = setTimeout(() => {
+        isScrolling = false;
+      }, 180);
+    };
+
+    window.addEventListener("resize", handleResize, { passive: true });
+    window.addEventListener("scroll", handleScroll, { passive: true });
+
+    drawFrame();
+
+    let lastTime = 0;
+    const loop = (now: number) => {
+      animationFrameId = requestAnimationFrame(loop);
+      if (isScrolling || document.hidden) return;
+      if (now - lastTime < 50) return;
+      lastTime = now;
+      drawFrame();
+    };
+
+    animationFrameId = requestAnimationFrame(loop);
 
     return () => {
       window.removeEventListener("resize", handleResize);
-      window.removeEventListener("mousemove", handleMouseMove);
-      document.removeEventListener("mouseleave", handleMouseLeave);
-      clearTimeout(stepTimer);
+      window.removeEventListener("scroll", handleScroll);
+      if (scrollTimer !== null) clearTimeout(scrollTimer);
       cancelAnimationFrame(animationFrameId);
     };
   }, []);
@@ -567,7 +541,7 @@ export default function LandingAndLoginPage() {
         {/* SECTION 1: HERO OVERVIEW IN ENGLISH WITHOUT PARENTHETICAL STAGE NUMBERS */}
         <section
           id="tentang-website"
-          className="bg-white/95 backdrop-blur-xl rounded-[2.5rem] p-8 sm:p-12 lg:p-14 shadow-[0_24px_60px_-15px_rgba(16,68,56,0.18)] border border-emerald-900/10"
+          className="bg-white rounded-[2.5rem] p-8 sm:p-12 lg:p-14 shadow-[0_24px_60px_-15px_rgba(16,68,56,0.18)] border border-emerald-900/10"
         >
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-center">
             <div className="lg:col-span-7">
@@ -681,7 +655,7 @@ export default function LandingAndLoginPage() {
         {/* SECTION 2: END-TO-END WORKFLOW */}
         <section
           id="alur-kerja"
-          className="bg-white/95 backdrop-blur-xl rounded-[2.5rem] p-8 sm:p-10 lg:p-12 shadow-[0_22px_55px_-15px_rgba(16,68,56,0.16)] border border-emerald-900/10"
+          className="bg-white rounded-[2.5rem] p-8 sm:p-10 lg:p-12 shadow-[0_22px_55px_-15px_rgba(16,68,56,0.16)] border border-emerald-900/10"
         >
           <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4 mb-8">
             <div>
@@ -738,7 +712,7 @@ export default function LandingAndLoginPage() {
         {/* SECTION 3: 9 INTEGRATED AI MODULES */}
         <section
           id="fungsi-ai"
-          className="bg-white/95 backdrop-blur-xl rounded-[2.5rem] p-8 sm:p-10 lg:p-12 shadow-[0_22px_55px_-15px_rgba(16,68,56,0.16)] border border-emerald-900/10"
+          className="bg-white rounded-[2.5rem] p-8 sm:p-10 lg:p-12 shadow-[0_22px_55px_-15px_rgba(16,68,56,0.16)] border border-emerald-900/10"
         >
           <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4 mb-10">
             <div>
@@ -812,7 +786,7 @@ export default function LandingAndLoginPage() {
           </div>
 
           {/* MISSION CARD */}
-          <div className="lg:col-span-7 bg-white/95 backdrop-blur-xl rounded-[2.2rem] p-8 sm:p-10 shadow-[0_20px_50px_-15px_rgba(16,68,56,0.14)] border border-emerald-900/10 flex flex-col justify-between">
+          <div className="lg:col-span-7 bg-white rounded-[2.2rem] p-8 sm:p-10 shadow-[0_20px_50px_-15px_rgba(16,68,56,0.14)] border border-emerald-900/10 flex flex-col justify-between">
             <div>
               <div className="flex items-center gap-3 mb-4">
                 <div className="w-11 h-11 rounded-2xl bg-teal-50 border border-teal-200 text-[#0d9488] flex items-center justify-center">
@@ -879,7 +853,7 @@ export default function LandingAndLoginPage() {
         {/* SECTION 5: 4 AI PILLARS & 3D MOLECULAR STUDIO */}
         <section
           id="empat-pilar-ai"
-          className="bg-white/95 backdrop-blur-xl rounded-[2.5rem] p-8 sm:p-10 shadow-[0_22px_55px_-15px_rgba(16,68,56,0.14)] border border-emerald-900/10"
+          className="bg-white rounded-[2.5rem] p-8 sm:p-10 shadow-[0_22px_55px_-15px_rgba(16,68,56,0.14)] border border-emerald-900/10"
         >
           <div className="mb-8">
             <p className="text-xs font-extrabold tracking-[0.2em] uppercase text-[#0d9488] mb-2">

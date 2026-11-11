@@ -378,8 +378,13 @@ export async function POST(request: Request) {
         );
       }
 
-      if (customIngs && Array.isArray(customIngs)) {
-        customIngs.forEach((ci) => {
+      const effectiveCustomIngs =
+        customIngs && Array.isArray(customIngs) && customIngs.filter((c) => String(c).trim()).length > 0
+          ? customIngs
+          : productSpec.recommendedActives.slice(0, 2).map((a) => a.name);
+
+      if (effectiveCustomIngs && Array.isArray(effectiveCustomIngs)) {
+        effectiveCustomIngs.forEach((ci) => {
           if (!ci || !String(ci).trim()) return;
           let userPerc: number | null = null;
           let cleanName = String(ci).trim();
@@ -431,15 +436,19 @@ export async function POST(request: Request) {
               }
             }
 
+            // Differentiate active dosage slightly across Variant A (100%), Variant B (85% cost-saver), Variant C (90% ready-stock)
+            const variantFactor = variantIndex === 0 ? 1.0 : variantIndex === 1 ? 0.85 : 0.9;
+            const adjustedConc = Number((concNum * variantFactor).toFixed(2));
+
             const suppInfo = getSupplierInfo(cleanName);
             const activePrice = suppInfo.price > 25 ? suppInfo.price : 150;
-            totalCost += (concNum / 100) * finalBatchSize * activePrice;
+            totalCost += (adjustedConc / 100) * finalBatchSize * activePrice;
 
             list.push(
               buildEnrichedItem(
                 cleanName,
                 "Custom Active Compound",
-                concNum,
+                adjustedConc,
                 "Low",
                 `Active Compound untuk ${skinTarget || productSpec.shortName}`,
                 suppInfo
@@ -447,6 +456,35 @@ export async function POST(request: Request) {
             );
           }
         });
+      }
+
+      // 3. Rebalance to exact 100.00% w/w mass balance (q.s. ad 100.00%)
+      list.sort((a, b) => parseFloat(b.conc) - parseFloat(a.conc));
+      if (list.length > 0) {
+        const currentSum = list.reduce((acc, item) => acc + (parseFloat(item.conc) || 0), 0);
+        const diff = 100 - currentSum;
+        if (Math.abs(diff) > 0.001) {
+          // Adjust primary carrier (Water / Aqua or highest base component) if possible, otherwise scale proportionally
+          const carrierIdx = list.findIndex((i) =>
+            /\b(water|aqua|liquid paraffin|glycerin)\b/i.test(i.name)
+          );
+          const targetIdx = carrierIdx !== -1 ? carrierIdx : 0;
+          const targetCurrent = parseFloat(list[targetIdx].conc) || 0;
+          if (targetCurrent + diff >= 5.0) {
+            list[targetIdx].conc = `${(targetCurrent + diff).toFixed(2)}%`;
+          } else if (currentSum > 0) {
+            let running = 0;
+            for (let i = 0; i < list.length; i++) {
+              if (i === list.length - 1) {
+                list[i].conc = `${Math.max(0.05, 100 - running).toFixed(2)}%`;
+              } else {
+                const scaled = Number((((parseFloat(list[i].conc) || 0) / currentSum) * 100).toFixed(2));
+                list[i].conc = `${scaled.toFixed(2)}%`;
+                running += scaled;
+              }
+            }
+          }
+        }
       }
 
       list.sort((a, b) => parseFloat(b.conc) - parseFloat(a.conc));

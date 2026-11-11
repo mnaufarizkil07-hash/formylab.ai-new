@@ -188,22 +188,60 @@ export function analyzeBriefCompleteness(
 export function shouldSearchLiveInternet(query: string): boolean {
   const lower = query.toLowerCase().trim();
   if (lower.length < 4) return false;
-  if (/^[0-9+\-*/().\s]+$/.test(lower)) return false;
+  if (/^[0-9+\-*/().\s?=!]+$/.test(lower)) return false;
+  // Never run web search on arithmetic / math expressions
+  if (
+    /\d+\s*(?:[+\-*/×÷^]|(?:\b(?:x|:|tambah|ditambah|plus|kurang|dikurang|dikurangi|minus|kali|dikali|dikalikan|times|bagi|dibagi|pangkat|dipangkatkan)\b))\s*-?\d+/i.test(
+      lower
+    )
+  ) {
+    return false;
+  }
+  if (
+    /\b(?:akar\s*(?:kuadrat)?\s*(?:dari)?|sqrt)\s*\(?\s*\d+/i.test(lower) ||
+    /\d+(?:[.,]\d+)?\s*(?:%|persen)\s*(?:dari|of)\s*\d+/i.test(lower)
+  ) {
+    return false;
+  }
+  // Skip trivial greetings
+  if (
+    /^(?:halo|hai|hi|hello|p|tes|test|ping|pagi|siang|sore|malam|assalamualaikum|terima\s*kasih|makasih|thanks|ok|oke|siap)[?!.\s]*$/i.test(
+      lower
+    )
+  ) {
+    return false;
+  }
   return true;
 }
 
-function cleanHtmlEntities(raw: string): string {
-  return raw
-    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&quot;/g, '"')
-    .replace(/&#039;|&apos;/g, "'")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&nbsp;/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+export function cleanHtmlEntities(raw: string): string {
+  if (!raw) return "";
+  return (
+    raw
+      .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
+      // Decode double-escaped or single-escaped HTML entities FIRST before stripping HTML tags
+      .replace(/&amp;/gi, "&")
+      .replace(/&lt;/gi, "<")
+      .replace(/&gt;/gi, ">")
+      .replace(/&quot;/gi, '"')
+      .replace(/&#0*39;|&apos;/gi, "'")
+      .replace(/&nbsp;|&#160;/gi, " ")
+      // Second decode pass in case of &amp;lt;
+      .replace(/&lt;/gi, "<")
+      .replace(/&gt;/gi, ">")
+      .replace(/&quot;/gi, '"')
+      .replace(/&#0*39;|&apos;/gi, "'")
+      .replace(/&nbsp;|&#160;/gi, " ")
+      // Strip all HTML tags (<a href=...>, <font color=...>, <span>, etc.) AFTER decoding entities
+      .replace(/<[^>]+>/g, " ")
+      // Remove any leftover angle brackets or raw URL attributes
+      .replace(/href="[^"]*"/gi, " ")
+      .replace(/target="_blank"/gi, " ")
+      .replace(/color="#[0-9a-f]{3,6}"/gi, " ")
+      .replace(/[<>]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+  );
 }
 
 /**
@@ -227,11 +265,22 @@ export async function fetchRealtimeWebContext(query: string): Promise<{
     "apa",
     "apakah",
     "bagaimana",
+    "gimana",
     "siapa",
     "dimana",
     "kapan",
     "kenapa",
     "mengapa",
+    "berapa",
+    "berapa",
+    "berapakah",
+    "beraapa",
+    "brp",
+    "hitung",
+    "hitunglah",
+    "hasil",
+    "hasilnya",
+    "nilai",
     "berdasarkan",
     "internet",
     "website",
@@ -241,45 +290,64 @@ export async function fetchRealtimeWebContext(query: string): Promise<{
     "dong",
     "ya",
     "sih",
+    "kah",
+    "kak",
+    "bang",
+    "bro",
     "menurut",
     "carikan",
     "cari",
     "di",
+    "ke",
     "dan",
     "atau",
     "yang",
+    "yg",
     "untuk",
     "pada",
     "dari",
     "saat",
     "ini",
+    "itu",
     "utamanya",
     "utama",
     "sumber",
     "buatkan",
+    "bikin",
     "saya",
+    "aku",
+    "gue",
     "kami",
     "kita",
     "bandingkan",
     "perbandingan",
     "tabel",
+    "beserta",
   ]);
 
   const rawTokens = query
-    .replace(/[?!.,":;()[\]]+/g, " ")
+    .replace(/[?!.,":;()[\]+=\-*/×÷^]+/g, " ")
     .split(/\s+/)
     .map((w) => w.trim())
-    .filter((w) => w.length >= 3 && !stopWords.has(w.toLowerCase()));
+    .filter(
+      (w) =>
+        w.length >= 3 &&
+        !/^\d+(?:[.,]\d+)?$/.test(w) &&
+        !stopWords.has(w.toLowerCase()) &&
+        !/^ber+a+p+a+$/i.test(w)
+    );
+
+  if (rawTokens.length === 0) {
+    return { results: [], contextBlockForAi: "", sourcesMarkdown: "" };
+  }
 
   const lowerQ = query.toLowerCase();
   const mentionsSkincareBrand =
-    /\b(kahf|cetaphil|cerave|wardah|emina|make\s*over|somethinc|avoskin|skintific|azarine|labore|lacoco|npure|whitelab|scarlett|garnier|pond|biore|hada\s*labo|cosrx|anua|skin1004|la\s*roche|bioderma| eucerin|kiehl)\b/.test(
+    /\b(kahf|cetaphil|cerave|wardah|emina|make\s*over|somethinc|avoskin|skintific|azarine|labore|lacoco|npure|whitelab|scarlett|garnier|pond|biore|hada\s*labo|cosrx|anua|skin1004|la\s*roche|bioderma|eucerin|kiehl)\b/.test(
       lowerQ
     );
 
-  const baseQuery =
-    rawTokens.slice(0, 5).join(" ") ||
-    query.replace(/[?!.,]+/g, "").trim().slice(0, 60);
+  const baseQuery = rawTokens.slice(0, 6).join(" ");
   const effectiveQuery =
     mentionsSkincareBrand && !/\b(skincare|kosmetik|sabun|wajah)\b/.test(lowerQ)
       ? `${baseQuery} skincare kosmetik`
@@ -305,15 +373,27 @@ export async function fetchRealtimeWebContext(query: string): Promise<{
       .join(" ") || effectiveQuery;
   const results: WebSearchResultItem[] = [];
 
-  // Filter out off-topic religious/cave/ancient history hits when the user is asking about skincare brands like "Kahf"
+  const meaningfulLowerTokens = rawTokens
+    .map((t) => t.toLowerCase())
+    .filter((t) => t.length >= 3);
+
+  // Filter out off-topic hits and require at least one meaningful query token to appear in the result
   const isRelevantResult = (title: string, snippet: string): boolean => {
+    const combined = `${title} ${snippet}`.toLowerCase();
     if (mentionsSkincareBrand) {
-      const combined = `${title} ${snippet}`.toLowerCase();
       if (
         /\b(surah|quran|koran|meccan|cave|nakhchivan|moses|prophet|ayat|bible)\b/.test(
           combined
         )
       ) {
+        return false;
+      }
+    }
+    if (meaningfulLowerTokens.length > 0) {
+      const hasTokenOverlap = meaningfulLowerTokens.some((tok) =>
+        combined.includes(tok)
+      );
+      if (!hasTokenOverlap) {
         return false;
       }
     }
@@ -363,7 +443,12 @@ export async function fetchRealtimeWebContext(query: string): Promise<{
         const pubDate = pubDateMatch
           ? cleanHtmlEntities(pubDateMatch[1]).slice(0, 16)
           : "";
-        const rawDesc = descMatch ? cleanHtmlEntities(descMatch[1]) : rawTitle;
+        const cleanedDesc = descMatch ? cleanHtmlEntities(descMatch[1]) : "";
+        // Prefer clean title + source rather than raw RSS description if they are redundant
+        const rawDesc =
+          cleanedDesc && cleanedDesc.length > rawTitle.length + 15
+            ? cleanedDesc
+            : rawTitle;
 
         if (rawTitle && rawLink && isRelevantResult(rawTitle, rawDesc)) {
           parsed.push({

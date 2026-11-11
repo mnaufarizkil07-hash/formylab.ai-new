@@ -465,19 +465,24 @@ export function extractFormulationFromText(
     targetViscosity = viscMatch[1].replace(/\./g, ",");
   }
 
-  // 5. Extract matching ingredients & percentages from text
+  // 5. Extract matching ingredients & percentages from text using strict word boundaries
   const extractedIngredients: string[] = [];
   for (const prof of Object.values(INGREDIENT_PROFILES)) {
     const shortName = prof.inciName.split("(")[0].trim();
-    const keyWords = prof.key.replace(/_/g, " ");
-    if (
-      lower.includes(shortName.toLowerCase()) ||
-      (keyWords.length >= 4 && lower.includes(keyWords))
-    ) {
+    const keyWords = prof.key.replace(/_/g, " ").trim();
+    const escapedShort = shortName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const escapedKey = keyWords.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const matchesShort =
+      shortName.length >= 4 &&
+      new RegExp(`\\b${escapedShort}\\b`, "i").test(lower);
+    const matchesKey =
+      keyWords.length >= 4 &&
+      new RegExp(`\\b${escapedKey}\\b`, "i").test(lower);
+
+    if (matchesShort || matchesKey) {
       // Look for a nearby percentage in the text
-      const escaped = shortName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const rateRegex = new RegExp(
-        `${escaped}[^\\n\\d]{0,35}?(\\d+(?:[.,]\\d+)?)\\s*%`,
+        `${escapedShort}[^\\n\\d]{0,35}?(\\d+(?:[.,]\\d+)?)\\s*%`,
         "i"
       );
       const matchRate = text.match(rateRegex);

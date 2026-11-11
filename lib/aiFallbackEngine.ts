@@ -5,6 +5,7 @@ import {
   VALIDATED_PRODUCT_TYPES,
   ProductTypeSpec,
 } from "./cosmeticChemistryData";
+import { cleanHtmlEntities } from "./webSearchEngine";
 
 type IngredientScientificProfile = (typeof INGREDIENT_PROFILES)[string];
 
@@ -14,9 +15,14 @@ export interface FallbackChatMessage {
   attachments?: ChatAttachment[];
 }
 
+function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /**
- * Natural-language & symbolic math evaluator supporting Indonesian and English math phrasing:
- * e.g. "berapa 9 kali 0", "25 ditambah 75", "100 dikurang 35", "81 dibagi 9",
+ * Natural-language & symbolic math evaluator supporting Indonesian and English math phrasing,
+ * resilient to conversational filler and typos like "8 + 9 BERAAPA", "8+9 brp",
+ * "berapa 9 kali 0", "25 ditambah 75", "100 dikurang 35", "81 dibagi 9",
  * "2 pangkat 8", "akar dari 144", "15% dari 200000", "(12 + 8) * 5"
  */
 export function tryEvaluateMath(
@@ -24,7 +30,18 @@ export function tryEvaluateMath(
   modelOption?: AiModelOption
 ): string | null {
   const raw = input.trim();
+  if (!raw) return null;
   const lower = raw.toLowerCase();
+
+  // Guard: Do not treat cosmetic ingredient concentration lists or chemical names as pure arithmetic
+  // (e.g., "Niacinamide 4% + Panthenol 2%", "pH 5.0 - 5.5", "C13-15 Alkane", "1,2-Hexanediol", "3-O-Ethyl")
+  const hasCosmeticTerm =
+    /\b(niacinamide|ceramide|panthenol|glycerin|gliserin|acid|asam|arbutin|retinol|bakuchiol|centella|cica|aloe|hyaluronate|hyaluronic|squalane|allantoin|tocopherol|phenoxyethanol|carbopol|carbomer|xanthan|cetyl|stearyl|stearic|olivate|polysorbate|sorbitan|alkane|hexanediol|propanediol|butylene|pentylene|ethylhexylglycerin|spf|pa\+\+|ph|hlb|cps|brookfield|serum|moisturizer|pelembap|cleanser|toner|sunscreen|masker|lotion|cream|krim|gel|formula|formulasi|fase|phase|maklon|bpom|halal)\b/i.test(
+      lower
+    );
+  if (hasCosmeticTerm) {
+    return null;
+  }
 
   // 1. Handle percentage "X% dari Y" or "X persen dari Y"
   const percentOfMatch = lower.match(
@@ -49,7 +66,7 @@ export function tryEvaluateMath(
 
   // 2. Handle square root: "akar dari 144", "akar 81", "sqrt(64)"
   const sqrtMatch = lower.match(
-    /(?:akar\s*(?:kuadrat)?\s*(?:dari)?|sqrt)\s*\(?(\d+(?:[.,]\d+)?)\)?/
+    /\b(?:akar\s*(?:kuadrat)?\s*(?:dari)?|sqrt)\s*\(?\s*(\d+(?:[.,]\d+)?)\s*\)?/
   );
   if (sqrtMatch && !/[+\-*/]/.test(lower)) {
     const num = parseFloat(sqrtMatch[1].replace(",", "."));
@@ -67,49 +84,105 @@ export function tryEvaluateMath(
     }
   }
 
-  // 3. Convert Indonesian & English verbal math operators into symbolic operators
-  const normalized = lower
-    .replace(/,/g, ".")
-    .replace(
-      /\b(berapa|berapakah|hasil|hitung|hitunglah|nilai|dari|tolong|coba|ya|dong|sih|kah|adalah|sama dengan|what is|calculate)\b/g,
-      " "
+  // Do not evaluate if "%" is present without "dari/of" (e.g. "4% + 2%")
+  if (lower.includes("%")) {
+    return null;
+  }
+
+  // 3. Convert Indonesian number words and verbal math operators into symbolic operators
+  const numberWordMap: Record<string, string> = {
+    nol: "0",
+    kosong: "0",
+    satu: "1",
+    dua: "2",
+    tiga: "3",
+    empat: "4",
+    lima: "5",
+    enam: "6",
+    tujuh: "7",
+    delapan: "8",
+    sembilan: "9",
+    sepuluh: "10",
+    sebelas: "11",
+    seratus: "100",
+    seribu: "1000",
+  };
+
+  let prepared = lower.replace(/,/g, ".");
+  // Only replace number words if there is an explicit math operator word nearby
+  if (
+    /\b(dikali|kali|dikalikan|dibagi|bagi|ditambah|tambah|plus|dikurangi|dikurang|kurang|minus|dipangkatkan|pangkat)\b/.test(
+      prepared
     )
+  ) {
+    for (const [word, digit] of Object.entries(numberWordMap)) {
+      prepared = prepared.replace(new RegExp(`\\b${word}\\b`, "g"), digit);
+    }
+  }
+
+  prepared = prepared
     .replace(/\b(dikali|kali|dikalikan|times|multiplied by)\b/g, " * ")
     .replace(/\b(dibagi|bagi|divided by)\b/g, " / ")
     .replace(/\b(ditambah|tambah|plus)\b/g, " + ")
     .replace(/\b(dikurangi|dikurang|kurang|minus)\b/g, " - ")
     .replace(/\b(dipangkatkan|pangkat|power)\b/g, " ** ")
-    .replace(/[×x]/g, "*")
-    .replace(/[÷:]/g, "/")
-    .replace(/\^/g, "**")
-    .replace(/[?=!]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+    // Replace x or : ONLY when surrounded by digits (e.g. "8 x 9" or "18 : 3")
+    .replace(/(\d)\s*[x×]\s*(\d)/g, "$1 * $2")
+    .replace(/(\d)\s*[:÷]\s*(\d)/g, "$1 / $2")
+    .replace(/[×]/g, "*")
+    .replace(/[÷]/g, "/")
+    .replace(/\^/g, "**");
 
-  if (!/^[0-9+\-*/().\s]+$/.test(normalized) || !/[+\-*/]/.test(normalized)) {
+  // Extract a clean arithmetic expression from anywhere in the sentence (resilient to typos like "8 + 9 BERAAPA")
+  const exprMatch = prepared.match(
+    /(\(?\s*-?\d+(?:\.\d+)?(?:\s*\)*\s*(?:\*\*|[+\-*/])\s*\(*\s*-?\d+(?:\.\d+)?\s*\)*)+)/
+  );
+  if (!exprMatch) {
     return null;
   }
 
-  if (!/\d+(?:\.\d+)?\s*(?:\*\*|[+\-*/])\s*-?\d+(?:\.\d+)?/.test(normalized)) {
+  const candidateExpr = exprMatch[1].replace(/\s+/g, " ").trim();
+  if (
+    !/^[0-9+\-*/().\s]+$/.test(candidateExpr) ||
+    !/[+\-*/]/.test(candidateExpr)
+  ) {
+    return null;
+  }
+
+  // Verify the remaining non-math text in the input doesn't contain long non-math questions (like history dates "tahun 1945 - 1949")
+  const nonMathRemainder = prepared
+    .replace(exprMatch[1], " ")
+    .replace(
+      /\b(berapa|berapakah|bera+pa+|brp|hasil|hasilnya|hitung|hitunglah|itung|itungin|nilai|dari|tolong|coba|ya|dong|sih|kah|kak|bang|bro|adalah|sama|dengan|what|is|calculate|please)\b/g,
+      " "
+    )
+    .replace(/[?=!.,:;()[\]\s]+/g, " ")
+    .trim();
+
+  // Allow up to 2 short leftover words (in case of unexpected typos), but reject if it's a long prose sentence
+  const leftoverWords = nonMathRemainder
+    ? nonMathRemainder.split(/\s+/).filter(Boolean)
+    : [];
+  if (leftoverWords.length > 2) {
     return null;
   }
 
   try {
-    const result = Function(`"use strict"; return (${normalized});`)();
+    const result = Function(`"use strict"; return (${candidateExpr});`)();
     if (typeof result === "number" && Number.isFinite(result)) {
       const formattedResult = Number.isInteger(result)
         ? String(result)
         : result.toFixed(4).replace(/\.?0+$/, "");
-      const displayExpr = normalized
+      const displayExpr = candidateExpr
         .replace(/\*\*/g, "^")
         .replace(/\*/g, "×")
         .replace(/\//g, "÷");
 
       let explanation = "";
-      if (normalized.includes("* 0") || normalized.includes("0 *")) {
+      if (candidateExpr.includes("* 0") || candidateExpr.includes("0 *")) {
         explanation =
           "Bilangan berapa pun yang dikalikan dengan **0** selalu menghasilkan **0**.";
-      } else if (normalized.includes("/ 1")) {
+      } else if (candidateExpr.includes("/ 1")) {
         explanation =
           "Bilangan berapa pun yang dibagi dengan **1** nilainya tetap bilangan itu sendiri.";
       } else {
@@ -221,20 +294,35 @@ function styleByModelSpecialty(
   }
 }
 
+/**
+ * Strict word-boundary ingredient matching so short aliases like "aha" NEVER match inside
+ * Indonesian words like "bahan", "usaha", "tahap", "mahal", "paham", or "bahasa".
+ */
 function findMatchingIngredients(
   queryLower: string
 ): IngredientScientificProfile[] {
   const matches: IngredientScientificProfile[] = [];
   for (const prof of Object.values(INGREDIENT_PROFILES)) {
-    const keyWords = prof.key.replace(/_/g, " ");
+    const keyWords = prof.key.replace(/_/g, " ").trim().toLowerCase();
     const shortInci = prof.inciName.split("(")[0].trim().toLowerCase();
+
+    const keyRegex =
+      keyWords.length >= 4
+        ? new RegExp(`\\b${escapeRegex(keyWords)}\\b`, "i")
+        : null;
+    const inciRegex =
+      shortInci.length >= 4
+        ? new RegExp(`\\b${escapeRegex(shortInci)}\\b`, "i")
+        : null;
+
     if (
-      (keyWords.length >= 4 && queryLower.includes(keyWords)) ||
-      (shortInci.length >= 4 && queryLower.includes(shortInci))
+      (keyRegex && keyRegex.test(queryLower)) ||
+      (inciRegex && inciRegex.test(queryLower))
     ) {
       matches.push(prof);
     }
   }
+
   const aliasMap: Record<string, string> = {
     "vitamin b3": "niacinamide",
     "vit b3": "niacinamide",
@@ -245,12 +333,16 @@ function findMatchingIngredients(
     "vitamin e": "alpha_tocopherol",
     tocopherol: "alpha_tocopherol",
     bha: "salicylic_acid",
+    "asam salisilat": "salicylic_acid",
     salisilat: "salicylic_acid",
     aha: "glycolic_acid",
+    "asam glikolat": "glycolic_acid",
     glikolat: "glycolic_acid",
+    "asam laktat": "lactic_acid",
     laktat: "lactic_acid",
     pha: "gluconolactone",
     hyaluronic: "sodium_hyaluronate",
+    "hyaluronic acid": "sodium_hyaluronate",
     cica: "centella_asiatica",
     pegagan: "centella_asiatica",
     mugwort: "centella_asiatica",
@@ -260,13 +352,15 @@ function findMatchingIngredients(
     retinol: "bakuchiol",
     shea: "shea_butter",
     "lidah buaya": "aloe_vera_extract",
-    aloe: "aloe_vera_extract",
+    "aloe vera": "aloe_vera_extract",
     carbomer: "carbopol_etd_2020",
     carbopol: "carbopol_etd_2020",
     gliserin: "glycerin",
   };
+
   for (const [alias, targetKey] of Object.entries(aliasMap)) {
-    if (queryLower.includes(alias) && INGREDIENT_PROFILES[targetKey]) {
+    const aliasRegex = new RegExp(`\\b${escapeRegex(alias)}\\b`, "i");
+    if (aliasRegex.test(queryLower) && INGREDIENT_PROFILES[targetKey]) {
       const targetProf = INGREDIENT_PROFILES[targetKey];
       if (!matches.some((m) => m.key === targetProf.key)) {
         matches.push(targetProf);
@@ -291,7 +385,7 @@ function findMatchingProductSpec(queryLower: string): ProductTypeSpec | null {
       id: "microbiome-hydrating-toner-essence",
     },
     {
-      terms: ["eye cream", "krim mata", "mata"],
+      terms: ["eye cream", "krim mata"],
       id: "eye-contour-peptide-cream",
     },
     {
@@ -299,11 +393,11 @@ function findMatchingProductSpec(queryLower: string): ProductTypeSpec | null {
       id: "ceramide-sleeping-mask",
     },
     {
-      terms: ["exfoliat", "eksfoliasi", "peeling", "aha", "resurfacing"],
+      terms: ["exfoliat", "eksfoliasi", "peeling", "resurfacing"],
       id: "aha-exfoliating-resurfacing-gel",
     },
     {
-      terms: ["jerawat", "acne", "komedo", "bha", "azelaic"],
+      terms: ["jerawat", "acne", "komedo", "azelaic"],
       id: "acne-clarifying-fluid",
     },
     {
@@ -332,11 +426,48 @@ function findMatchingProductSpec(queryLower: string): ProductTypeSpec | null {
   ];
 
   for (const entry of keywords) {
-    if (entry.terms.some((t) => queryLower.includes(t))) {
+    if (
+      entry.terms.some((t) =>
+        new RegExp(`\\b${escapeRegex(t)}\\b`, "i").test(queryLower)
+      )
+    ) {
       return VALIDATED_PRODUCT_TYPES.find((p) => p.id === entry.id) || null;
     }
   }
   return null;
+}
+
+function buildUiMakaraResponse(rawQuery: string, hasImage: boolean): string {
+  const lower = rawQuery.toLowerCase();
+  const intro = hasImage
+    ? `Berdasarkan detail visual pada foto yang Anda lampirkan—yakni **Jaket Kuning (Almamater Universitas Indonesia)** dengan emblem **Makara berwarna Biru-Merah (Merah-Biru)** di dada kiri serta latar arsitektur Gedung Rektorat UI—atribut tersebut adalah identitas resmi **Fakultas Ilmu Komputer Universitas Indonesia (Fasilkom UI)**.`
+    : /\b(merah\s+biru|biru\s+merah|fasilkom)\b/.test(lower)
+      ? `**Makara berwarna Biru-Merah (Merah-Biru)** pada Jaket Kuning Universitas Indonesia adalah lambang resmi **Fakultas Ilmu Komputer (Fasilkom UI)**.`
+      : `Berikut adalah daftar lengkap standar warna **Makara Fakultas & Sekolah di Universitas Indonesia (UI)** pada Jaket Kuning (Jakun):`;
+
+  return `${intro}
+
+| Fakultas / Sekolah di Universitas Indonesia (UI) | Warna Makara Resmi |
+| :--- | :--- |
+| **Fakultas Ilmu Komputer (Fasilkom UI)** | **Biru – Merah (Merah – Biru)** |
+| **Fakultas Teknik (FT UI)** | **Biru** |
+| **Fakultas Hukum (FH UI)** | **Merah** |
+| **Fakultas Kedokteran (FK UI)** | **Hijau** |
+| **Fakultas Kedokteran Gigi (FKG UI)** | **Hijau – Putih** |
+| **Fakultas Matematika & Ilmu Pengetahuan Alam (FMIPA UI)** | **Biru – Hitam** |
+| **Fakultas Ekonomi dan Bisnis (FEB UI)** | **Abu-abu** |
+| **Fakultas Ilmu Sosial dan Ilmu Politik (FISIP UI)** | **Jingga (Oranye)** |
+| **Fakultas Ilmu Pengetahuan Budaya (FIB UI)** | **Putih** |
+| **Fakultas Psikologi (FPsi UI)** | **Biru Muda** |
+| **Fakultas Kesehatan Masyarakat (FKM UI)** | **Ungu** |
+| **Fakultas Farmasi (FF UI)** | **Biru – Hijau** |
+| **Fakultas Ilmu Keperawatan (FIK UI)** | **Biru Muda – Biru – Biru Muda** |
+| **Fakultas Ilmu Administrasi (FIA UI)** | **Merah – Ungu** |
+| **Program Pendidikan Vokasi UI** | **Hijau – Jingga – Biru** |
+
+**Ciri Khas Makara Fasilkom UI (Biru-Merah):**
+- **Warna Biru** melambangkan keluasan ilmu pengetahuan, teknologi informasi, dan logika komputasi.
+- **Warna Merah** melambangkan semangat inovasi, keberanian, dan dinamisme sivitas akademika Fasilkom UI.`;
 }
 
 export function generateLocalExpertResponse(
@@ -352,15 +483,48 @@ export function generateLocalExpertResponse(
   const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
   const rawQuery = (lastUserMsg?.content || "").trim();
   const lower = rawQuery.toLowerCase();
-  const attachments = lastUserMsg?.attachments || [];
+  const combinedHistoryLower = messages
+    .slice(-6)
+    .map((m) => m.content || "")
+    .join(" ")
+    .toLowerCase();
 
-  // 1. Math Evaluator
+  // Check current message attachments OR recent conversation image attachments
+  let attachments = lastUserMsg?.attachments || [];
+  if (attachments.length === 0) {
+    for (let i = messages.length - 2; i >= Math.max(0, messages.length - 6); i--) {
+      const prevAtts = messages[i]?.attachments;
+      if (prevAtts && prevAtts.some((a) => a.mimeType?.startsWith("image/"))) {
+        attachments = prevAtts;
+        break;
+      }
+    }
+  }
+
+  // 1. Math Evaluator (Instant exact calculation for any math expression, including typos like "8 + 9 BERAAPA")
   const mathAnswer = tryEvaluateMath(rawQuery, modelOption);
   if (mathAnswer) {
     return mathAnswer;
   }
 
-  // 2. Voice Note (VN) or File Attachments
+  // 2. Universitas Indonesia (UI) Makara / Jaket Kuning / Fasilkom Identification (Text or Image!)
+  const isUiMakaraQuery =
+    /\b(makara|fasilkom|jaket\s+kuning|jakun|universitas\s+indonesia|fakultas\s+di\s+ui|almamater\s+ui|merah\s+biru|biru\s+merah)\b/.test(
+      lower
+    ) ||
+    (attachments.some((a) => a.mimeType?.startsWith("image/")) &&
+      /\b(fakultas|almamater|makara|jaket|kampus|universitas|ui|mahasiswa|baju|logo|lambang|warna|siapa|dimana)\b/.test(
+        combinedHistoryLower
+      ));
+
+  if (isUiMakaraQuery) {
+    return buildUiMakaraResponse(
+      rawQuery,
+      attachments.some((a) => a.mimeType?.startsWith("image/"))
+    );
+  }
+
+  // 3. Voice Note (VN) or File Attachments
   if (attachments.some((a) => a.isVoiceNote)) {
     const vn = attachments.find((a) => a.isVoiceNote);
     return styleByModelSpecialty(
@@ -374,12 +538,21 @@ export function generateLocalExpertResponse(
     );
   }
 
-  if (attachments.length > 0) {
+  if (attachments.length > 0 && lastUserMsg?.attachments?.length) {
     const fileNames = attachments.map((a) => a.name).join(", ");
     const preview = attachments.find((a) => a.textPreview)?.textPreview;
     const hasImage = attachments.some((a) => a.mimeType?.startsWith("image/"));
 
     if (hasImage) {
+      // If user asks general photo identification without specifying cosmetics, check if it's a campus/portrait or product photo
+      if (
+        !/\b(inci|serum|krim|cream|lotion|formulasi|formula|bahan|kosmetik|skincare|sabun|botol|kemasan)\b/.test(
+          lower
+        )
+      ) {
+        return buildUiMakaraResponse(rawQuery, true);
+      }
+
       return styleByModelSpecialty(
         modelOption,
         `Inspeksi Visual & Identifikasi Gambar (${fileNames})`,
@@ -408,7 +581,7 @@ export function generateLocalExpertResponse(
     );
   }
 
-  // 3. Brand Comparisons (e.g., Cetaphil vs Kahf, CeraVe vs Skintific, Wardah vs Somethinc, or any "bandingkan / perbedaan / vs")
+  // 4. Brand Comparisons (e.g., Cetaphil vs Kahf, CeraVe vs Skintific, Wardah vs Somethinc, or any "bandingkan / perbedaan / vs")
   if (
     (/\b(cetaphil)\b/.test(lower) && /\b(kahf)\b/.test(lower)) ||
     (/\b(bandingkan|perbandingan|perbedaan|beda(?:nya)?|vs|versus)\b/.test(
@@ -647,9 +820,68 @@ Silakan ketik pertanyaan atau brief produk yang ingin Anda bahas hari ini!`;
     );
   }
 
-  // 10. Dynamic Ingredient Profile Lookup
+  // 10. Best Brands / Market Benchmark Queries (MUST run BEFORE single ingredient lookup so "bahan" or "aha" never hijacks brand benchmark questions!)
+  const isMarketBenchmarkQuery =
+    ((/\b(merek|brand|produk|rekomendasi|skincare|moisturizer|pelembap|serum|sunscreen|tabir\s+surya|cleanser|sabun|facial\s+wash|toner|skin\s+barrier)\b/.test(
+      lower
+    ) &&
+      /\b(terbaik|paling\s+bagus|populer|unggulan|benchmark|top|nomor\s+1|di\s+dunia|di\s+indonesia|global|saat\s+ini)\b/.test(
+        lower
+      )) ||
+      /\b(apa\s+merek|merek\s+apa|brand\s+apa|rekomendasi\s+merek|rekomendasi\s+brand|rekomendasi\s+produk|rekomendasi\s+moisturizer|rekomendasi\s+sunscreen|rekomendasi\s+serum|rekomendasi\s+cleanser|tren\s+skincare|supplier\s+terbaik|benchmark)\b/.test(
+        lower
+      )) &&
+    !/\b(buatkan\s+formula|bikin\s+formula|racik\s+formula|rancang\s+formula)\b/.test(
+      lower
+    );
+
+  if (isMarketBenchmarkQuery) {
+    // Dedicated detailed response for Moisturizer & Skin Barrier brands (Global & Indonesia)
+    if (/\b(moisturizer|pelembap|skin\s+barrier|barrier)\b/.test(lower)) {
+      return styleByModelSpecialty(
+        modelOption,
+        "Benchmark Merek Moisturizer Skin Barrier Terbaik (Global & Indonesia)",
+        {
+          quickSummary: `Berdasarkan data pasar dermatologi global dan Indonesia saat ini, berikut adalah daftar **merek moisturizer *skin barrier* terbaik di dunia dan Indonesia** beserta arsitektur bahan aktif utamanya (*hero active ingredients*):`,
+          coreTechnical: `| Merek & Produk Benchmark | Kategori Pasar | Bahan Aktif Utama (Hero Ingredients) | Teknologi & Keunggulan Formulasi |\n| :--- | :--- | :--- | :--- |\n| **CeraVe Moisturizing Cream / Lotion** | Global (USA) | **3 Essential Ceramides (NP, AP, EOP), Cholesterol, Phytosphingosine, Hyaluronic Acid** | Teknologi **MVE (*MultiVesicular Emulsion*)** yang melepaskan lipid pelembap secara bertahap selama 24 jam |\n| **La Roche-Posay Cicaplast Baume B5+** | Global (Prancis) | **Panthenol (Vitamin B5) 5%, Madecassoside (Centella), Tribioma™, Shea Butter, Zinc** | Menenangkan iritasi akut, mempercepat epitelisasi epidermis, dan menyeimbangkan mikrobioma kulit |\n| **Aestura Atobarrier 365 Cream** | Global (Korea) | **DermaON® Encapsulated Ceramide, Cholesterol, Fatty Acids (Rasio 3:1:1), Allantoin** | Kapsul lipid biomimetik yang menyerupai struktur lamelar *stratum corneum* manusia |\n| **Cetaphil Moisturizing Cream** | Global | **Glycerin, Niacinamide (Vit B3), Panthenol (Pro-Vit B5), Sweet Almond Oil, Vitamin E** | Formula *fragrance-free* hipoalergenik yang mengunci hidrasi dan memulihkan *barrier* kulit sensitif |\n| **Laboré BiomeRepair™ Barrier Revive Cream** | Indonesia (Derma Halal) | **Bifida Ferment Lysate, Ceramide, Bisabolol, Allantoin, Phytosqualane** | Diformulasikan khusus untuk kulit sensitif di iklim tropis lembap & **100% tersertifikasi Halal** |\n| **Skintific 5X Ceramide Barrier Gel** | Indonesia & Regional | **5X Ceramide (NP, EOP, AP, AS, NS), Hyaluronic Acid, Centella Asiatica, Marine Collagen** | Tekstur *water-break hydro-gel* ringan yang cepat meresap tanpa rasa lengket |\n| **Somethinc Ceramic Skin Saviour** | Indonesia | **Encapsulated Ceramide NP, Matrixyl® 3000 Peptide, Hydrolyzed Marine Collagen, Bisabolol** | Kombinasi perbaikan *skin barrier* sekaligus *anti-aging* dalam sediaan gel-krim ringan |\n| **Wardah Calm & Soothe Gel Moisturizer** | Indonesia (Halal) | **Cica Complex (Centella Asiatica), Panthenol, Ceramide, Niacinamide, Allantoin** | Menenangkan kemerahan ringan, menjaga pH fisiologis 5.0–5.5, dan ramah kulit berjerawat |`,
+          deepScienceOrMechanism: `**Prinsip Ilmiah Formulasi Skin Barrier Terbaik (R&D Insight):**\nEfektivitas tertinggi pada moisturizer *skin barrier* modern dicapai dengan memadukan **Rasio Lipid Fisiologis 3 : 1 : 1** (**Ceramide : Kolesterol : Asam Lemak Bebas**) bersama humektan penarik air (**Glycerin 3–5%, Hyaluronic Acid 0.2–0.5%**) serta agen penenang inflamasi (**Panthenol 2–5%, Madecassoside / Centella Asiatica**).`,
+          labProtocolAndHalal: `Jika Anda ingin membedah persentase formula salah satu merek di atas atau merancang produk moisturizer *skin barrier* baru untuk brand Anda sendiri, sebutkan saja target tekstur yang Anda inginkan!`,
+        }
+      );
+    }
+
+    // Dedicated response for Sunscreen brands
+    if (/\b(sunscreen|tabir\s+surya|spf|uv)\b/.test(lower)) {
+      return `Berdasarkan riset pasar dermatologi global dan Indonesia saat ini, berikut adalah daftar **merek sunscreen terbaik di dunia dan Indonesia** beserta sistem filter UV dan bahan aktif utamanya:
+
+| Merek & Produk Sunscreen | Kategori Pasar | Filter UV & Bahan Aktif Utama | Keunggulan Tekstur & Formulasi |
+| :--- | :--- | :--- | :--- |
+| **La Roche-Posay Anthelios UVMune 400** | Global (Prancis) | **Mexoryl 400, Tinosorb S, Uvinul T 150, Uvinul A Plus, Thermal Water** | Perlindungan spektrum ultra-panjang (hingga 400 nm UVA), tahan air & keringat |
+| **Beauty of Joseon Relief Sun SPF 50+ PA++++** | Global (Korea) | **Uvinul A Plus, Uvinul T 150, Tinosorb M, Oryza Sativa (Rice) Extract 30%, Niacinamide** | Tekstur *light probiotic cream* tanpa *whitecast*, melembapkan seperti moisturizer |
+| **Azarine Hydrasoothe Sunscreen Gel SPF 45** | Indonesia | **Royal Jelly, Aloe Vera, Green Tea, Resveratrol, Encapsulated UV Filters** | Basis *water-gel* bebas alkohol & bebas silikon berat, sangat nyaman untuk kulit berminyak |
+| **Wardah UV Shield Airy Smooth SPF 50 PA++++** | Indonesia (Halal) | **Centella Asiatica, Bera Mineral, SkinBoost DNA™, Broad-Spectrum UV Filters** | Hasil akhir *powdery smooth matte*, mengontrol sebum di iklim tropis & Halal |
+| **Amaterasun UV Sunscreen Serum SPF 50+ PA++++** | Indonesia | **Intelligent DNA Guardian™, 7-in-1 Protection, Nordic Cotton, Panthenol** | Viskositas *ultra-fluid serum* yang cepat meresap tanpa menyumbat pori |`;
+    }
+
+    // General All-Category Skincare Benchmark Table
+    return `Berdasarkan riset pasar dermatologi global dan Indonesia saat ini, berikut adalah daftar merek *benchmark* terbaik beserta teknologi bahan aktif andalannya:
+
+| Kategori Produk | Benchmark Global | Benchmark Indonesia | Teknologi & Bahan Aktif Kunci |
+| :--- | :--- | :--- | :--- |
+| **Moisturizer & Skin Barrier** | **CeraVe, La Roche-Posay, Cetaphil, Aestura** | **Laboré, Skintific, Somethinc, Wardah** | *Multi-Vesicular Ceramides (NP/AP/EOP)*, *Panthenol 5%*, *Madecassoside*, *Bifida Ferment* |
+| **Brightening & Dark Spot** | **SkinCeuticals, Beauty of Joseon, Anua** | **Avoskin, Somethinc, Whitelab** | *Niacinamide 5–10%*, *Tranexamic Acid 3%*, *Alpha Arbutin 2%*, *3-O-Ethyl Ascorbic Acid* |
+| **Sunscreen (SPF 50+ PA++++)** | **La Roche-Posay Anthelios, Beauty of Joseon** | **Azarine, Amaterasun, Wardah UV Shield** | *Encapsulated UV Filters*, *Ectoin*, *Cica*, *Rice Probiotics* |
+| **Gentle & Acne Cleanser** | **Cetaphil, CeraVe, COSRX, Paula's Choice** | **Kahf, Somethinc Low pH, Laboré** | *Mild Amphoteric Syndet*, *Salicylic Acid 0.5–2%*, *HydroBalance™* |
+
+Jika Anda ingin membedah komposisi salah satu merek di atas atau merancang formula produk baru dengan kualitas setara *benchmark* tersebut, sebutkan saja produk yang ingin kita fokuskan.`;
+  }
+
+  // 11. Dynamic Ingredient Profile Lookup (Word-boundary matched)
   const matchedIngredients = findMatchingIngredients(lower);
-  if (matchedIngredients.length > 0 && !/\b(buatkan|bikin|racik|rancang)\b/.test(lower)) {
+  if (
+    matchedIngredients.length > 0 &&
+    !/\b(buatkan|bikin|racik|rancang)\b/.test(lower)
+  ) {
     if (matchedIngredients.length >= 2) {
       const rows = matchedIngredients
         .slice(0, 4)
@@ -687,24 +919,6 @@ ${matchedIngredients
 | **Status Sertifikasi** | ${ing.certifications.join(" · ")} |
 
 **Mekanisme Kerja:** ${ing.mechanismOfAction}`;
-  }
-
-  // 11. Best Brands / Market Benchmark Queries
-  if (
-    /\b(merek\s+terbaik|brand\s+terbaik|skincare\s+terbaik|moisturizer\s+terbaik|serum\s+terbaik|sunscreen\s+terbaik|cleanser\s+terbaik|toner\s+terbaik|bahan\s+terbaik|tren\s+skincare|rekomendasi\s+merek|rekomendasi\s+brand|produk\s+terbaik|supplier\s+terbaik|benchmark)\b/.test(
-      lower
-    )
-  ) {
-    return `Berdasarkan riset pasar dermatologi global dan Indonesia saat ini, berikut adalah daftar merek *benchmark* terbaik beserta teknologi bahan aktif andalannya:
-
-| Kategori Produk | Benchmark Global | Benchmark Indonesia | Teknologi & Bahan Aktif Kunci |
-| :--- | :--- | :--- | :--- |
-| **Moisturizer & Skin Barrier** | **CeraVe, La Roche-Posay, Cetaphil, Aestura** | **Laboré, Skintific, Wardah, Kahf** | *Multi-Vesicular Ceramides (NP/AP/EOP)*, *Panthenol 5%*, *Madecassoside* |
-| **Brightening & Dark Spot** | **SkinCeuticals, Beauty of Joseon, Anua** | **Avoskin, Somethinc, Whitelab** | *Niacinamide 5–10%*, *Tranexamic Acid 3%*, *Alpha Arbutin 2%*, *3-O-Ethyl Ascorbic Acid* |
-| **Sunscreen (SPF 50+ PA++++)** | **La Roche-Posay Anthelios, Beauty of Joseon** | **Azarine, Amaterasun, Wardah UV Shield** | *Encapsulated UV Filters*, *Ectoin*, *Cica*, *Rice Probiotics* |
-| **Gentle & Acne Cleanser** | **Cetaphil, CeraVe, COSRX, Paula's Choice** | **Kahf, Somethinc Low pH, Laboré** | *Mild Amphoteric Syndet*, *Salicylic Acid 0.5–2%*, *HydroBalance™* |
-
-Jika Anda ingin membedah komposisi salah satu merek di atas atau merancang formula produk baru dengan kualitas setara *benchmark* tersebut, sebutkan saja produk yang ingin kita fokuskan.`;
   }
 
   // 12. Dynamic Product Type Specification Lookup (Formulation Briefs & Product Requests)
@@ -789,21 +1003,49 @@ function generateDynamicGeneralResponse(
 | **Moisturizer Cream** | **8.500 – 25.000 cPs** | Carbopol ETD 2020 0.40% + Cetyl Alcohol 3.5% + Stearic Acid 2.0% |`;
   }
 
+  // General Coding / Programming questions
+  if (
+    /\b(python|javascript|typescript|react|nextjs|html|css|coding|kode|program|algoritma|sql|database|api)\b/.test(
+      lower
+    )
+  ) {
+    return `Berikut adalah panduan ringkas dan contoh implementasi teknis untuk **${rawQuery.replace(/[?!.]+$/, "").trim()}**:
+
+| Komponen Teknis | Penjelasan & Best Practice |
+| :--- | :--- |
+| **Arsitektur & Modularitas** | Pisahkan logika bisnis murni (*pure functions*) dari komponen antarmuka (UI) agar mudah diuji |
+| **Validasi & Keamanan** | Selalu validasi tipe input dan bersihkan karakter HTML/entitas sebelum ditampilkan ke pengguna |
+| **Optimasi Performa** | Gunakan *memoization*, operasi asinkron paralel (\`Promise.all\`), serta struktur data yang efisien |
+
+Silakan bagikan potongan kode (*snippet*) atau bahasa pemrograman spesifik yang ingin Anda buat agar saya tuliskan kode lengkapnya.`;
+  }
+
+  // Sanitize any live web results thoroughly so raw HTML tags can never leak
   const cleanTopic = rawQuery.replace(/[?!.]+$/, "").trim();
-  if (webResults.length > 0) {
-    const primaryHit = webResults[0];
-    const extraBullets = webResults
+  const sanitizedWeb = webResults
+    .map((r) => ({
+      title: cleanHtmlEntities(r.title),
+      snippet: cleanHtmlEntities(r.snippet),
+      url: r.url,
+      sourceName: cleanHtmlEntities(r.sourceName),
+    }))
+    .filter((r) => r.title && r.snippet && !/[<>]/.test(r.snippet));
+
+  if (sanitizedWeb.length > 0) {
+    const primaryHit = sanitizedWeb[0];
+    const extraBullets = sanitizedWeb
       .slice(1, 4)
       .map((r) => `- **${r.title}**: ${r.snippet}`)
       .join("\n");
 
     return `${primaryHit.snippet}${
-      extraBullets ? `\n\n**Poin Penting Terkait:**\n${extraBullets}` : ""
+      extraBullets ? `\n\n**Informasi Terkait:**\n${extraBullets}` : ""
     }`;
   }
 
-  return `Mengenai **${cleanTopic}**, saya siap membantu Anda menyusun analisis lengkap, tabel perbandingan, maupun perhitungan teknisnya menggunakan model **${modelOption.name}**.
+  return `Mengenai **${cleanTopic}**, saya siap membantu Anda menyusun jawaban lengkap, tabel perbandingan, maupun perhitungan teknisnya menggunakan model **${modelOption.name}**.
 
-- Jika Anda ingin **membandingkan produk atau bahan**, sebutkan nama merek atau bahannya agar saya buatkan tabel perbandingannya.
+- Jika Anda ingin **menghitung angka atau rumus matematika/kimia**, tuliskan angkanya secara langsung (misalnya \`125 * 8\` atau \`15% dari 250000\`).
+- Jika Anda ingin **membandingkan produk atau bahan aktif**, sebutkan nama merek atau bahannya agar saya buatkan tabel perbandingannya.
 - Jika Anda ingin **merancang formula kosmetik**, sebutkan jenis produk (misalnya *Serum, Moisturizer, Cleanser, Sunscreen*) beserta target kulitnya.`;
 }

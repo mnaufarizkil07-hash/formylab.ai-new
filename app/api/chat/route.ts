@@ -121,12 +121,20 @@ Adapt response depth automatically to the user's question—using clean Markdown
   }
 }
 
-function getGeminiCascadeOrder(): string[] {
+function getGeminiCascadeOrder(modelId: string): string[] {
+  if (modelId === "gemini-3.8-pro" || modelId === "gpt-6-omni") {
+    return [
+      "gemini-2.5-pro",
+      "gemini-3-flash-preview",
+      "gemini-2.5-flash",
+      "gemini-flash-latest",
+    ];
+  }
   return [
-    "gemini-3.8-flash",
     "gemini-2.5-flash",
+    "gemini-3-flash-preview",
     "gemini-flash-latest",
-    "gemini-3.1-flash-lite",
+    "gemini-2.5-pro",
   ];
 }
 
@@ -291,10 +299,18 @@ async function generateWithResilientCascade(
     };
   }
 
-  // Build search query combining current prompt + recent context if short follow-up
+  // Only combine with previous USER message if the current prompt is a short pronoun follow-up
+  const isPronounFollowUp =
+    lastUserText.split(/\s+/).length <= 4 &&
+    /\b(itu|ini|tersebut|nya|tadi|lanjut|detailnya)\b/i.test(lastUserText);
+  const prevUserMessages = messages.filter((m) => m.role === "user");
+  const prevUserText =
+    prevUserMessages.length >= 2
+      ? prevUserMessages[prevUserMessages.length - 2]?.content.slice(0, 60) || ""
+      : "";
   const combinedSearchQuery =
-    lastUserText.split(/\s+/).length <= 5 && messages.length >= 2
-      ? `${messages[messages.length - 2]?.content.slice(0, 80) || ""} ${lastUserText}`
+    isPronounFollowUp && prevUserText
+      ? `${prevUserText} ${lastUserText}`
       : lastUserText;
 
   const [briefReport, webContext] = await Promise.all([
@@ -334,7 +350,7 @@ async function generateWithResilientCascade(
     });
 
     const fullPrompt = `${historyLines.join("\n\n")}${webContext.contextBlockForAi}${briefReport.promptInstructionForAi}\n\nAI (${modelOption.name}) [Respond directly and accurately in Bahasa Indonesia. If an image is attached, inspect all visual details—such as university almamater jacket colors, chest emblem/makara colors (e.g., Biru-Merah = Fasilkom UI), buildings, or product labels—with 100% accuracy. Never output headers like "Ringkasan Cepat" or "Nanya Balik", and never append a source list unless requested]:`;
-    const candidateModels = getGeminiCascadeOrder();
+    const candidateModels = getGeminiCascadeOrder(modelOption.id);
 
     for (const candidateModel of candidateModels) {
       const contents: Part[] =

@@ -6,47 +6,79 @@ interface LivingLabBackgroundProps {
   variant?: "emerald" | "mint" | "obsidian";
 }
 
-export default function LivingLabBackground({ variant = "mint" }: LivingLabBackgroundProps) {
+export default function LivingLabBackground({
+  variant = "mint",
+}: LivingLabBackgroundProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext("2d");
+    const ctx = canvas.getContext("2d", { alpha: true });
     if (!ctx) return;
 
     let animationFrameId = 0;
     let width = (canvas.width = window.innerWidth);
     let height = (canvas.height = window.innerHeight);
+    let isScrolling = false;
+    let scrollTimeout: ReturnType<typeof setTimeout> | null = null;
 
     const handleResize = () => {
       if (!canvas) return;
       width = canvas.width = window.innerWidth;
       height = canvas.height = window.innerHeight;
+      drawFrame();
     };
-    window.addEventListener("resize", handleResize);
 
-    const mouse = { x: -1000, y: -1000 };
-    const handleMouseMove = (e: MouseEvent) => {
-      mouse.x = e.clientX;
-      mouse.y = e.clientY;
+    const handleScroll = () => {
+      isScrolling = true;
+      if (scrollTimeout !== null) {
+        clearTimeout(scrollTimeout);
+      }
+      scrollTimeout = setTimeout(() => {
+        isScrolling = false;
+      }, 180);
     };
-    window.addEventListener("mousemove", handleMouseMove);
+
+    window.addEventListener("resize", handleResize, { passive: true });
+    window.addEventListener("scroll", handleScroll, { passive: true });
 
     const palette = ["#a4cf4a", "#00f5d4", "#38bdf8", "#2dd4bf"];
-    const nodes = Array.from({ length: 48 }, (_, idx) => ({
-      x: ((idx * 197) % Math.max(width, 800)) + 40,
-      y: ((idx * 131) % Math.max(height, 600)) + 40,
-      vx: ((idx % 5) - 2) * 0.22 || 0.18,
-      vy: ((idx % 7) - 3) * 0.18 || -0.16,
-      r: (idx % 4) + 3.2,
+    const nodes = Array.from({ length: 22 }, (_, idx) => ({
+      x: ((idx * 239) % Math.max(width - 80, 600)) + 40,
+      y: ((idx * 173) % Math.max(height - 80, 500)) + 40,
+      vx: ((idx % 5) - 2) * 0.16 || 0.14,
+      vy: ((idx % 7) - 3) * 0.14 || -0.12,
+      r: (idx % 3) + 3.0,
       color: palette[idx % palette.length],
     }));
 
-    let stepTimer = 0;
-    const render = () => {
+    const maxDist = 160;
+    const maxDistSq = maxDist * maxDist;
+
+    const drawFrame = () => {
       ctx.clearRect(0, 0, width, height);
 
+      // Batch connecting lines first with minimal state changes
+      ctx.lineWidth = 1.15;
+      ctx.strokeStyle = "rgba(0, 225, 195, 0.22)";
+      ctx.beginPath();
+      for (let i = 0; i < nodes.length; i++) {
+        const p = nodes[i];
+        for (let j = i + 1; j < nodes.length; j++) {
+          const p2 = nodes[j];
+          const dx = p.x - p2.x;
+          const dy = p.y - p2.y;
+          const distSq = dx * dx + dy * dy;
+          if (distSq < maxDistSq) {
+            ctx.moveTo(p.x, p.y);
+            ctx.lineTo(p2.x, p2.y);
+          }
+        }
+      }
+      ctx.stroke();
+
+      // Update positions and draw nodes
       for (let i = 0; i < nodes.length; i++) {
         const p = nodes[i];
         p.x += p.vx;
@@ -55,87 +87,72 @@ export default function LivingLabBackground({ variant = "mint" }: LivingLabBackg
         if (p.x < 0 || p.x > width) p.vx *= -1;
         if (p.y < 0 || p.y > height) p.vy *= -1;
 
-        const dxMouse = mouse.x - p.x;
-        const dyMouse = mouse.y - p.y;
-        const distMouse = Math.sqrt(dxMouse * dxMouse + dyMouse * dyMouse);
-        if (distMouse < 180 && distMouse > 1) {
-          const force = (180 - distMouse) / 180;
-          p.x += (dxMouse / distMouse) * force * 1.2;
-          p.y += (dyMouse / distMouse) * force * 1.2;
-        }
-
-        // Jaringan Garis Poligon Glowing (seperti Gambar 1)
-        for (let j = i + 1; j < nodes.length; j++) {
-          const p2 = nodes[j];
-          const dx = p.x - p2.x;
-          const dy = p.y - p2.y;
-          const dist = Math.sqrt(dx * dx + dy * dy);
-          if (dist < 165) {
-            ctx.save();
-            ctx.beginPath();
-            ctx.moveTo(p.x, p.y);
-            ctx.lineTo(p2.x, p2.y);
-            let alpha = (1 - dist / 165) * 0.45;
-            if (distMouse < 180) alpha = Math.min(0.85, alpha * 1.6);
-            ctx.strokeStyle = `rgba(0, 245, 212, ${alpha.toFixed(3)})`;
-            ctx.lineWidth = dist < 95 ? 1.8 : 1.1;
-            ctx.stroke();
-            ctx.restore();
-          }
-        }
-
-        // Titik Atom Glowing (Lime / Cyan / Blue seperti Gambar 1)
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, p.r * 2.4, 0, Math.PI * 2);
         ctx.fillStyle = p.color;
-        ctx.globalAlpha = 0.22;
+        ctx.globalAlpha = 0.2;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.r * 2.2, 0, Math.PI * 2);
         ctx.fill();
 
+        ctx.globalAlpha = 0.88;
         ctx.beginPath();
         ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
-        ctx.fillStyle = p.color;
-        ctx.globalAlpha = 0.92;
         ctx.fill();
-        ctx.globalAlpha = 1;
       }
-
-      stepTimer = window.setTimeout(() => {
-        animationFrameId = requestAnimationFrame(render);
-      }, 80);
+      ctx.globalAlpha = 1;
     };
 
-    render();
+    // Draw initial frame immediately
+    drawFrame();
+
+    let lastTime = 0;
+    const loop = (now: number) => {
+      animationFrameId = requestAnimationFrame(loop);
+      // Pause canvas redraws completely while user is actively scrolling or tab is hidden
+      if (isScrolling || document.hidden) return;
+      if (now - lastTime < 50) return;
+      lastTime = now;
+      drawFrame();
+    };
+
+    animationFrameId = requestAnimationFrame(loop);
 
     return () => {
       window.removeEventListener("resize", handleResize);
-      window.removeEventListener("mousemove", handleMouseMove);
-      clearTimeout(stepTimer);
+      window.removeEventListener("scroll", handleScroll);
+      if (scrollTimeout !== null) clearTimeout(scrollTimeout);
       cancelAnimationFrame(animationFrameId);
     };
   }, [variant]);
 
-  return (
-    <div className="fixed inset-0 pointer-events-none z-0 overflow-hidden" aria-hidden="true">
-      {/* Multi-layered living scientific gradient canvas */}
-      <div
-        className={`absolute inset-0 ${
-          variant === "obsidian"
-            ? "bg-gradient-to-br from-[#071310] via-[#0c211b] to-[#081713]"
-            : "bg-gradient-to-br from-[#e6f7ec] via-[#d2f1dc] to-[#bde8cc]"
-        }`}
-      />
+  const isObsidian = variant === "obsidian";
 
+  return (
+    <div
+      className="fixed inset-0 pointer-events-none z-0 overflow-hidden"
+      style={{
+        contain: "strict",
+        background: isObsidian
+          ? "radial-gradient(circle at 15% 15%, rgba(45, 212, 191, 0.14), transparent 45%), radial-gradient(circle at 85% 40%, rgba(16, 185, 129, 0.12), transparent 50%), linear-gradient(135deg, #071310 0%, #0c211b 50%, #081713 100%)"
+          : "radial-gradient(circle at 12% 12%, rgba(94, 234, 212, 0.28), transparent 42%), radial-gradient(circle at 88% 35%, rgba(52, 211, 153, 0.22), transparent 48%), radial-gradient(circle at 30% 88%, rgba(103, 232, 249, 0.2), transparent 45%), linear-gradient(135deg, #e6f7ec 0%, #d2f1dc 50%, #bde8cc 100%)",
+      }}
+      aria-hidden="true"
+    >
       {/* Architectural SVG isometric lab grid mesh */}
       <svg
-        className="absolute inset-0 w-full h-full opacity-[0.22]"
+        className="absolute inset-0 w-full h-full opacity-[0.2]"
         xmlns="http://www.w3.org/2000/svg"
       >
         <defs>
-          <pattern id="lab-grid-pattern" width="56" height="56" patternUnits="userSpaceOnUse">
+          <pattern
+            id="lab-grid-pattern"
+            width="56"
+            height="56"
+            patternUnits="userSpaceOnUse"
+          >
             <path
               d="M 56 0 L 0 0 0 56"
               fill="none"
-              stroke={variant === "obsidian" ? "#34d399" : "#164e41"}
+              stroke={isObsidian ? "#34d399" : "#164e41"}
               strokeWidth="0.6"
               strokeOpacity="0.3"
             />
@@ -143,7 +160,7 @@ export default function LivingLabBackground({ variant = "mint" }: LivingLabBackg
               cx="56"
               cy="56"
               r="1.2"
-              fill={variant === "obsidian" ? "#34d399" : "#164e41"}
+              fill={isObsidian ? "#34d399" : "#164e41"}
               fillOpacity="0.35"
             />
           </pattern>
@@ -151,12 +168,7 @@ export default function LivingLabBackground({ variant = "mint" }: LivingLabBackg
         <rect width="100%" height="100%" fill="url(#lab-grid-pattern)" />
       </svg>
 
-      {/* Soft depth ambient glow orbs */}
-      <div className="absolute -top-32 -left-24 w-[520px] h-[520px] rounded-full bg-teal-300/30 blur-3xl" />
-      <div className="absolute top-1/3 -right-28 w-[560px] h-[560px] rounded-full bg-emerald-400/25 blur-3xl" />
-      <div className="absolute -bottom-36 left-1/4 w-[480px] h-[480px] rounded-full bg-cyan-300/20 blur-3xl" />
-
-      {/* Interactive 2D Molecular Lattice Canvas */}
+      {/* Interactive 2D Molecular Lattice Canvas (auto-paused during scroll) */}
       <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" />
     </div>
   );
