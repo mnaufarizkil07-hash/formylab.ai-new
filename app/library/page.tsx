@@ -143,13 +143,19 @@ export default function LibraryPage() {
               <ArrowLeft className="w-3.5 h-3.5" />
               <span>Back to Dashboard Home</span>
             </button>
+            <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-teal-50 border border-teal-200 text-[#0f766e] text-[11px] font-mono font-bold mb-2">
+              <span>TAHAP 0 · SETUP OTAK INTERNAL AI MAKLON &amp; DATABASE BAHAN BAKU</span>
+            </div>
             <h1 className="text-3xl sm:text-4xl font-extrabold text-slate-900 tracking-tight">
               3D Molecular Ingredient Library &amp; Halal Supplier Registry
             </h1>
-            <p className="text-slate-600 text-sm mt-1">
-              Menampilkan {ingredients.length} bahan baku &amp; senyawa aktif lengkap dengan
-              konformer 3D WebGL, skor kompatibilitas, rentang pH/HLB, dan sertifikasi Halal
-              supplier.
+            <p className="text-slate-600 text-sm mt-1 leading-relaxed max-w-3xl">
+              <strong>Definisi Tahap 0 (Otak Internal AI):</strong> Fondasi data internal pabrik
+              maklon yang memuat {ingredients.length} bahan baku &amp; senyawa aktif beserta status
+              stok gudang, harga/gram, daftar supplier, spesifikasi teknis (pH optimal, HLB,
+              kelarutan, batas aman), konformer molekul 3D WebGL, serta status &amp; sertifikat
+              Halal (LPPOM MUI / BPJPH / IFANCA) agar AI tidak menyarankan bahan di luar kemampuan
+              nyata pabrik.
             </p>
           </div>
 

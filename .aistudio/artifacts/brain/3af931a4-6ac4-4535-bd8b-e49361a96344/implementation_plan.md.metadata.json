@@ -1,6 +1,0 @@
-{
-  "summary":  "Rencana implementasi fitur Halaman AI Chat di Menu Dashboard formylab.ai dengan dual model (Gemini 3.8 Flash default dan GPT mode selector), persona ganda (ahli kimia kosmetik R&D dan asisten percakapan umum), quick prompts inspiratif, riwayat sesi chat, dan API endpoint server-side yang aman.",
-  "updatedAt":  "2026-11-09T02:00:58.791999034Z",
-  "requestFeedback":  true,
-  "userFacing":  true
-}

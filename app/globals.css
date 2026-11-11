@@ -1,19 +1,29 @@
 @import "tailwindcss";
 
+:root {
+  /* ==========================================================================
+     3D INTERACTIVE UI DESIGN TOKENS (Adjustable for depth, speed & intensity)
+     ========================================================================== */
+  --btn-depth: 6px;            /* tinggi "timbul" tombol fisik */
+  --btn-press: 4px;            /* kedalaman saat ditekan (:active) */
+  --spin-duration: 0.8s;       /* durasi putaran 360 derajat logo */
+  --tilt-max: 10deg;           /* kemiringan maksimal kartu 3D */
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
 @theme {
   /* 4 Warna Paten Lu */
   --color-brume: #C2F2E4;
   --color-menthe: #35C8B4;
   --color-limonade: #EDF7BE;
   --color-verveine: #A4CF4A;
-  
-  --color-base: #F8FBFB; 
-  --color-navy: #1B2A4A; 
+
+  --color-navy: #1B2A4A;
 }
 
 html,
 body {
-  background-color: var(--color-base);
+  background-color: #F8FBFB;
   color: var(--color-navy);
   scrollbar-width: none;
   -ms-overflow-style: none;
@@ -34,6 +44,274 @@ body::-webkit-scrollbar,
   border: 1px solid rgba(255, 255, 255, 0.8);
   border-radius: 24px;
   box-shadow: 0 10px 40px rgba(53, 200, 180, 0.15);
+}
+
+/* ==========================================================================
+   1. TOMBOL 3D (<Button3D />) — 60fps transform + box-shadow tactile physics
+   ========================================================================== */
+.btn-3d {
+  position: relative;
+  overflow: hidden;
+  min-height: 44px;
+  transform: translate3d(0, 0, 0);
+  transition:
+    transform 300ms var(--ease-spring),
+    box-shadow 300ms var(--ease-spring),
+    filter 200ms ease-out;
+  will-change: transform, box-shadow;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Highlight tipis di tepi atas tombol agar tampak timbul 3D */
+.btn-3d::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 45%;
+  background: linear-gradient(
+    to bottom,
+    rgba(255, 255, 255, 0.24),
+    rgba(255, 255, 255, 0)
+  );
+  pointer-events: none;
+  border-radius: inherit;
+}
+
+/* Varian Primary: Gradient Teal-Hijau + Shadow Lebih Gelap (#094c45) */
+.btn-3d-primary {
+  background: linear-gradient(135deg, #14b8a6 0%, #0f766e 60%, #12382f 100%);
+  color: #ffffff;
+  box-shadow:
+    0 var(--btn-depth) 0 #083d36,
+    0 calc(var(--btn-depth) + 8px) 18px -4px rgba(15, 118, 110, 0.38);
+}
+
+@media (hover: hover) {
+  .btn-3d-primary:hover:not(:disabled) {
+    transform: translate3d(0, -2px, 0);
+    filter: brightness(1.05);
+    box-shadow:
+      0 8px 0 #083d36,
+      0 16px 24px -4px rgba(15, 118, 110, 0.46);
+  }
+}
+
+.btn-3d-primary:active:not(:disabled) {
+  transform: translate3d(0, var(--btn-press), 0);
+  transition:
+    transform 100ms ease-out,
+    box-shadow 100ms ease-out;
+  box-shadow:
+    0 2px 0 #083d36,
+    0 4px 10px -2px rgba(15, 118, 110, 0.3);
+}
+
+/* Varian Navy: Navy/Forest Gelap + Shadow Lebih Gelap (#071a15) */
+.btn-3d-navy {
+  background: linear-gradient(135deg, #164439 0%, #12382f 100%);
+  color: #ffffff;
+  box-shadow:
+    0 var(--btn-depth) 0 #071d18,
+    0 calc(var(--btn-depth) + 8px) 18px -4px rgba(18, 56, 47, 0.35);
+}
+
+@media (hover: hover) {
+  .btn-3d-navy:hover:not(:disabled) {
+    transform: translate3d(0, -2px, 0);
+    filter: brightness(1.06);
+    box-shadow:
+      0 8px 0 #071d18,
+      0 16px 24px -4px rgba(18, 56, 47, 0.44);
+  }
+}
+
+.btn-3d-navy:active:not(:disabled) {
+  transform: translate3d(0, var(--btn-press), 0);
+  transition:
+    transform 100ms ease-out,
+    box-shadow 100ms ease-out;
+  box-shadow:
+    0 2px 0 #071d18,
+    0 4px 10px -2px rgba(18, 56, 47, 0.28);
+}
+
+/* Varian Secondary: Putih + Border + Shadow Abu/Teal Gelap (#94a3b8) */
+.btn-3d-secondary {
+  background: #ffffff;
+  color: #12382f;
+  border: 1.5px solid #cbd5e1;
+  box-shadow:
+    0 var(--btn-depth) 0 #94a3b8,
+    0 calc(var(--btn-depth) + 7px) 15px -4px rgba(15, 23, 42, 0.14);
+}
+
+@media (hover: hover) {
+  .btn-3d-secondary:hover:not(:disabled) {
+    transform: translate3d(0, -2px, 0);
+    filter: brightness(1.03);
+    border-color: #14b8a6;
+    box-shadow:
+      0 8px 0 #64748b,
+      0 14px 20px -4px rgba(15, 118, 110, 0.2);
+  }
+}
+
+.btn-3d-secondary:active:not(:disabled) {
+  transform: translate3d(0, var(--btn-press), 0);
+  transition:
+    transform 100ms ease-out,
+    box-shadow 100ms ease-out;
+  box-shadow:
+    0 2px 0 #64748b,
+    0 4px 8px -2px rgba(15, 23, 42, 0.12);
+}
+
+/* Varian Disabled: Tanpa efek tekan */
+.btn-3d-disabled,
+.btn-3d:disabled {
+  background: #cbd5e1;
+  color: #64748b;
+  box-shadow: 0 2px 0 #94a3b8;
+  cursor: not-allowed;
+  transform: none !important;
+  filter: none !important;
+}
+
+/* Ripple melebar dari titik klik kursor (durasi 500ms, transform + opacity saja) */
+@keyframes btnRippleExpand {
+  0% {
+    transform: translate(-50%, -50%) scale(0);
+    opacity: 0.42;
+  }
+  100% {
+    transform: translate(-50%, -50%) scale(3.2);
+    opacity: 0;
+  }
+}
+
+.btn-3d-ripple {
+  position: absolute;
+  border-radius: 9999px;
+  pointer-events: none;
+  background: radial-gradient(
+    circle,
+    rgba(255, 255, 255, 0.75) 0%,
+    rgba(20, 184, 166, 0.28) 70%,
+    transparent 100%
+  );
+  animation: btnRippleExpand 500ms ease-out forwards;
+  will-change: transform, opacity;
+}
+
+/* ==========================================================================
+   2. LOGO BERPUTAR 360 DERAJAT (<SpinLogo />)
+   ========================================================================== */
+.spin-logo-wrapper {
+  perspective: 800px;
+  display: inline-flex;
+  align-items: center;
+}
+
+.spin-logo-inner {
+  transform-style: preserve-3d;
+  backface-visibility: visible;
+  will-change: transform;
+  transform: rotateY(0deg);
+}
+
+@keyframes spinLogo360Y {
+  0% {
+    transform: rotateY(0deg);
+  }
+  100% {
+    transform: rotateY(360deg);
+  }
+}
+
+.spin-logo-inner.is-spinning {
+  animation: spinLogo360Y var(--spin-duration) ease-in-out forwards;
+}
+
+/* ==========================================================================
+   3. KARTU TILT 3D (<TiltCard />) & PARALLAX LAYER DEPTH
+   ========================================================================== */
+.tilt-card-container {
+  perspective: 1000px;
+}
+
+.tilt-card-body {
+  position: relative;
+  transform-style: preserve-3d;
+  will-change: transform;
+}
+
+/* Parallax kedalaman untuk ikon/judul di dalam TiltCard (translateZ 20-40px) */
+.tilt-depth-sm {
+  transform: translateZ(22px);
+  transform-style: preserve-3d;
+}
+
+.tilt-depth-lg {
+  transform: translateZ(34px);
+  transform-style: preserve-3d;
+}
+
+/* ==========================================================================
+   4. ELEMEN MELAYANG HERO (Floating Decorative Icons 3-5s loop)
+   ========================================================================== */
+@keyframes floatUpDown3D {
+  0%,
+  100% {
+    transform: translate3d(0, 0px, 0) rotate(0deg);
+  }
+  50% {
+    transform: translate3d(0, -12px, 0) rotate(4deg);
+  }
+}
+
+.float-hero-slow {
+  animation: floatUpDown3D 4.8s ease-in-out infinite;
+  will-change: transform;
+}
+
+.float-hero-med {
+  animation: floatUpDown3D 3.9s ease-in-out infinite;
+  animation-delay: -1.4s;
+  will-change: transform;
+}
+
+.float-hero-fast {
+  animation: floatUpDown3D 3.2s ease-in-out infinite;
+  animation-delay: -2.6s;
+  will-change: transform;
+}
+
+/* ==========================================================================
+   5. ACCESSIBILITY: PREFERS-REDUCED-MOTION & TOUCH SAFEGUARDS
+   ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  .btn-3d,
+  .btn-3d:hover,
+  .btn-3d:active {
+    transition: background-color 150ms ease, filter 150ms ease !important;
+    transform: none !important;
+  }
+
+  .spin-logo-inner.is-spinning,
+  .float-hero-slow,
+  .float-hero-med,
+  .float-hero-fast {
+    animation: none !important;
+    transform: none !important;
+  }
+
+  .tilt-card-body,
+  .tilt-depth-sm,
+  .tilt-depth-lg {
+    transform: none !important;
+    transition: none !important;
+  }
 }
 
 /* --- ANIMASI GRADASI 4 WARNA (Buat Halaman Login) --- */

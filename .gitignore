@@ -39,3 +39,9 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# temporary AI Studio chat screenshots & browser artifacts
+/.aistudio
+/.playwright-cli
+/public/assets/aistudio/Screenshot*
+

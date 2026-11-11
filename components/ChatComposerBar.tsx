@@ -18,16 +18,20 @@ interface ChatComposerBarProps {
   selectedModel: AiModelId;
   onSelectModel: (model: AiModelId) => void;
   onSend: (text: string, attachments: ChatAttachment[]) => void;
+  onStartVoiceCall?: () => void;
   isLoading: boolean;
   compact?: boolean;
+  placeholder?: string;
 }
 
 export default function ChatComposerBar({
   selectedModel,
   onSelectModel,
   onSend,
+  onStartVoiceCall,
   isLoading,
   compact = false,
+  placeholder = "Tanya formylab.ai apa saja...",
 }: ChatComposerBarProps) {
   const [inputText, setInputText] = useState("");
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
@@ -36,12 +40,13 @@ export default function ChatComposerBar({
     "popular" | "openai" | "google"
   >("popular");
 
-  // Voice Note (VN) Recording States
+  // Voice Note (VN) / Dictation Recording States
   const [isRecordingVn, setIsRecordingVn] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [liveTranscript, setLiveTranscript] = useState("");
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const popoverRef = useRef<HTMLDivElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
@@ -49,6 +54,15 @@ export default function ChatComposerBar({
   const attachCounterRef = useRef(1);
 
   const currentModelOpt = getModelOption(selectedModel);
+
+  // Auto-resize textarea height cleanly while keeping 1-line compact height by default
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = "24px";
+    const nextHeight = Math.min(el.scrollHeight, 112);
+    el.style.height = `${Math.max(24, nextHeight)}px`;
+  }, [inputText]);
 
   // Close model menu when clicking outside
   useEffect(() => {
@@ -91,7 +105,6 @@ export default function ChatComposerBar({
       let dataUrl: string | undefined;
       let textPreview: string | undefined;
 
-      // Read text preview for text/csv/json files
       if (
         file.type.startsWith("text/") ||
         file.name.endsWith(".csv") ||
@@ -107,7 +120,6 @@ export default function ChatComposerBar({
         }
       }
 
-      // Read DataURL for images, audio, PDFs, or small files (< 4MB)
       if (file.size <= 4 * 1024 * 1024) {
         dataUrl = await new Promise<string | undefined>((resolve) => {
           const reader = new FileReader();
@@ -151,6 +163,54 @@ export default function ChatComposerBar({
     }, 1000);
 
     try {
+      const w = window as unknown as {
+        SpeechRecognition?: new () => {
+          lang: string;
+          continuous: boolean;
+          interimResults: boolean;
+          onresult:
+            | ((e: {
+                results: ArrayLike<ArrayLike<{ transcript: string }>>;
+              }) => void)
+            | null;
+          start: () => void;
+          stop: () => void;
+        };
+        webkitSpeechRecognition?: new () => {
+          lang: string;
+          continuous: boolean;
+          interimResults: boolean;
+          onresult:
+            | ((e: {
+                results: ArrayLike<ArrayLike<{ transcript: string }>>;
+              }) => void)
+            | null;
+          start: () => void;
+          stop: () => void;
+        };
+      };
+      const SpeechRec = w.SpeechRecognition || w.webkitSpeechRecognition;
+      if (SpeechRec) {
+        const recognition = new SpeechRec();
+        recognition.lang = "id-ID";
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        recognition.onresult = (event) => {
+          let combined = "";
+          for (let i = 0; i < event.results.length; i++) {
+            combined += event.results[i][0].transcript + " ";
+          }
+          if (combined.trim()) {
+            setLiveTranscript(combined.trim());
+          }
+        };
+        recognition.start();
+      }
+    } catch {
+      // SpeechRecognition optional
+    }
+
+    try {
       if (
         typeof navigator !== "undefined" &&
         navigator.mediaDevices &&
@@ -171,7 +231,6 @@ export default function ChatComposerBar({
         recorder.start();
       }
     } catch {
-      // Fallback mode when microphone permission is unavailable in iframe/headless browser
       mediaRecorderRef.current = null;
     }
   };
@@ -266,6 +325,9 @@ export default function ChatComposerBar({
     setLiveTranscript("");
   };
 
+  const hasContentToSend =
+    inputText.trim().length > 0 || attachments.length > 0 || isRecordingVn;
+
   const handleSubmit = () => {
     if (isLoading) return;
     if (isRecordingVn) {
@@ -277,6 +339,20 @@ export default function ChatComposerBar({
     onSend(inputText.trim(), attachments);
     setInputText("");
     setAttachments([]);
+    if (textareaRef.current) {
+      textareaRef.current.style.height = "24px";
+    }
+  };
+
+  const handlePrimaryRightButtonClick = () => {
+    if (isLoading) return;
+    if (hasContentToSend) {
+      handleSubmit();
+    } else if (onStartVoiceCall) {
+      onStartVoiceCall();
+    } else {
+      startVoiceNoteRecording();
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -290,21 +366,17 @@ export default function ChatComposerBar({
     m.category.includes(activeCategory)
   );
 
-  const canSend =
-    !isLoading &&
-    (inputText.trim().length > 0 || attachments.length > 0 || isRecordingVn);
-
   return (
     <div className="relative w-full" ref={popoverRef}>
-      {/* POPOVER MODEL SELECTOR (SESUAI GAMBAR KE-3) */}
+      {/* POPOVER MODEL SELECTOR */}
       {isModelMenuOpen && (
         <div
-          className={`absolute bottom-full mb-3 right-0 z-50 ${
-            compact ? "w-[330px]" : "w-[350px] sm:w-[430px]"
-          } bg-[#121316] text-white rounded-[26px] p-3.5 shadow-[0_20px_60px_rgba(0,0,0,0.65)] border border-white/10 animate-in fade-in slide-in-from-bottom-2 duration-150`}
+          className={`absolute bottom-full mb-2.5 right-0 z-50 ${
+            compact ? "w-[310px]" : "w-[330px] sm:w-[400px]"
+          } bg-[#141517] text-white rounded-3xl p-3 shadow-[0_20px_50px_rgba(0,0,0,0.65)] border border-white/10 animate-in fade-in slide-in-from-bottom-2 duration-150`}
         >
           {/* FILTER TABS (Popular | OpenAI | Google) */}
-          <div className="flex items-center gap-1.5 pb-3 mb-2 border-b border-white/10 overflow-x-auto">
+          <div className="flex items-center gap-1.5 pb-2.5 mb-2 border-b border-white/10 overflow-x-auto">
             {(
               [
                 { id: "popular", label: "Popular" },
@@ -318,7 +390,7 @@ export default function ChatComposerBar({
                   key={tab.id}
                   type="button"
                   onClick={() => setActiveCategory(tab.id)}
-                  className={`px-4 py-1.5 rounded-full text-xs font-bold transition cursor-pointer shrink-0 ${
+                  className={`px-3.5 py-1 rounded-full text-xs font-bold transition cursor-pointer shrink-0 ${
                     isTabActive
                       ? "bg-white text-black shadow-xs"
                       : "text-gray-300 hover:text-white hover:bg-white/10"
@@ -331,7 +403,7 @@ export default function ChatComposerBar({
           </div>
 
           {/* MODEL LIST ITEMS */}
-          <div className="space-y-1 max-h-[290px] overflow-y-auto pr-0.5">
+          <div className="space-y-1 max-h-[260px] overflow-y-auto pr-0.5">
             {filteredModels.map((modelOpt) => {
               const isSelected = currentModelOpt.id === modelOpt.id;
               return (
@@ -342,25 +414,22 @@ export default function ChatComposerBar({
                     onSelectModel(modelOpt.id);
                     setIsModelMenuOpen(false);
                   }}
-                  className={`w-full flex items-center justify-between gap-3 p-3 rounded-2xl text-left transition cursor-pointer ${
-                    isSelected
-                      ? "bg-[#22242a]"
-                      : "hover:bg-[#1a1c21]"
+                  className={`w-full flex items-center justify-between gap-3 p-2.5 rounded-2xl text-left transition cursor-pointer ${
+                    isSelected ? "bg-[#22242a]" : "hover:bg-[#1a1c21]"
                   }`}
                 >
-                  <div className="flex items-center gap-3.5 min-w-0">
-                    {/* CIRCULAR LOGO CONTAINER */}
-                    <div className="w-10 h-10 rounded-full bg-[#17181c] border border-white/15 flex items-center justify-center shrink-0 text-white shadow-inner">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className="w-9 h-9 rounded-full bg-[#17181c] border border-white/15 flex items-center justify-center shrink-0 text-white shadow-inner">
                       <ModelIcon
                         modelId={modelOpt.id}
-                        className="w-5 h-5"
+                        className="w-4.5 h-4.5"
                         idSuffix={`menu-${modelOpt.id}`}
                       />
                     </div>
 
                     <div className="min-w-0">
                       <div className="flex items-center gap-2">
-                        <span className="text-sm font-bold text-white truncate">
+                        <span className="text-xs sm:text-sm font-bold text-white truncate">
                           {modelOpt.name}
                         </span>
                         {modelOpt.isNew && (
@@ -369,16 +438,15 @@ export default function ChatComposerBar({
                           </span>
                         )}
                       </div>
-                      <p className="text-xs text-gray-400 truncate mt-0.5">
+                      <p className="text-[11px] text-gray-400 truncate mt-0.5">
                         {modelOpt.description}
                       </p>
                     </div>
                   </div>
 
-                  {/* CHECKMARK FOR SELECTED MODEL */}
                   {isSelected && (
                     <svg
-                      className="w-5 h-5 text-[#3b82f6] shrink-0"
+                      className="w-4 h-4 text-[#3b82f6] shrink-0"
                       viewBox="0 0 24 24"
                       fill="none"
                       stroke="currentColor"
@@ -396,12 +464,8 @@ export default function ChatComposerBar({
         </div>
       )}
 
-      {/* MAIN DARK CHAT BAR COMPOSER (SESUAI GAMBAR KE-2) */}
-      <div
-        className={`w-full bg-[#1e1f22] text-gray-100 rounded-[28px] ${
-          compact ? "p-3" : "px-4 py-3.5"
-        } shadow-[0_10px_30px_rgba(0,0,0,0.22)] border border-white/10 transition-all`}
-      >
+      {/* COMPACT BLACK CHATGPT-STYLE PILL COMPOSER BAR */}
+      <div className="w-full bg-[#1c1d20] text-gray-100 rounded-[28px] px-3 py-2 shadow-[0_6px_24px_rgba(0,0,0,0.18)] border border-white/10 transition-all">
         {/* HIDDEN FILE INPUT */}
         <input
           ref={fileInputRef}
@@ -414,70 +478,53 @@ export default function ChatComposerBar({
 
         {/* PREVIEW CHIP LAMPIRAN FILE & VOICE NOTE (VN) */}
         {attachments.length > 0 && (
-          <div className="flex flex-wrap gap-2 mb-2.5 pb-2 border-b border-white/10">
+          <div className="flex flex-wrap gap-1.5 mb-2 pb-1.5 border-b border-white/10">
             {attachments.map((att) => (
               <div
                 key={att.id}
-                className="flex items-center gap-2.5 bg-[#2b2d31] border border-white/10 rounded-2xl px-3 py-1.5 text-xs text-gray-100 max-w-full"
+                className="flex items-center gap-2 bg-[#2b2d31] border border-white/10 rounded-2xl px-2.5 py-1 text-xs text-gray-100 max-w-full"
               >
                 {att.isVoiceNote ? (
-                  <div className="flex items-center gap-2">
-                    <span className="w-6 h-6 rounded-full bg-emerald-500/20 text-emerald-400 flex items-center justify-center font-bold text-xs">
+                  <div className="flex items-center gap-1.5">
+                    <span className="w-5 h-5 rounded-full bg-emerald-500/20 text-emerald-400 flex items-center justify-center font-bold text-[11px]">
                       🎤
                     </span>
-                    <div>
-                      <div className="font-bold text-white text-[11px]">
-                        {att.name}
-                      </div>
-                      <div className="text-[10px] text-emerald-400">
-                        {att.sizeLabel}
-                      </div>
-                    </div>
+                    <span className="font-bold text-white text-[11px]">
+                      {att.name}
+                    </span>
                     {att.dataUrl && (
                       <audio
                         src={att.dataUrl}
                         controls
-                        className="h-6 w-28 sm:w-36 ml-1"
+                        className="h-5 w-24 sm:w-32 ml-1"
                       />
                     )}
                   </div>
                 ) : att.mimeType.startsWith("image/") && att.dataUrl ? (
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-1.5">
                     {/* eslint-disable-next-line @next/next/no-img-element */}
                     <img
                       src={att.dataUrl}
                       alt={att.name}
-                      className="w-8 h-8 rounded-lg object-cover border border-white/15"
+                      className="w-6 h-6 rounded-md object-cover border border-white/15"
                     />
-                    <div className="truncate max-w-[150px]">
-                      <div className="font-semibold text-white text-[11px] truncate">
-                        {att.name}
-                      </div>
-                      <div className="text-[10px] text-gray-400">
-                        {att.sizeLabel}
-                      </div>
-                    </div>
+                    <span className="font-semibold text-white text-[11px] truncate max-w-[130px]">
+                      {att.name}
+                    </span>
                   </div>
                 ) : (
-                  <div className="flex items-center gap-2">
-                    <span className="w-7 h-7 rounded-lg bg-blue-500/20 text-blue-400 flex items-center justify-center font-bold text-xs">
-                      📄
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-xs">📄</span>
+                    <span className="font-semibold text-white text-[11px] truncate max-w-[140px]">
+                      {att.name}
                     </span>
-                    <div className="truncate max-w-[160px]">
-                      <div className="font-semibold text-white text-[11px] truncate">
-                        {att.name}
-                      </div>
-                      <div className="text-[10px] text-gray-400">
-                        {att.sizeLabel}
-                      </div>
-                    </div>
                   </div>
                 )}
 
                 <button
                   type="button"
                   onClick={() => handleRemoveAttachment(att.id)}
-                  className="w-5 h-5 rounded-full hover:bg-white/15 text-gray-400 hover:text-white flex items-center justify-center text-xs transition cursor-pointer"
+                  className="w-4 h-4 rounded-full hover:bg-white/15 text-gray-400 hover:text-white flex items-center justify-center text-[10px] transition cursor-pointer"
                   title="Hapus lampiran"
                 >
                   ✕
@@ -489,73 +536,45 @@ export default function ChatComposerBar({
 
         {/* PANEL PEREKAM VOICE NOTE (VN) SAAT AKTIF */}
         {isRecordingVn ? (
-          <div className="flex flex-col gap-2 py-1 px-1 mb-2 bg-[#282a2e] rounded-2xl p-3 border border-red-500/30">
-            <div className="flex items-center justify-between gap-2">
-              <div className="flex items-center gap-2.5">
-                <span className="w-3 h-3 rounded-full bg-red-500 animate-ping" />
-                <span className="text-xs font-bold text-red-400 uppercase tracking-wider">
-                  Merekam Voice Note (VN) • {formatDuration(recordingSeconds)}
+          <div className="flex items-center justify-between gap-2 py-0.5 px-1">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="w-2.5 h-2.5 rounded-full bg-red-500 animate-ping shrink-0" />
+              <span className="text-xs font-bold text-red-400 truncate">
+                Merekam VN • {formatDuration(recordingSeconds)}
+              </span>
+              {liveTranscript && (
+                <span className="text-xs text-gray-300 truncate hidden sm:inline">
+                  — &ldquo;{liveTranscript}&rdquo;
                 </span>
-              </div>
-
-              {/* ANIMATED SOUNDWAVE BARS */}
-              <div className="hidden sm:flex items-center gap-1 h-4">
-                {[40, 85, 55, 100, 65, 90, 45, 75, 60].map((h, i) => (
-                  <span
-                    key={i}
-                    style={{ height: `${h}%` }}
-                    className="w-1 bg-emerald-400 rounded-full animate-pulse"
-                  />
-                ))}
-              </div>
-
-              <div className="flex items-center gap-1.5">
-                <button
-                  type="button"
-                  onClick={cancelVoiceNoteRecording}
-                  className="px-2.5 py-1 rounded-xl bg-white/10 hover:bg-white/15 text-gray-300 text-xs font-semibold cursor-pointer transition"
-                >
-                  Batal
-                </button>
-                <button
-                  type="button"
-                  onClick={finishVoiceNoteRecording}
-                  className="px-3 py-1 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-black text-xs font-extrabold cursor-pointer transition"
-                >
-                  ✓ Lampirkan VN
-                </button>
-              </div>
+              )}
             </div>
 
-            <input
-              type="text"
-              value={liveTranscript}
-              onChange={(e) => setLiveTranscript(e.target.value)}
-              placeholder="Ketik catatan suara / transkrip VN opsional di sini..."
-              className="w-full bg-[#1e1f22] text-xs text-gray-200 placeholder-gray-500 px-3 py-1.5 rounded-xl border border-white/10 focus:outline-none"
-            />
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                onClick={cancelVoiceNoteRecording}
+                className="px-2.5 py-1 rounded-full bg-white/10 hover:bg-white/15 text-gray-300 text-xs font-semibold cursor-pointer transition"
+              >
+                Batal
+              </button>
+              <button
+                type="button"
+                onClick={finishVoiceNoteRecording}
+                className="px-3 py-1 rounded-full bg-emerald-500 hover:bg-emerald-400 text-black text-xs font-extrabold cursor-pointer transition"
+              >
+                ✓ Lampirkan
+              </button>
+            </div>
           </div>
         ) : (
-          /* TEXTAREA INPUT UTAMA ("Ask anything...") */
-          <textarea
-            value={inputText}
-            onChange={(e) => setInputText(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder="Ask anything..."
-            rows={compact ? 1 : 2}
-            className="w-full bg-transparent border-none text-sm sm:text-base text-gray-100 placeholder-gray-400 focus:outline-none resize-none font-sans leading-relaxed px-1"
-          />
-        )}
-
-        {/* BOTTOM TOOLBAR ROW (SESUAI GAMBAR KE-2: [+] KIRI, [Model v] [Mic] [Up Arrow] KANAN) */}
-        <div className="flex items-center justify-between pt-2 mt-1">
-          {/* TOMBOL + UPLOAD FILE / GAMBAR / DOKUMEN */}
+          /* COMPACT SINGLE-ROW HORIZONTAL CHATGPT BAR: [+] [Input] [Model v] [Mic] [Blue Action] */
           <div className="flex items-center gap-2">
+            {/* TOMBOL + UPLOAD FILE */}
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
-              className="w-9 h-9 rounded-full bg-[#2b2d31] hover:bg-[#383a40] border border-white/10 text-gray-200 flex items-center justify-center transition cursor-pointer"
-              title="Kirim File (Gambar, PDF, CSV Formulasi, Dokumen, Audio)"
+              className="w-8 h-8 rounded-full hover:bg-[#2b2d31] text-gray-300 hover:text-white flex items-center justify-center transition cursor-pointer shrink-0"
+              title="Lampirkan File (Gambar, PDF, CSV Formulasi, Dokumen, Audio)"
               aria-label="Upload File"
             >
               <svg
@@ -571,103 +590,152 @@ export default function ChatComposerBar({
                 <line x1="5" y1="12" x2="19" y2="12" />
               </svg>
             </button>
-          </div>
 
-          {/* KANAN: MODEL PICKER + VOICE NOTE (VN) MIC + SEND ARROW */}
-          <div className="flex items-center gap-2 sm:gap-3">
-            {/* MODEL SELECTOR BUTTON (e.g. Auto v / GPT-6 Luna v / Gemini 3.8 Flash v) */}
-            <button
-              type="button"
-              onClick={() => setIsModelMenuOpen((prev) => !prev)}
-              className="flex items-center gap-2 px-3 py-1.5 rounded-full hover:bg-[#2b2d31] text-gray-100 text-xs sm:text-sm font-semibold transition cursor-pointer"
-              title="Pilih Model AI (Auto, GPT-6 Luna, Gemini 3.8 Flash, dll.)"
-            >
-              <ModelIcon
-                modelId={currentModelOpt.id}
-                className="w-4 h-4 text-gray-100"
-                idSuffix={`bar-${ compact ? "compact" : "main" }`}
-              />
-              <span>{currentModelOpt.shortName}</span>
-              <svg
-                className={`w-3.5 h-3.5 text-gray-400 transition-transform ${
-                  isModelMenuOpen ? "rotate-180" : ""
+            {/* TEXTAREA COMPACT */}
+            <textarea
+              ref={textareaRef}
+              value={inputText}
+              onChange={(e) => setInputText(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder={placeholder}
+              rows={1}
+              className="flex-1 min-w-0 bg-transparent border-none text-sm text-gray-100 placeholder-gray-400 focus:outline-none resize-none font-sans leading-6 py-0.5 max-h-28 overflow-y-auto"
+            />
+
+            {/* KANAN: MODEL PICKER + MIC + DYNAMIC BLUE VOICE/SEND BUTTON */}
+            <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
+              {/* MODEL SELECTOR BUTTON */}
+              <button
+                type="button"
+                onClick={() => setIsModelMenuOpen((prev) => !prev)}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-full hover:bg-[#2b2d31] text-gray-200 text-xs font-semibold transition cursor-pointer whitespace-nowrap"
+                title="Pilih Model AI (Auto, GPT-6 Luna, Gemini 3.8 Flash, Gemini 3.8 Pro, GPT-6 Omni)"
+              >
+                <ModelIcon
+                  modelId={currentModelOpt.id}
+                  className="w-3.5 h-3.5 text-gray-100 shrink-0"
+                  idSuffix={`bar-${compact ? "compact" : "main"}`}
+                />
+                <span className="hidden xs:inline sm:inline">
+                  {currentModelOpt.shortName}
+                </span>
+                <svg
+                  className={`w-3 h-3 text-gray-400 transition-transform ${
+                    isModelMenuOpen ? "rotate-180" : ""
+                  }`}
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2.2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <polyline points="6 9 12 15 18 9" />
+                </svg>
+              </button>
+
+              {/* TOMBOL MICROPHONE / VOICE NOTE (VN) */}
+              <button
+                type="button"
+                onClick={startVoiceNoteRecording}
+                className="w-8 h-8 rounded-full flex items-center justify-center hover:bg-[#2b2d31] text-gray-300 hover:text-white transition cursor-pointer shrink-0"
+                title="Rekam Pesan Suara / Dikte Mikrofon"
+                aria-label="Voice Note"
+              >
+                <svg
+                  className="w-4 h-4"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                  <line x1="12" y1="19" x2="12" y2="22" />
+                </svg>
+              </button>
+
+              {/* TOMBOL BULAT BIRU DINAMIS (4-BAR VOICE WAVEFORM -> PANAH KIRIM ↑ SAAT MENGETIK) */}
+              <button
+                type="button"
+                onClick={handlePrimaryRightButtonClick}
+                disabled={isLoading}
+                className={`w-9 h-9 rounded-full flex items-center justify-center transition-all shadow-sm shrink-0 ${
+                  isLoading
+                    ? "bg-[#2563eb]/50 text-white/60 cursor-not-allowed"
+                    : "bg-[#2563eb] hover:bg-[#1d4ed8] active:scale-95 text-white cursor-pointer"
                 }`}
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2.2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <polyline points="6 9 12 15 18 9" />
-              </svg>
-            </button>
-
-            {/* TOMBOL MICROPHONE / VOICE NOTE (VN) */}
-            <button
-              type="button"
-              onClick={() => {
-                if (isRecordingVn) {
-                  finishVoiceNoteRecording();
-                } else {
-                  startVoiceNoteRecording();
+                title={
+                  hasContentToSend
+                    ? "Kirim Pesan"
+                    : "Mode Bicara Suara Interaktif (Seperti Teleponan dengan AI)"
                 }
-              }}
-              className={`w-9 h-9 rounded-full flex items-center justify-center transition cursor-pointer ${
-                isRecordingVn
-                  ? "bg-red-500 text-white animate-pulse"
-                  : "hover:bg-[#2b2d31] text-gray-200"
-              }`}
-              title={
-                isRecordingVn
-                  ? "Selesai Merekam Voice Note (VN)"
-                  : "Rekam Voice Note (VN)"
-              }
-              aria-label="Voice Note"
-            >
-              <svg
-                className="w-5 h-5"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
+                aria-label={
+                  hasContentToSend
+                    ? "Send Message"
+                    : "Start Interactive Voice Mode"
+                }
               >
-                <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
-                <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                <line x1="12" y1="19" x2="12" y2="22" />
-              </svg>
-            </button>
-
-            {/* TOMBOL KIRIM PANAH ATAS (↑) */}
-            <button
-              type="button"
-              onClick={handleSubmit}
-              disabled={!canSend}
-              className={`w-9 h-9 rounded-full flex items-center justify-center transition ${
-                canSend
-                  ? "bg-white text-black hover:bg-gray-200 cursor-pointer shadow-sm"
-                  : "bg-[#32343a] text-gray-500 cursor-not-allowed"
-              }`}
-              title="Kirim Pesan"
-              aria-label="Send Message"
-            >
-              <svg
-                className="w-4 h-4"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2.5"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <line x1="12" y1="19" x2="12" y2="5" />
-                <polyline points="5 12 12 5 19 12" />
-              </svg>
-            </button>
+                {hasContentToSend ? (
+                  <svg
+                    className="w-4 h-4"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2.5"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <line x1="12" y1="19" x2="12" y2="5" />
+                    <polyline points="5 12 12 5 19 12" />
+                  </svg>
+                ) : (
+                  <svg
+                    className="w-4 h-4"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    xmlns="http://www.w3.org/2000/svg"
+                  >
+                    <rect
+                      x="4.5"
+                      y="9"
+                      width="2.6"
+                      height="6"
+                      rx="1.3"
+                      fill="currentColor"
+                    />
+                    <rect
+                      x="9.2"
+                      y="5"
+                      width="2.6"
+                      height="14"
+                      rx="1.3"
+                      fill="currentColor"
+                    />
+                    <rect
+                      x="13.9"
+                      y="7"
+                      width="2.6"
+                      height="10"
+                      rx="1.3"
+                      fill="currentColor"
+                    />
+                    <rect
+                      x="18.6"
+                      y="9.5"
+                      width="2.6"
+                      height="5"
+                      rx="1.3"
+                      fill="currentColor"
+                    />
+                  </svg>
+                )}
+              </button>
+            </div>
           </div>
-        </div>
+        )}
       </div>
     </div>
   );

@@ -5,6 +5,7 @@ export interface UserAccount {
 }
 
 export const DEFAULT_ACCOUNTS: UserAccount[] = [
+  { email: "rnd.chemist@formylab.ai", password: "12345", name: "R&D Lead Chemist" },
   { email: "naufalrizki@gmail.com", password: "12345", name: "Naufalrizki" },
   { email: "raisa@gmail.com", password: "12345", name: "Raisa" },
   { email: "humaidah@gmail.com", password: "12345", name: "Humaidah" },

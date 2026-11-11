@@ -5,6 +5,7 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
 import Logo from "./Logo";
+import Button3D from "./ui3d/Button3D";
 
 interface WorkspaceNavbarProps {
   backHref?: string;
@@ -26,16 +27,16 @@ export default function WorkspaceNavbar({ backHref, backLabel }: WorkspaceNavbar
     <div className="w-full max-w-7xl mx-auto px-4 sm:px-6 pt-5 pb-2 relative z-30">
       {/* XTRA-style Floating Rounded Pill Top Bar following strict 3-zone contract */}
       <header className="w-full bg-white/95 backdrop-blur-md rounded-full shadow-[0_14px_40px_-12px_rgba(16,68,56,0.16)] border border-emerald-900/10 px-6 sm:px-8 py-3 flex items-center justify-between gap-8">
-        {/* Zone 1: Original 100% Identical Brand Logo */}
+        {/* Zone 1: Original 100% Identical Brand Logo with 360° 3D Spin */}
         <Link
           href="/dashboard"
-          className="flex items-center whitespace-nowrap shrink-0 hover:opacity-90 transition-opacity"
+          className="flex items-center whitespace-nowrap shrink-0 hover:opacity-95 transition-opacity"
         >
           <Logo size="sm" />
         </Link>
 
         {/* Zone 2: Concise single-line navigation links */}
-        <nav className="hidden md:flex items-center gap-7 text-sm font-semibold text-slate-600">
+        <nav className="hidden md:flex items-center gap-6 text-sm font-semibold text-slate-600">
           {navItems.map((item) => {
             const isActive =
               pathname === item.href || (item.href !== "/dashboard" && pathname?.startsWith(item.href));
@@ -55,25 +56,27 @@ export default function WorkspaceNavbar({ backHref, backLabel }: WorkspaceNavbar
           })}
         </nav>
 
-        {/* Zone 3: 1 Primary Action */}
+        {/* Zone 3: 1 Primary 3D Action Button */}
         <div className="flex items-center gap-3 shrink-0">
           {backHref ? (
-            <button
+            <Button3D
               type="button"
+              variant="primary"
+              size="sm"
               onClick={() => router.push(backHref)}
-              className="px-5 py-2.5 rounded-full text-xs sm:text-sm font-bold text-white bg-gradient-to-r from-[#14b8a6] to-[#0f766e] hover:opacity-95 transition shadow-sm flex items-center gap-2 cursor-pointer whitespace-nowrap shrink-0"
             >
               <ArrowLeft className="w-4 h-4" />
               <span>{backLabel || "Back to Home"}</span>
-            </button>
+            </Button3D>
           ) : (
-            <button
+            <Button3D
               type="button"
+              variant="primary"
+              size="sm"
               onClick={() => router.push("/formulate")}
-              className="px-5 py-2.5 rounded-full text-xs sm:text-sm font-bold text-white bg-gradient-to-r from-[#14b8a6] to-[#0f766e] hover:opacity-95 transition shadow-sm cursor-pointer whitespace-nowrap shrink-0"
             >
-              New Formulation
-            </button>
+              <span>New Formulation</span>
+            </Button3D>
           )}
         </div>
       </header>
