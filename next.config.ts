@@ -8,7 +8,6 @@ const nextConfig: NextConfig = {
       "./data/**/*",
       "./node_modules/tesseract.js/**/*",
       "./node_modules/tesseract.js-core/**/*",
-      "./eng.traineddata",
     ],
   },
   allowedDevOrigins: [

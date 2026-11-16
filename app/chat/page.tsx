@@ -286,11 +286,28 @@ export default function ChatPage() {
           attachments: m.attachments,
         }));
 
+      const geminiHistory = payloadMessages.map((m) => ({
+        role: m.role === "assistant" ? ("model" as const) : ("user" as const),
+        content: m.content,
+        parts: [{ text: m.content }],
+        attachments: m.attachments,
+      }));
+
+      const geminiContents = payloadMessages.map((m) => ({
+        role: m.role === "assistant" ? ("model" as const) : ("user" as const),
+        parts: [{ text: m.content }],
+        ...(m.attachments && m.attachments.length > 0
+          ? { attachments: m.attachments }
+          : {}),
+      }));
+
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          contents: geminiContents,
           messages: payloadMessages,
+          history: geminiHistory,
           model: selectedModel,
           voiceCallMode,
         }),
@@ -318,11 +335,53 @@ export default function ChatPage() {
 
         return data.reply as string;
       } else {
+        const technicalErrorText =
+          data.reply ||
+          `⚠️ **Error Teknis API (${res.status}):**\n\n\`\`\`\n${
+            data.error || "Gagal mendapatkan balasan dari Gemini API."
+          }\n\`\`\``;
+
+        const errMsgId = generateUniqueId("bot-err");
+        const errorAssistantMsg: ChatMessage = {
+          id: errMsgId,
+          role: "assistant",
+          content: technicalErrorText,
+          modelBadge: selectedModel,
+          timestamp: "Error API",
+        };
+
+        const finalMessages = [...updatedMessages, errorAssistantMsg];
+        const finalSessions = updatedSessions.map((s) =>
+          s.id === activeSession.id ? { ...s, messages: finalMessages } : s
+        );
+
+        setSessions(finalSessions);
+        saveStoredSessions(finalSessions);
         setErrorMessage(data.error || "Gagal mendapatkan balasan dari AI.");
-        return null;
+        return technicalErrorText;
       }
-    } catch {
-      setErrorMessage("Terjadi gangguan koneksi ke server AI.");
+    } catch (err: unknown) {
+      const networkErrorDetail =
+        err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+      const technicalCatchText = `⚠️ **Error Teknis Koneksi / Jaringan:**\n\n\`\`\`\n${networkErrorDetail}\n\`\`\``;
+
+      const errMsgId = generateUniqueId("bot-net-err");
+      const errorAssistantMsg: ChatMessage = {
+        id: errMsgId,
+        role: "assistant",
+        content: technicalCatchText,
+        modelBadge: selectedModel,
+        timestamp: "Error Jaringan",
+      };
+
+      const finalMessages = [...updatedMessages, errorAssistantMsg];
+      const finalSessions = updatedSessions.map((s) =>
+        s.id === activeSession.id ? { ...s, messages: finalMessages } : s
+      );
+
+      setSessions(finalSessions);
+      saveStoredSessions(finalSessions);
+      setErrorMessage(networkErrorDetail);
       return null;
     } finally {
       setIsLoading(false);
@@ -845,6 +904,14 @@ export default function ChatPage() {
                         <InteractiveMessageActions
                           messageId={msg.id}
                           content={msg.content}
+                          contextText={[
+                            activeSession?.title || "",
+                            ...conversationMessages
+                              .slice(Math.max(0, msgIdx - 3), msgIdx)
+                              .map((m) => m.content),
+                          ]
+                            .filter(Boolean)
+                            .join("\n")}
                           attachments={msg.attachments}
                           voice={voice}
                           onQuickFollowUp={(promptText) =>

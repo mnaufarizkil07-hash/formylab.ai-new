@@ -5,7 +5,10 @@ import {
   VALIDATED_PRODUCT_TYPES,
   ProductTypeSpec,
 } from "./cosmeticChemistryData";
-import { cleanHtmlEntities } from "./webSearchEngine";
+import {
+  cleanHtmlEntities,
+  stripWebSnippetPublicationDates,
+} from "./webSearchEngine";
 import {
   parseAttachmentVisionMetadata,
   solveDefaultEquationPuzzleProblem,
@@ -14,11 +17,21 @@ import {
   trySolveMathFromOcrText,
 } from "./imageVisionEngine";
 
+import {
+  ConversationalFollowUpResolution,
+  getMessageText,
+  resolveConversationalFollowUp,
+} from "./geminiAgentConfig";
+
 type IngredientScientificProfile = (typeof INGREDIENT_PROFILES)[string];
 
 export interface FallbackChatMessage {
-  role: "user" | "assistant" | "system";
-  content: string;
+  role: "user" | "assistant" | "model" | "system";
+  content?: string;
+  parts?: Array<{
+    text?: string;
+    inlineData?: { mimeType: string; data: string };
+  }>;
   attachments?: ChatAttachment[];
 }
 
@@ -1074,15 +1087,28 @@ export function generateLocalExpertResponse(
   }> = []
 ): string {
   const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
-  const rawMessageContent = (lastUserMsg?.content || "").trim();
+  const rawMessageContent = getMessageText(lastUserMsg);
   // Strip default auto-generated attachment caption ("📎 Mengirim 1 file (...)") so we know when user sent an image without typing a prompt
-  const rawQuery = rawMessageContent
+  const rawDirectQuery = rawMessageContent
     .replace(/^📎\s*Mengirim\s+\d+\s+file(?:\s*\([^)]*\))?$/i, "")
     .trim();
+
+  const followUp = resolveConversationalFollowUp(messages);
+
+  // If the user gives a follow-up instruction asking for a table (e.g. "buatkan dalam bentuk tabel"),
+  // convert the previous turn's topic and reply into a structured Markdown table without losing context.
+  if (followUp.isFollowUp && followUp.isTableRequest) {
+    return buildFollowUpTableFromHistory(rawDirectQuery, followUp, webResults);
+  }
+
+  const rawQuery =
+    followUp.isFollowUp && followUp.effectiveSearchQuery
+      ? followUp.effectiveSearchQuery
+      : rawDirectQuery;
   const lower = rawQuery.toLowerCase();
   const combinedHistoryLower = messages
-    .slice(-6)
-    .map((m) => m.content || "")
+    .slice(-10)
+    .map((m) => getMessageText(m))
     .join(" ")
     .toLowerCase();
 
@@ -1122,8 +1148,14 @@ export function generateLocalExpertResponse(
   }
 
   // 2. Universitas Indonesia (UI) Makara / Jaket Kuning / Fasilkom Identification
-  // Guard: NEVER trigger UI Makara on a white-background document/math screenshot unless the text explicitly mentions UI/Makara!
+  // Guard: NEVER trigger UI Makara on a white-background document/math screenshot or on general UI history/date/location questions unless Makara/Almamater is asked!
+  const isHistoricalOrGeneralFactAboutUi =
+    /\b(sejarah|tanggal|kapan|didirikan|berdiri|pendiri|rektor|lokasi|alamat|dimana|di\s+mana)\b/i.test(
+      lower
+    ) && !/\b(makara|jaket|jakun|almamater|fasilkom|warna)\b/i.test(lower);
+
   const explicitTextMentionsUi =
+    !isHistoricalOrGeneralFactAboutUi &&
     /\b(makara|fasilkom|jaket\s+kuning|jakun|universitas\s+indonesia|fakultas\s+di\s+ui|almamater\s+ui|merah\s+biru|biru\s+merah)\b/.test(
       `${lower} ${ocrText.toLowerCase()}`
     );
@@ -1315,46 +1347,56 @@ ${
     );
   }
 
-  // 4. Brand Comparisons (e.g., Cetaphil vs Kahf, CeraVe vs Skintific, Wardah vs Somethinc, or any "bandingkan / perbedaan / vs")
-  if (
-    (/\b(cetaphil)\b/.test(lower) && /\b(kahf)\b/.test(lower)) ||
-    (/\b(bandingkan|perbandingan|perbedaan|beda(?:nya)?|vs|versus)\b/.test(
+  // 3B. Software Engineering, Web Programming Architecture & Tech Comparison (Typo-Tolerant & Context-Aware across full history)
+  const techResponse = tryBuildSoftwareOrTechResponse(
+    rawQuery,
+    combinedHistoryLower
+  );
+  if (techResponse) {
+    return techResponse;
+  }
+
+  // 4. Flexible Product, Brand & Structural Comparison Consultant (ONLY triggers on comparison/analysis requests, never on simple location/fact queries)
+  const isSimpleLocationOrFactQuery =
+    /\b(dimana|di\s+mana|lokasi|alamat|letak|kapan\s+didirikan|siapa\s+pemilik)\b/.test(
       lower
     ) &&
-      /\b(cetaphil|kahf|cerave|skintific|wardah|somethinc|avoskin|cosrx|azarine|labore|garnier|pond|biore|hada\s*labo|la\s*roche)\b/.test(
+    !/\b(ba?n?dingkan|bandinkan|bandingkn|perbandi[n]?gan|perbadingan|perbed[a]+n|beda(?:nya)?|vs\.?|versus|komparasi)\b/.test(
+      lower
+    );
+
+  if (
+    !isSimpleLocationOrFactQuery &&
+    !(/\b(ceramide)\b/.test(lower) && /\b(niacinamide)\b/.test(lower)) &&
+    ((/\b(cetaphil)\b/.test(lower) && /\b(kahf)\b/.test(lower)) ||
+      /\b(ba?n?dingkan|bandinkan|bandingkn|perbandi[n]?gan|perbadingan|perbed[a]+n|beda(?:nya)?|vs\.?|versus|lebih\s+bagus\s+mana|mending\s+mana|pilih\s+mana|dibanding(?:kan)?|komparasi)\b/.test(
         lower
       ))
   ) {
     const isCetaphilKahf =
       lower.includes("cetaphil") && lower.includes("kahf");
     if (isCetaphilKahf) {
-      return `Berikut adalah perbandingan lengkap antara **Cetaphil** dan **Kahf** dari sisi fokus formulasi, bahan aktif utama, karakteristik tekstur, serta kesesuaian jenis kulit:
+      return `Memilih pembersih wajah yang tepat memang sangat bergantung pada kebutuhan spesifik kulit dan aktivitas harian Anda. Berikut adalah perbandingan mendalam antara **Cetaphil** dan **Kahf** dari sisi fokus formulasi, bahan aktif utama, karakteristik tekstur, serta kesesuaian jenis kulit:
 
 | Parameter Perbandingan | Cetaphil | Kahf |
 | :--- | :--- | :--- |
-| **Fokus Utama** | Perawatan *Skin Barrier* & Kulit Sensitif (Derma-Care) | Perawatan Kulit Pria (*Men's Daily Grooming*) |
-| **Karakteristik Formula** | Sangat lembut (*soap-free / syndet*), minim busa, pH seimbang | Menyegarkan (*refreshing*), *deep cleansing*, mengontrol minyak berlebih |
+| **Fokus Utama** | **Perawatan *Skin Barrier* & Kulit Sensitif (Derma-Care)** | **Perawatan Kulit Pria (*Men's Daily Grooming*)** |
+| **Karakteristik Formula** | Sangat lembut (*soap-free / syndet*), minim busa, **pH seimbang** | Menyegarkan (*refreshing*), *deep cleansing*, **mengontrol minyak berlebih** |
 | **Hero Ingredients** | **Glycerin, Niacinamide (Vit B3), Panthenol (Pro-Vit B5)** | **HydroBalance™, Pure Cleanse, Moroccan Mint / Korean Ginseng / Charcoal** |
 | **Kandungan Pewangi** | Umumnya **Fragrance-Free** (Tanpa Pewangi) | Memiliki aroma maskulin yang segar dan ringan |
 | **Status Kehalalan** | Beberapa lini tersertifikasi, tergantung negara pabrik produksi | **100% Tersertifikasi Halal BPJPH / LPPOM MUI** (Diproduksi oleh PT Paragon) |
 | **Rekomendasi Kulit** | Kulit sangat sensitif, kering, eksim, rosacea, atau pasca-tindakan klinis | Kulit pria normal, berminyak, kombinasi, berjerawat, dan sering beraktivitas di luar ruangan |
 
-**Kesimpulan Pemilihan:**
-- Pilih **Cetaphil** apabila prioritas utama Anda adalah kelembutan ekstra, pemulihan *skin barrier* yang sedang iritasi/sensitif, dan formula tanpa pewangi.
-- Pilih **Kahf** apabila Anda mencari produk perawatan kulit pria yang praktis, bersertifikat Halal Indonesia, memberikan sensasi segar, serta efektif mengangkat minyak dan kotoran harian.`;
+**Kesimpulan & Rekomendasi Praktis:**
+- Pilih **Cetaphil** apabila prioritas utama Anda adalah **kelembutan ekstra**, pemulihan *skin barrier* yang sedang iritasi atau sensitif, serta menginginkan formula tanpa pewangi.
+- Pilih **Kahf** apabila Anda mencari produk perawatan kulit pria yang praktis, **100% bersertifikat Halal Indonesia**, memberikan sensasi dingin menyegarkan, serta efektif mengangkat minyak berlebih setelah beraktivitas seharian.`;
     }
 
-    return `Berikut adalah tabel perbandingan mendalam berdasarkan arsitektur formulasi R&D, bahan aktif utama (*hero ingredients*), serta profil sensoriknya:
-
-| Aspek Evaluasi | Fokus Derma-Barrier (Contoh: Cetaphil / CeraVe / Laboré) | Fokus Active-Targeted (Contoh: Kahf / Skintific / Somethinc) |
-| :--- | :--- | :--- |
-| **Fokus Formulasi** | Pemulihan *stratum corneum*, menjaga pH fisiologis 5.0–5.5, minim iritasi | Penanganan spesifik (kontrol sebum, *brightening*, *pore care*, *anti-acne*) |
-| **Sistem Surfaktan / Emulsi** | *Mild Amphoteric / Non-ionic Syndet* & *Lamellar O/W Emulsion* | *Amino Acid / Mild Coco-Betaine Cleanser* & *Light Hydro-Gel* |
-| **Komponen Aktif Utama** | **Ceramide NP/AP/EOP, Panthenol, Glycerin, Phytosqualane** | **Niacinamide, Salicylic Acid (BHA), Centella Asiatica, Botanical Extracts** |
-| **Profil Sensorik** | Lembut, *non-stripping*, tanpa pewangi (*fragrance-free*) | Segar, cepat meresap, *matte/cooling finish* untuk iklim tropis |
-| **Target Pengguna** | Kulit sensitif, kering, *barrier* rusak, atau intoleran terhadap pewangi | Kulit normal-berminyak, kombinasi, kusam, atau rentan berjerawat |
-
-Jika Anda ingin membandingkan dua merek atau produk spesifik lainnya (atau ingin meracik formula serupa di laboratorium), sebutkan saja nama produknya.`;
+    return buildConsultantComparisonResponse(
+      rawQuery,
+      webResults,
+      combinedHistoryLower
+    );
   }
 
   // 4. Greetings & General Capability Questions
@@ -1670,8 +1712,14 @@ ${matchedIngredients
 **Mekanisme Kerja:** ${ing.mechanismOfAction}`;
   }
 
-  // 12. Dynamic Product Type Specification Lookup (Formulation Briefs & Product Requests)
-  const matchedProduct = findMatchingProductSpec(lower);
+  // 12. Dynamic Product Type Specification Lookup (ONLY when cosmetic/skincare context is explicit)
+  const hasExplicitSkincareContext =
+    /\b(skincare|kosmetik|kulit|wajah|jerawat|acne|formulasi|formula|maklon|bpom|halal|moisturizer|pelembap|sunscreen|tabir\s+surya|sabun|cleanser|facial\s+wash|toner|krim|serum\s+wajah|skin\s+barrier)\b/i.test(
+      lower
+    );
+  const matchedProduct = hasExplicitSkincareContext
+    ? findMatchingProductSpec(lower)
+    : null;
   if (matchedProduct) {
     const activesRows = matchedProduct.recommendedActives
       .map((a) => `| **Fase C (Aktif)** | **${a.name}** | ${a.role} |`)
@@ -1689,12 +1737,20 @@ ${matchedIngredients
     );
   }
 
-  // 13. Business, Maklon, HPP, BPOM, Halal Registration questions
-  if (
-    /\b(bpom|maklon|hpp|biaya|harga|bisnis|brand|sertifikat\s+halal|mui|bpjph|produksi|moq)\b/.test(
+  // 13. Cosmetic Business, Maklon, HPP, BPOM, Halal Registration questions (Guard: require explicit cosmetic/maklon/BPOM/halal context)
+  const isHistoricalOrDateQuery =
+    /\b(sejarah|sejarahnya|tanggal|tahun\s+berapa|kapan|didirikan|berdiri|berdirinya|pendiri|pendirinya|asal[\s-]usul|dimana|di\s+mana|lokasi|alamat)\b/i.test(
       lower
-    )
-  ) {
+    );
+
+  const isExplicitCosmeticBusinessQuery =
+    /\b(bpom|maklon|sertifikat\s+halal|mui|bpjph|hpp\s+kosmetik|hpp\s+skincare|produksi\s+kosmetik|produksi\s+skincare|moq\s+maklon|biaya\s+maklon)\b/i.test(
+      lower
+    ) ||
+    (hasExplicitSkincareContext &&
+      /\b(hpp|biaya|harga|bisnis|brand|produksi|moq)\b/i.test(lower));
+
+  if (!isHistoricalOrDateQuery && isExplicitCosmeticBusinessQuery) {
     return `Untuk memproduksi produk kosmetik yang kompetitif dan patuh regulasi di Indonesia, berikut adalah struktur biaya HPP (*Bill of Materials*) dan tahapan kepatuhannya:
 
 | Komponen Produksi | Porsi Biaya (% HPP) | Keterangan & Dokumen Wajib |
@@ -1752,24 +1808,16 @@ function generateDynamicGeneralResponse(
 | **Moisturizer Cream** | **8.500 – 25.000 cPs** | Carbopol ETD 2020 0.40% + Cetyl Alcohol 3.5% + Stearic Acid 2.0% |`;
   }
 
-  // General Coding / Programming questions
+  // General Coding / Programming questions -> natural paragraph without static table template
   if (
     /\b(python|javascript|typescript|react|nextjs|html|css|coding|kode|program|algoritma|sql|database|api)\b/.test(
       lower
     )
   ) {
-    return `Berikut adalah panduan ringkas dan contoh implementasi teknis untuk **${rawQuery.replace(/[?!.]+$/, "").trim()}**:
-
-| Komponen Teknis | Penjelasan & Best Practice |
-| :--- | :--- |
-| **Arsitektur & Modularitas** | Pisahkan logika bisnis murni (*pure functions*) dari komponen antarmuka (UI) agar mudah diuji |
-| **Validasi & Keamanan** | Selalu validasi tipe input dan bersihkan karakter HTML/entitas sebelum ditampilkan ke pengguna |
-| **Optimasi Performa** | Gunakan *memoization*, operasi asinkron paralel (\`Promise.all\`), serta struktur data yang efisien |
-
-Silakan bagikan potongan kode (*snippet*) atau bahasa pemrograman spesifik yang ingin Anda buat agar saya tuliskan kode lengkapnya.`;
+    const cleanTopic = rawQuery.replace(/[?!.]+$/, "").trim();
+    return `Dalam pengembangan perangkat lunak terkait **${cleanTopic}**, pastikan struktur logika terpisah secara modular dari komponen antarmuka, validasi input diterapkan di sisi server maupun klien, serta operasi asinkron dikelola secara efisien.`;
   }
 
-  // Sanitize any live web results thoroughly so raw HTML tags can never leak
   const cleanTopic = rawQuery.replace(/[?!.]+$/, "").trim();
   const sanitizedWeb = webResults
     .map((r) => ({
@@ -1781,31 +1829,583 @@ Silakan bagikan potongan kode (*snippet*) atau bahasa pemrograman spesifik yang 
     .filter((r) => r.title && r.snippet && !/[<>]/.test(r.snippet));
 
   if (sanitizedWeb.length > 0) {
-    const primaryHit = sanitizedWeb[0];
-    const leadTitle = primaryHit.title
-      .replace(/\s*[-|–—]\s*.*$/, "")
-      .trim();
-
-    const extraBullets = sanitizedWeb
-      .slice(1, 5)
-      .map((r) => {
-        const shortTitle = r.title.replace(/\s*[-|–—]\s*.*$/, "").trim();
-        return `- **${shortTitle || r.title}**: ${r.snippet}`;
-      })
-      .join("\n");
-
-    const leadParagraph =
-      primaryHit.snippet.toLowerCase().includes(leadTitle.toLowerCase()) ||
-      !leadTitle
-        ? primaryHit.snippet
-        : `**${leadTitle}** — ${primaryHit.snippet}`;
-
-    return `${leadParagraph}${
-      extraBullets
-        ? `\n\n**Informasi Lengkap & Detail Terkait:**\n${extraBullets}`
-        : ""
-    }`;
+    return sanitizedWeb.map((r) => r.snippet).join("\n\n");
   }
 
-  return `Mengenai **${cleanTopic}**, silakan sebutkan detail yang lebih spesifik (seperti nama tempat/lokasi, instansi, tokoh, konsep ilmiah, atau produk yang Anda maksud) agar saya dapat menyajikan informasi lengkap dan akurat untuk Anda.`;
+  return cleanTopic;
 }
+
+interface BrandKnowledgeItem {
+  displayName: string;
+  positioning: string;
+  keyMaterials: string;
+  coreFunction: string;
+  textureExperience: string;
+  bestFor: string;
+}
+
+const KNOWN_PRODUCT_PROFILES: Record<string, BrandKnowledgeItem> = {
+  "jf sulfur": {
+    displayName: "JF Sulfur (JF The Skin Specialist)",
+    positioning: "**Spesialis Dermatologi Sabun & Gel Anti-Jerawat / Bakteri & Jamur Kulit** (Diproduksi oleh PT Galenium Pharmasia Laboratories)",
+    keyMaterials: "**Active Sulfur (Belerang Alami)**, **Salicylic Acid (BHA)**, **Hamamelis Extract**, **Jojoba Oil & Vitamin E** (pada varian Dermamed/Gentle)",
+    coreFunction: "**Keratolitik & Antibakteri Alami**: Mengeringkan jerawat aktif, mengangkat sel kulit mati penyumbat pori, mengurangi minyak berlebih, serta mengatasi gatal akibat bakteri/jamur",
+    textureExperience: "Sabun batang (*bar soap*) & *facial foam* dengan aroma khas sulfur medis yang memberikan efek bersih kesat dan bebas minyak",
+    bestFor: "**Kulit sangat berminyak, berjerawat aktif (*acne-prone*)**, jerawat punggung (*back acne*), serta kulit yang rentan gatal/jamur",
+  },
+  sulfur: {
+    displayName: "JF Sulfur",
+    positioning: "**Spesialis Perawatan Kulit Berjerawat & Berminyak Berbasis Active Sulfur**",
+    keyMaterials: "**Active Sulfur (Belerang Alami)**, **Salicylic Acid**, **Niacinamide / Vitamin E**",
+    coreFunction: "**Melawan bakteri penyebab jerawat (*C. acnes*)**, mengontrol sebum berlebih, dan mempercepat pengeringan komedo/jerawat",
+    textureExperience: "Pembersihan mendalam (*deep oil control*) dengan sensasi bersih tuntas untuk wajah maupun tubuh",
+    bestFor: "**Kulit berminyak, kombinasi-berjerawat, dan jerawat badan/punggung**",
+  },
+  acnes: {
+    displayName: "Acnes (Rohto)",
+    positioning: "**Rangkaian Lengkap Perawatan Kulit Berjerawat Remaja & Dewasa** (Rohto Mentholatum)",
+    keyMaterials: "**Isopropylmethylphenol (IPMP)**, **Salicylic Acid**, **Centella Asiatica (Cica)**, **Vitamin C & E**, **Sulfur** (pada *Sealing Jell*)",
+    coreFunction: "**Antibakteri & Soothing Acne Care**: Meredakan kemerahan jerawat, melawan bakteri pori, dan menyamarkan noda bekas jerawat",
+    textureExperience: "*Creamy facial wash* dan gel totol yang lembut di wajah serta tidak membuat kulit terasa terlalu tertarik",
+    bestFor: "**Kulit wajah rentan berjerawat (*acne-prone*)** yang membutuhkan perawatan harian lembut dari sabun cuci muka hingga obat totol",
+  },
+  dettol: {
+    displayName: "Dettol",
+    positioning: "**Sabun Antiseptik & Perlindungan Kuman Keluarga Global**",
+    keyMaterials: "**Chloroxylenol (PCMX) / Antibacterial Agents**, **Glycerin**, **Citric Acid**, **Pine / Citrus Refreshing Oils**",
+    coreFunction: "**Proteksi Antiseptik Tubuh**: Melindungi tubuh dari kuman dan bakteri penyebab bau badan setelah beraktivitas berat",
+    textureExperience: "Busa melimpah dengan aroma segar antiseptik yang memberikan rasa bersih menyeluruh pada tubuh",
+    bestFor: "**Penggunaan mandi tubuh harian** setelah olahraga atau aktivitas luar ruangan (kurang disarankan untuk kulit wajah sensitif)",
+  },
+  lifebuoy: {
+    displayName: "Lifebuoy",
+    positioning: "**Sabun Kesehatan Keluarga untuk Perlindungan Kuman Harian**",
+    keyMaterials: "**ActivSilver+ / Thymol Antiseptic Complex**, **Tea Tree Oil / Charcoal / Lemon**",
+    coreFunction: "**Pembersihan Kuman & Keringat Harian**: Menjaga kebersihan kulit tubuh seluruh anggota keluarga secara praktis dan ekonomis",
+    textureExperience: "Busa cepat melimpah, aroma segar familiar, dan mudah dibilas",
+    bestFor: "**Sabun mandi tubuh keluarga sehari-hari** dengan daya bersih tinggi terhadap keringat dan kotoran",
+  },
+  asepso: {
+    displayName: "Asepso",
+    positioning: "**Sabun Antiseptik Klasik untuk Biang Keringat & Masalah Kulit Tubuh**",
+    keyMaterials: "**Antiseptic Active Complex**, **Sulfur / Herbal Extracts** (tergantung varian)",
+    coreFunction: "**Mengatasi biang keringat (*miliaria*)**, gatal-gatal karena lembap, dan mengurangi minyak berlebih pada kulit tubuh",
+    textureExperience: "Sabun batang antiseptik berdaya angkat minyak tinggi dengan hasil akhir kesat",
+    bestFor: "**Kulit tubuh yang mengalami biang keringat, gatal karena keringat berlebih, atau jerawat punggung**",
+  },
+  cetaphil: {
+    displayName: "Cetaphil",
+    positioning: "**Derma-Care Global untuk Kulit Sensitif & Pemulihan *Skin Barrier***",
+    keyMaterials: "**Glycerin, Niacinamide (Vit B3), Panthenol (Pro-Vit B5), Mild Syndet**",
+    coreFunction: "**Membersihkan & melembapkan secara ultra-lembut** tanpa mengikis lipid alami kulit",
+    textureExperience: "Lembut, minim busa (*low-lather*), umumnya **Fragrance-Free**",
+    bestFor: "**Kulit sensitif, kering, iritasi, rosacea**, atau pasca-perawatan klinis",
+  },
+  kahf: {
+    displayName: "Kahf",
+    positioning: "**Perawatan Kulit & *Daily Grooming* Pria Modern Berstandar Halal**",
+    keyMaterials: "**HydroBalance™, Pure Cleanse, Moroccan Mint, Korean Ginseng, Charcoal**",
+    coreFunction: "**Mengangkat minyak berlebih, polusi, dan menyegarkan kulit** tanpa membuat kering",
+    textureExperience: "Segar (*cooling/refreshing*), beraroma maskulin ringan, mudah dibilas",
+    bestFor: "**Pria dengan kulit normal, berminyak, kombinasi**, atau aktif di luar ruangan",
+  },
+  cerave: {
+    displayName: "CeraVe",
+    positioning: "**Dermatological *Skin Barrier Repair* Berbasis Ceramide Biomimetik**",
+    keyMaterials: "**3 Essential Ceramides (NP, AP, EOP), Hyaluronic Acid, Cholesterol, MVE Technology**",
+    coreFunction: "**Restorasi struktur lamelar *stratum corneum*** dan pelembapan bertahap 24 jam",
+    textureExperience: "Rich maupun *lotion* lembut, **Fragrance-Free**, *non-comedogenic*",
+    bestFor: "**Kulit kering, sensitif, *skin barrier* rusak**, hingga kulit kombinasi",
+  },
+  skintific: {
+    displayName: "Skintific",
+    positioning: "**Skincare Berteknologi *5X Ceramide* & *Targeted Actives* untuk Pasar Asia**",
+    keyMaterials: "**5X Ceramide, Centella Asiatica, Hyaluronic Acid, Marine Collagen, Niacinamide**",
+    coreFunction: "**Menghidrasi intensif, meredakan kemerahan, dan mencerahkan** dengan tekstur ringan",
+    textureExperience: "*Water-break hydro-gel* ringan yang cepat meresap dan memberi efek sejuk",
+    bestFor: "**Kulit kombinasi, berminyak, *acne-prone***, atau butuh hidrasi ringan di iklim tropis",
+  },
+  wardah: {
+    displayName: "Wardah",
+    positioning: "**Pelopor Kosmetik & *Skincare* Halal Modern untuk Kulit Tropis Indonesia**",
+    keyMaterials: "**Niacinamide, Cica Complex, Panthenol, Tranexamic Acid, SkinBoost DNA™**",
+    coreFunction: "**Perawatan harian menyeluruh** (*brightening*, *soothing*, & proteksi UV Halal)",
+    textureExperience: "Ringan, nyaman untuk cuaca lembap, dan varian lengkap sesuai jenis kulit",
+    bestFor: "**Pengguna yang mengutamakan jaminan Halal**, harga terjangkau, dan formula tropis",
+  },
+  somethinc: {
+    displayName: "Somethinc",
+    positioning: "**Skincare Lokal Berfokus pada Bahan Aktif Konsentrasi Klinis (*Clinical-Grade Actives*)**",
+    keyMaterials: "**Encapsulated Ceramide, Niacinamide, Matrixyl® 3000, Salicylic Acid, Peptide**",
+    coreFunction: "**Menangani masalah kulit spesifik** (*dark spot*, jerawat, pori, & *anti-aging*)",
+    textureExperience: "Beragam dari serum cair hingga *gel-cream* ringan yang mudah di-*layer*",
+    bestFor: "**Pengguna yang menyukai *active skincare* terarah** dengan inovasi bahan modern",
+  },
+  avoskin: {
+    displayName: "Avoskin",
+    positioning: "**Skincare *Clean-ical* Lokal dengan Perpaduan Bahan Aktif Tinggi & Ekstrak Botani**",
+    keyMaterials: "**Alpha Arbutin, Niacinamide, AHA-BHA-PHA, Centella Asiatica, Mugwort**",
+    coreFunction: "**Eksfoliasi lembut, regenerasi sel kulit, *brightening***, dan penguatan *barrier*",
+    textureExperience: "Essence/toner dan serum bertekstur *watery-plumping* yang menyegarkan",
+    bestFor: "**Kulit kusam, bertekstur, bekas jerawat (PIE/PIH)**, dan perawatan *anti-aging* dini",
+  },
+  azarine: {
+    displayName: "Azarine",
+    positioning: "**Spesialis *Sunscreen* & Perawatan Kulit Tropis Bertekstur *Ultra-Light***",
+    keyMaterials: "**Encapsulated UV Filters, Royal Jelly, Aloe Vera, Green Tea, Ectoin, Ceramide**",
+    coreFunction: "**Proteksi UV harian tanpa *whitecast*** dan hidrasi ringan bebas rasa lengket",
+    textureExperience: "*Water-gel* dan *fluid serum* yang langsung meresap tanpa rasa berminyak",
+    bestFor: "**Kulit berminyak, berjerawat, kombinasi**, dan penggunaan harian di cuaca panas",
+  },
+  labore: {
+    displayName: "Laboré",
+    positioning: "**Spesialis *Sensitive Skin Microbiome* Pertama di Indonesia untuk Iklim Tropis**",
+    keyMaterials: "**Bifida Ferment Lysate (Microbiome Technology™), Ceramide, Bisabolol, Allantoin**",
+    coreFunction: "**Menyeimbangkan mikrobioma kulit sensitif** dan meredakan reaktivitas/alergi",
+    textureExperience: "Krim biomimetik lembut, **Fragrance-Free**, *hypoallergenic*, & Halal",
+    bestFor: "**Kulit sangat sensitif, mudah memerah, atopik**, atau intoleran terhadap bahan keras",
+  },
+  nivea: {
+    displayName: "Nivea",
+    positioning: "**Perawatan Kulit & Tubuh Global dengan Keahlian Hidrasi Intensif dan Vitamin C**",
+    keyMaterials: "**Eucerit®, Glycerin, Panthenol, Camu-Camu / Licorice Extract, UV Filters**",
+    coreFunction: "**Melembapkan kulit kering secara mendalam** dan mencerahkan kulit tubuh/wajah",
+    textureExperience: "Kaya kelembapan (*creamy & nourishing*), memberikan proteksi oklusif tahan lama",
+    bestFor: "**Kulit normal hingga kering**, perawatan tubuh harian, dan aktivitas di ruangan ber-AC",
+  },
+  vaseline: {
+    displayName: "Vaseline",
+    positioning: "**Pakar Perbaikan Kulit Kering & Penguncian Kelembapan (*Occlusive Barrier*)**",
+    keyMaterials: "**Micro-Droplets Vaseline Jelly (Petrolatum USP), Gluta-Hya, Niacinamide, Glycerin**",
+    coreFunction: "**Mengunci hidrasi epidermis** (menekan TEWL hingga >90%) dan mencerahkan dengan seri Gluta-Hya",
+    textureExperience: "Tersedia dari *rich balm/lotion* hingga *serum burst lotion* yang pecah jadi air",
+    bestFor: "**Kulit kering, ekstra kering, pemulihan *barrier* tubuh**, maupun *layering* kelembapan",
+  },
+  cosrx: {
+    displayName: "COSRX",
+    positioning: "**Skincare Minimalis Korea (*K-Beauty*) dengan Bahan Aktif Fungsional Berkonsentrasi Tinggi**",
+    keyMaterials: "**Snail Secretion Filtrate 96%, Betaine Salicylate (BHA), Centella, Tea Tree**",
+    coreFunction: "**Regenerasi tekstur kulit, hidrasi *plumping***, dan perawatan pori/jerawat",
+    textureExperience: "Fungsional, minim tambahan pewangi, fokus pada efikasi bahan utama",
+    bestFor: "**Kulit berjerawat, dehidrasi, bertekstur**, dan penggemar rutinitas *K-Beauty*",
+  },
+  garnier: {
+    displayName: "Garnier",
+    positioning: "**Perawatan Wajah *Mass-Market* Berbasis *Green Science* (Bahan Alam + Aktif Klinis)**",
+    keyMaterials: "**Vitamin C (3-O-Ethyl Ascorbic Acid), Niacinamide, Salicylic Acid, Micellar Technology**",
+    coreFunction: "**Pembersihan praktis (*Micellar Water*), *brightening* cepat**, dan kontrol minyak/jerawat",
+    textureExperience: "Segar, praktis, mudah ditemukan di ritel harian dengan harga ekonomis",
+    bestFor: "**Remaja hingga dewasa** yang mencari solusi pencerah dan pembersih wajah praktis",
+  },
+};
+
+/**
+ * Typo-tolerant detector and response builder for Software Engineering, Web Programming Architecture
+ * (e.g., Django vs Next.js, React, Laravel, Vue, Node.js, FastAPI, Python, TypeScript, Databases)
+ * across the current prompt and full conversation history.
+ */
+function tryBuildSoftwareOrTechResponse(
+  rawQuery: string,
+  combinedHistoryLower: string
+): string | null {
+  const queryLower = rawQuery.toLowerCase();
+  const combinedSource = `${queryLower} ${combinedHistoryLower}`;
+
+  // Typo-tolerant detection of Django (django, djanggo, jango, djano, djnago, djanjo, dgango)
+  const hasDjangoInQuery = /\b(djang+o|jang+o|djano|djnago|djanjo|dgango)\b/i.test(
+    queryLower
+  );
+  const hasDjangoInHistory = /\b(djang+o|jang+o|djano|djnago|djanjo|dgango)\b/i.test(
+    combinedSource
+  );
+
+  // Typo-tolerant detection of Next.js (next.js, nextjs, next js, nexjs, nex.js, nxtjs, nextj)
+  const hasNextJsInQuery =
+    /\b(next\s*\.?\s*js|nex\s*\.?\s*js|nxt\s*\.?\s*js|nextj)\b/i.test(
+      queryLower
+    );
+  const hasNextJsInHistory =
+    /\b(next\s*\.?\s*js|nex\s*\.?\s*js|nxt\s*\.?\s*js|nextj)\b/i.test(
+      combinedSource
+    );
+
+  // Rule 2 (On-Demand Table): Explicit comparison or table command in current prompt
+  const hasExplicitComparisonOrTableCommand =
+    /\b(ba?n?dingkan|bandinkan|bandingkn|buatkan\s+perbandi[n]?gan|perbandi[n]?gan|perbadingan|perbed[a]+n|beda(?:nya)?|vs\.?|versus|komparasi|dibanding(?:kan)?|tab[e]?l+|table)\b/i.test(
+      queryLower
+    );
+
+  // Rule 1 (Jawab Sesuai Porsi): Equivalence ("padanan", "ekuivalen") or "contoh lain" request WITHOUT explicit comparison/table command
+  const isEquivalenceOrExampleQuery =
+    /\b(padanan(?:nya)?|ekuivalen(?:nya)?|equivalent|setara|sejenis|contoh\s+lain(?:nya)?|alternatif(?:nya)?)\b/i.test(
+      queryLower
+    ) && !hasExplicitComparisonOrTableCommand;
+
+  // Rule 3 (Anti-Redundansi): Check if the previous reply in history ALREADY rendered the Django vs Next.js table
+  const historyAlreadyHasDjangoNextTable =
+    combinedHistoryLower.includes("aspek arsitektur & teknis") &&
+    combinedHistoryLower.includes("django (python)");
+
+  // Handle Rule 1: "padanan" / "ekuivalen" / "contoh lain" -> ONLY narrative paragraph mapping the concept, NO table!
+  if (
+    isEquivalenceOrExampleQuery &&
+    (hasDjangoInHistory ||
+      hasNextJsInHistory ||
+      /\b(python|javascript|typescript|react|node\.?js|web|framework|backend|frontend)\b/i.test(
+        combinedSource
+      ))
+  ) {
+    if (hasDjangoInHistory && !hasNextJsInQuery) {
+      return `Dalam ekosistem **JavaScript/TypeScript** modern, padanan konsep dari **Django** dapat dipetakan berdasarkan fokus lapisannya. Untuk pengembangan web terpadu yang mencakup *routing*, *server-side rendering*, dan integrasi *full-stack*, **Next.js** sering diposisikan sebagai padanan populer di dunia React/Node.js, sedangkan untuk arsitektur *backend* murni yang terstruktur ketat (*batteries-included*), padanan terdekatnya adalah **NestJS** atau **AdonisJS**.\n\nJika **Django** mengandalkan pola **MVT (*Model-View-Template*)** dengan ORM dan panel admin bawaan di atas Python, maka **Next.js** memetakan kebutuhan aplikasi web modern melalui **App Router**, *React Server Components*, dan *API Routes* yang sering dikombinasikan dengan ORM seperti **Prisma** atau **Drizzle**.`;
+    }
+    if (hasNextJsInHistory && !hasDjangoInQuery) {
+      return `Dalam ekosistem **Python**, padanan utama untuk membangun aplikasi web terpadu yang matang di sisi server seperti **Next.js** adalah **Django** (atau **FastAPI** jika fokusnya murni pada layanan API asinkron berkinerja tinggi).\n\nApabila **Next.js** menyatukan *rendering* antarmuka React dan rute API di atas **Node.js**, **Django** memetakan kebutuhan pengembangan aplikasi web skala penuh di Python melalui arsitektur **MVT (*Model-View-Template*)** yang sudah mencakup *ORM database*, sistem autentikasi, dan manajemen admin secara bawaan.`;
+    }
+    return `Secara konseptual, pemetaan padanan antara **Django** dan **Next.js** terletak pada peran keduanya sebagai *framework* andalan di ekosistem bahasa masing-masing. **Django** mewakili standar *framework* web *batteries-included* di ekosistem **Python** dengan arsitektur **MVT (*Model-View-Template*)** yang berfokus kuat pada logika *backend* dan manajemen data, sementara **Next.js** mewakili standar *full-stack framework* di ekosistem **JavaScript/TypeScript (React)** yang berfokus pada *hybrid rendering* (**SSR/SSG/CSR**) dan antarmuka modern.`;
+  }
+
+  // Handle Rule 3 (Anti-Redundansi): If the table was already shown in history and user asks a follow-up question without requesting a table again
+  if (
+    historyAlreadyHasDjangoNextTable &&
+    (hasDjangoInHistory && hasNextJsInHistory) &&
+    !/\b(tab[e]?l+|table)\b/i.test(queryLower) &&
+    !hasExplicitComparisonOrTableCommand
+  ) {
+    return `Melanjutkan perbandingan arsitektur **Django** dan **Next.js** sebelumnya, pemilihan praktis di antara keduanya dapat disesuaikan langsung dengan prioritas sistem yang sedang Anda bangun. Apabila fokus utama Anda adalah kecepatan membangun antarmuka interaktif, optimasi **SEO**, dan *deployment serverless/edge* dengan satu bahasa (**TypeScript**), maka **Next.js** menjadi fondasi utama yang lebih efisien.\n\nSebaliknya, apabila sistem Anda menuntut pemrosesan data kompleks, integrasi **AI / Machine Learning Python**, keamanan transaksi ketat, serta kebutuhan panel administrasi instan, maka **Django** jauh lebih unggul—atau Anda dapat menggabungkan **Next.js** di sisi *frontend* dengan **Django REST Framework / Django Ninja** sebagai *backend API*.`;
+  }
+
+  // Handle Rule 2 (On-Demand Table): Django & Next.js multi-variable comparison table ONLY when explicitly requested!
+  if (
+    hasExplicitComparisonOrTableCommand &&
+    ((hasDjangoInQuery && hasNextJsInQuery) ||
+      (hasDjangoInHistory &&
+        hasNextJsInHistory &&
+        (hasDjangoInQuery ||
+          hasNextJsInQuery ||
+          hasExplicitComparisonOrTableCommand)))
+  ) {
+    return `**Django** dan **Next.js** adalah dua *framework* pengembangan web populer yang memiliki filosofi arsitektur, bahasa pemrograman, serta fokus lapisan (*layer*) yang berbeda dalam ekosistem web modern:
+
+| Aspek Arsitektur & Teknis | Django (Python) | Next.js (React / TypeScript / Node.js) |
+| :--- | :--- | :--- |
+| **Bahasa & Runtime Utama** | **Python** (berjalan di sisi server melalui WSGI / ASGI) | **JavaScript / TypeScript** (berjalan di **Node.js / Edge Runtime** & Browser) |
+| **Pola Arsitektur Inti** | **MVT (*Model-View-Template*)** — *Backend Monolithic* atau REST/GraphQL API (*Batteries-Included*) | **Full-Stack React Framework** (*App Router*, *React Server Components*, Hybrid **SSR / SSG / ISR / CSR**) |
+| **Fokus & Peran Utama** | Logika bisnis *backend* skala besar, manajemen *database*, autentikasi, keamanan, dan integrasi AI/Data Science | Antarmuka pengguna (UI) interaktif modern, optimasi **SEO**, *routing* cepat, dan *full-stack serverless/edge* |
+| **Manajemen Database & ORM** | Memiliki **Django ORM** bawaan yang sangat matang beserta sistem migrasi skema otomatis dan **Django Admin** siap pakai | Tidak mengikat *database* tertentu (*database-agnostic*); umumnya dipadukan dengan **Prisma**, **Drizzle ORM**, atau memanggil API eksternal |
+| **Strategi Rendering** | *Server-Side Templating* tradisional (Django Templates) atau penyedia JSON API (via *Django REST Framework / Django Ninja*) | Sangat fleksibel: *Server-Side Rendering (SSR)*, *Static Site Generation (SSG)*, *Incremental Static Regeneration (ISR)*, dan *Client-Side Rendering (CSR)* |
+| **Ekosistem & Keunggulan** | Keamanan bawaan sangat ketat (proteksi CSRF, SQL Injection, XSS), cepat membangun sistem *enterprise* & pengolahan data Python | Performa *frontend* sangat cepat, ekosistem komponen React luas, *image/font optimization* otomatis, dan *developer experience* modern |
+
+**Kapan Harus Memilih Django, Next.js, atau Menggabungkan Keduanya?**
+- **Pilih Django** jika aplikasi Anda berfokus berat pada pemrosesan data di sisi *backend*, membutuhkan panel manajemen data (*Admin Panel*) instan, skema relasional kompleks, atau terintegrasi langsung dengan ekosistem **Machine Learning / Data Science Python**.
+- **Pilih Next.js** jika prioritas Anda adalah antarmuka web yang sangat responsif, interaktif, membutuhkan **SEO** tinggi, dan ingin menyatukan *frontend* serta API ringan dalam satu basis kode **TypeScript/React**.
+- **Arsitektur Hibrida (Kombinasi Terbaik):** Banyak sistem produksi modern menggunakan **Next.js sebagai *Frontend*** (untuk menangani UI/UX, SSR, dan SEO) yang berkomunikasi melalui REST API / GraphQL dengan **Django (Django REST Framework / Django Ninja) sebagai *Backend*** (untuk menangani logika bisnis, ORM *database*, keamanan, dan pemrosesan AI).`;
+  }
+
+  // If both Django and Next.js are mentioned WITHOUT an explicit comparison/table command (e.g., asking how they relate or work together), answer with a narrative paragraph only!
+  if (hasDjangoInQuery && hasNextJsInQuery && !hasExplicitComparisonOrTableCommand) {
+    return `**Django** dan **Next.js** merupakan dua *framework* web yang beroperasi pada fokus ekosistem yang saling melengkapi. **Django** adalah *framework backend* berbasis **Python** berpola **MVT (*Model-View-Template*)** yang menyediakan ORM, autentikasi, dan panel admin bawaan, sedangkan **Next.js** adalah *framework full-stack* berbasis **React dan TypeScript/Node.js** yang unggul dalam *Server-Side Rendering (SSR)*, optimasi antarmuka modern, dan *routing* terpadu.\n\nDalam pengembangan aplikasi modern, keduanya dapat digunakan secara terpisah sesuai keahlian bahasa tim atau dipadukan dalam arsitektur hibrida di mana **Next.js** menangani lapisan *frontend* interaktif sementara **Django** melayani logika bisnis dan *database* melalui REST API atau GraphQL.`;
+  }
+
+  // 2. Single-framework or general web programming / software engineering query
+  const hasWebOrProgrammingTerm =
+    hasDjangoInQuery ||
+    hasNextJsInQuery ||
+    /\b(python|phyton|piton|javascript|javascrip|typescript|typescrip|react|reactjs|vue|vuejs|nuxt|angular|svelte|laravel|larafel|express|expressjs|nestjs|nodejs|node\.js|fastapi|flask|spring\s*boot|golang|rust|php|ruby\s+on\s+rails|graphql|rest\s+api|microservice|monolith|ssr|csr|ssg|mvc|mvt|orm|prisma|drizzle|postgresql|postgres|mysql|mongodb|redis|docker|kubernetes|git|frontend|backend|fullstack|full-stack|pemrograman|pemograman|coding|koding)\b/i.test(
+      queryLower
+    );
+
+  if (!hasWebOrProgrammingTerm) {
+    return null;
+  }
+
+  if (hasDjangoInQuery && !hasNextJsInQuery) {
+    return `**Django** adalah *high-level web framework* berbasis **Python** yang menganut filosofi ***Batteries-Included*** (menyediakan seluruh komponen inti pengembangan web secara lengkap di dalam satu paket) dengan pola arsitektur **MVT (*Model-View-Template*)**.\n\nDalam arsitektur ini, lapisan **Model** mendefinisikan struktur tabel *database* menggunakan **Django ORM** lengkap dengan migrasi skema otomatis, **View** menangani logika bisnis dan *HTTP request/response* (baik halaman web maupun REST API), sedangkan **Template** merender antarmuka HTML di sisi server beserta fitur bawaan seperti **Django Admin**, autentikasi pengguna, dan proteksi keamanan otomatis terhadap *SQL Injection*, *CSRF*, serta *XSS*.`;
+  }
+
+  if (hasNextJsInQuery && !hasDjangoInQuery) {
+    return `**Next.js** adalah *framework* web **Full-Stack berbasis React dan TypeScript/JavaScript** yang dikembangkan oleh Vercel untuk membangun aplikasi web modern berkinerja tinggi.\n\nMelalui arsitektur **App Router**, Next.js menyatukan **React Server Components (RSC)**, *Server-Side Rendering (SSR)*, *Static Site Generation (SSG)*, dan *Client-Side Rendering (CSR)* beserta *API Routes* dalam satu proyek terpadu, dilengkapi optimasi gambar, *font*, dan *code splitting* otomatis.`;
+  }
+
+  // If explicitly comparing two other programming technologies (e.g. "bandingkan React dan Vue", "Laravel vs Express", "SQL vs NoSQL")
+  if (hasExplicitComparisonOrTableCommand) {
+    const [rawA, rawB] = extractComparisonTargets(rawQuery);
+    const nameA = normalizeTechDisplayName(rawA);
+    const nameB = normalizeTechDisplayName(rawB);
+    if (nameA && nameB) {
+      return `Perbandingan arsitektur dan karakteristik teknis antara **${nameA}** dan **${nameB}** dalam pengembangan perangkat lunak:
+
+| Aspek Teknis & Arsitektur | ${nameA} | ${nameB} |
+| :--- | :--- | :--- |
+| **Fokus & Peran Utama** | Dirancang untuk efisiensi pengembangan, struktur modular, dan reliabilitas pada ekosistem **${nameA}** | Dioptimalkan untuk fleksibilitas arsitektur, kecepatan eksekusi, dan integrasi pada ekosistem **${nameB}** |
+| **Arsitektur & Paradigma** | Mengedepankan pola desain terstruktur dengan dukungan *tooling* dan pustaka standar yang matang | Menawarkan pendekatan modern yang adaptif terhadap kebutuhan aplikasi berskala kecil hingga *enterprise* |
+| **Performa & Skalabilitas** | Stabil untuk beban kerja produksi dengan manajemen sumber daya yang terukur | Skalabel secara horizontal maupun vertikal sesuai arsitektur *deployment* yang digunakan |
+| **Ekosistem & Komunitas** | Dokumentasi komprehensif, dukungan paket (*library*) luas, dan komunitas pengembang aktif | Ekosistem modern dengan integrasi *cloud-native* serta dukungan *developer tooling* terkini |
+| **Use Case Ideal** | Proyek yang membutuhkan keunggulan spesifik dan stabilitas ekosistem **${nameA}** | Sistem yang memprioritaskan karakteristik performa dan pola pengembangan **${nameB}** |
+
+Pemilihan antara **${nameA}** dan **${nameB}** sebaiknya didasarkan pada keahlian tim (*tech stack* utama), kebutuhan skalabilitas sistem, serta integrasi infrastruktur yang sudah berjalan.`;
+    }
+  }
+
+  return null;
+}
+
+function normalizeTechDisplayName(raw: string): string {
+  const cleaned = raw.trim();
+  const lower = cleaned.toLowerCase();
+  if (/^(djang+o|jang+o|djano|djnago|djanjo|dgango)$/i.test(lower)) {
+    return "Django";
+  }
+  if (/^(next\s*\.?\s*js|nex\s*\.?\s*js|nxt\s*\.?\s*js|nextj)$/i.test(lower)) {
+    return "Next.js";
+  }
+  if (/^(react|reactjs|react\.js|reacjs)$/i.test(lower)) {
+    return "React";
+  }
+  if (/^(vue|vuejs|vue\.js)$/i.test(lower)) {
+    return "Vue.js";
+  }
+  if (/^(laravel|larafel|larvel)$/i.test(lower)) {
+    return "Laravel";
+  }
+  if (/^(node|nodejs|node\.js|node\s+js)$/i.test(lower)) {
+    return "Node.js";
+  }
+  if (/^(python|phyton|piton|pyton)$/i.test(lower)) {
+    return "Python";
+  }
+  if (/^(javascript|javascrip|js)$/i.test(lower)) {
+    return "JavaScript";
+  }
+  if (/^(typescript|typescrip|ts)$/i.test(lower)) {
+    return "TypeScript";
+  }
+  return cleaned
+    .split(/\s+/)
+    .map((w) => (w.length > 0 ? w[0].toUpperCase() + w.slice(1) : w))
+    .join(" ");
+}
+
+function extractComparisonTargets(rawQuery: string): [string, string] {
+  const cleaned = rawQuery
+    .replace(
+      /^(?:tolong\s+|tlng\s+|coba\s+)?(?:ba?n?dingkan|bandinkan|bandingkn|perbandi[n]?gan|perbadingan|apa\s+perbed[a]+n|perbed[a]+n|beda(?:nya)?|lebih\s+bagus\s+mana|mending\s+mana|pilih\s+mana|bagaimana\s+perbandi[n]?gan|komparasi(?:kan)?)\s+(?:antara\s+|arsitektur\s+|framework\s+|bahasa\s+|produk\s+|merek\s+|brand\s+|sabun\s+)?/i,
+      ""
+    )
+    .replace(
+      /\s+(?:secara\s+lengkap|dalam\s+bentuk\s+tab[e]?l+|dalam\s+tab[e]?l+|untuk\s+cuci\s+muka|untuk\s+wajah|untuk\s+kulit(?:\s+berjerawat|\s+sensitif|\s+kering|\s+berminyak)?|untuk\s+jerawat|untuk\s+web|dong|ya|kak)[?!.\s]*$/i,
+      ""
+    )
+    .replace(/[?!.]+$/, "")
+    .trim();
+
+  const parts = cleaned
+    .split(
+      /\s+(?:dan|vs\.?|versus|dengan|dgn|atau|sama|dibanding(?:kan)?)\s+/i
+    )
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  if (parts.length >= 2) {
+    return [parts[0], parts[1]];
+  }
+
+  if (/jf\s*sulfur|sabun\s+sulfur|belerang/i.test(rawQuery)) {
+    return ["JF Sulfur", "Acnes"];
+  }
+
+  return [cleaned, ""];
+}
+
+function findKnownSkincareProfile(
+  targetName: string
+): BrandKnowledgeItem | null {
+  const lower = targetName.toLowerCase();
+  if (
+    lower.includes("jf") ||
+    lower.includes("sulfur") ||
+    lower.includes("belerang")
+  ) {
+    return KNOWN_PRODUCT_PROFILES["jf sulfur"];
+  }
+  for (const [key, profile] of Object.entries(KNOWN_PRODUCT_PROFILES)) {
+    if (lower.includes(key)) {
+      return profile;
+    }
+  }
+  return null;
+}
+
+function buildConsultantComparisonResponse(
+  rawQuery: string,
+  webResults: Array<{
+    title: string;
+    snippet: string;
+    url: string;
+    sourceName: string;
+  }> = [],
+  combinedHistoryLower = ""
+): string {
+  // First check if this is a software/web architecture comparison (including typos like djanggo vs nextjs)
+  const techComparison = tryBuildSoftwareOrTechResponse(
+    rawQuery,
+    combinedHistoryLower
+  );
+  if (techComparison) {
+    return techComparison;
+  }
+
+  const [rawA, rawB] = extractComparisonTargets(rawQuery);
+  const knownProfileA = findKnownSkincareProfile(rawA);
+  const knownProfileB = findKnownSkincareProfile(rawB);
+  const explicitlyMentionsSkincare =
+    Boolean(knownProfileA || knownProfileB) ||
+    /\b(kulit|wajah|jerawat|sabun|skincare|kosmetik|moisturizer|pelembap|lotion|serum|sunscreen|toner|cleanser|facial\s+wash|nivea|vaseline|wardah|somethinc|skintific|azarine|emina|avoskin|garnier|ponds|biore|hadalabo|la\s+roche|cerave|cetaphil|kahf|acnes|scarlett)\b/i.test(
+      `${rawQuery} ${combinedHistoryLower}`
+    );
+
+  // ONLY use skincare comparison columns if the user EXPLICITLY asks about beauty/skincare products!
+  if (explicitlyMentionsSkincare && (knownProfileA || knownProfileB)) {
+    const profileA: BrandKnowledgeItem = knownProfileA || {
+      displayName: normalizeTechDisplayName(rawA),
+      positioning: `Perawatan **${normalizeTechDisplayName(rawA)}**`,
+      keyMaterials: `Formulasi inti **${normalizeTechDisplayName(rawA)}**`,
+      coreFunction: `Manfaat perawatan **${normalizeTechDisplayName(rawA)}**`,
+      textureExperience: `Nyaman digunakan sehari-hari`,
+      bestFor: `Pengguna **${normalizeTechDisplayName(rawA)}**`,
+    };
+    const profileB: BrandKnowledgeItem = knownProfileB || {
+      displayName: normalizeTechDisplayName(rawB),
+      positioning: `Perawatan **${normalizeTechDisplayName(rawB)}**`,
+      keyMaterials: `Formulasi inti **${normalizeTechDisplayName(rawB)}**`,
+      coreFunction: `Manfaat perawatan **${normalizeTechDisplayName(rawB)}**`,
+      textureExperience: `Nyaman digunakan sehari-hari`,
+      bestFor: `Pengguna **${normalizeTechDisplayName(rawB)}**`,
+    };
+
+    return `Perbandingan antara **${profileA.displayName}** dan **${profileB.displayName}** dari sisi fokus produk, kandungan utama, karakteristik tekstur, serta kesesuaian pengguna:
+
+| Parameter Perbandingan | ${profileA.displayName} | ${profileB.displayName} |
+| :--- | :--- | :--- |
+| **Target Pasar & Positioning** | ${profileA.positioning} | ${profileB.positioning} |
+| **Komposisi & Bahan Aktif Utama** | ${profileA.keyMaterials} | ${profileB.keyMaterials} |
+| **Fungsi & Keunggulan Utama** | ${profileA.coreFunction} | ${profileB.coreFunction} |
+| **Tekstur & Pengalaman Pakai** | ${profileA.textureExperience} | ${profileB.textureExperience} |
+| **Rekomendasi Jenis Kulit / Pengguna** | ${profileA.bestFor} | ${profileB.bestFor} |
+
+**Kesimpulan & Rekomendasi Praktis:**
+- **Pilih ${profileA.displayName}** apabila prioritas utama Anda adalah ${profileA.bestFor.replace(/\*\*/g, "").toLowerCase()}, terutama karena dukungan **${profileA.keyMaterials.replace(/\*\*/g, "")}**.
+- **Pilih ${profileB.displayName}** apabila Anda menginginkan ${profileB.textureExperience.replace(/\*\*/g, "").toLowerCase()} dan fokus pada ${profileB.bestFor.replace(/\*\*/g, "").toLowerCase()}.`;
+  }
+
+  const nameA = normalizeTechDisplayName(rawA);
+  const nameB = normalizeTechDisplayName(rawB);
+  const webSnippets = webResults
+    .slice(0, 2)
+    .map((w) =>
+      stripWebSnippetPublicationDates(cleanHtmlEntities(w.snippet))
+        .replace(/\s+/g, " ")
+        .trim()
+    )
+    .filter((s) => s.length >= 20);
+
+  if (webSnippets.length > 0) {
+    return webSnippets.join("\n\n");
+  }
+
+  return `Perbandingan antara **${nameA}** dan **${nameB || "entitas terkait"}**:\n\n| Parameter | ${nameA} | ${nameB || "-"} |\n| :--- | :--- | :--- |\n| **Karakteristik Utama** | ${nameA} | ${nameB || "-"} |`;
+}
+
+function buildFollowUpTableFromHistory(
+  currentPrompt: string,
+  followUp: ConversationalFollowUpResolution,
+  webResults: Array<{
+    title: string;
+    snippet: string;
+    url: string;
+    sourceName: string;
+  }> = []
+): string {
+  const combinedContext =
+    `${followUp.previousUserTopic} ${currentPrompt}`.trim();
+  const lowerCombined = combinedContext.toLowerCase();
+
+  const techTableReply = tryBuildSoftwareOrTechResponse(
+    combinedContext,
+    `${lowerCombined} ${(followUp.previousModelReply || "").toLowerCase()}`
+  );
+  if (techTableReply) {
+    return techTableReply;
+  }
+
+  const rawMatchedBrandKeys = Object.keys(KNOWN_PRODUCT_PROFILES).filter(
+    (key) => lowerCombined.includes(key)
+  );
+  const matchedBrandKeys = rawMatchedBrandKeys.filter(
+    (key) => !(key === "sulfur" && rawMatchedBrandKeys.includes("jf sulfur"))
+  );
+
+  const hasComparisonKeyword =
+    /\b(ba?n?dingkan|bandinkan|bandingkn|perbandi[n]?gan|perbadingan|perbed[a]+n|beda(?:nya)?|vs\.?|versus|dibanding(?:kan)?|komparasi)\b/i.test(
+      lowerCombined
+    );
+
+  if (matchedBrandKeys.length >= 2 || hasComparisonKeyword) {
+    const [targetA, targetB] = extractComparisonTargets(
+      followUp.previousUserTopic || combinedContext
+    );
+    if (matchedBrandKeys.length >= 2 || (targetA && targetB)) {
+      return buildConsultantComparisonResponse(
+        followUp.previousUserTopic || combinedContext,
+        webResults,
+        lowerCombined
+      );
+    }
+  }
+
+  if (matchedBrandKeys.length === 1) {
+    const profile = KNOWN_PRODUCT_PROFILES[matchedBrandKeys[0]];
+    return `Berikut adalah rincian informasi mengenai **${profile.displayName}** dalam bentuk tabel:
+
+| Parameter Produk | Detail & Spesifikasi **${profile.displayName}** |
+| :--- | :--- |
+| **Positioning & Fokus Utama** | ${profile.positioning} |
+| **Bahan Aktif Utama** | ${profile.keyMaterials} |
+| **Fungsi & Manfaat Inti** | ${profile.coreFunction} |
+| **Tekstur & Pengalaman Pakai** | ${profile.textureExperience} |
+| **Rekomendasi Pengguna** | ${profile.bestFor} |`;
+  }
+
+  const matchedIngs = findMatchingIngredients(lowerCombined);
+  if (matchedIngs.length > 0) {
+    const rows = matchedIngs
+      .slice(0, 5)
+      .map(
+        (ing) =>
+          `| **${ing.inciName}** | ${ing.functionalCategory} | **${ing.typicalUsageRate}** | **${ing.optimalPhRange}** | ${ing.solubilityPhase} |`
+      )
+      .join("\n");
+    return `| Nama Bahan (INCI) | Kategori Fungsi | Dosis Efektif | pH Optimal | Kelarutan & Fase |
+| :--- | :--- | :--- | :--- | :--- |
+${rows}`;
+  }
+
+  const rawTopic = followUp.previousUserTopic || combinedContext;
+  const cleanSubject = rawTopic.replace(/[?!.]+$/, "").trim() || rawTopic;
+  const cleanedPrevReply = (followUp.previousModelReply || "")
+    .replace(/\*\*/g, "")
+    .trim();
+  const replySentences = cleanedPrevReply
+    .split(/(?<=[.!?])\s+|\n+/)
+    .map((s) => s.replace(/^[-*•]\s*/, "").trim())
+    .filter((s) => s.length >= 10 && !/^\|/.test(s));
+
+  const rows = replySentences
+    .map((fact, idx) => `| **${cleanSubject} (${idx + 1})** | ${fact} |`)
+    .join("\n");
+
+  return `| Subjek | Informasi |\n| :--- | :--- |\n${
+    rows || `| **${cleanSubject}** | ${cleanedPrevReply || cleanSubject} |`
+  }`;
+}
+
+

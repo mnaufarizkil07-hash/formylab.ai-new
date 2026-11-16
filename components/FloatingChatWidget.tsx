@@ -179,11 +179,18 @@ export default function FloatingChatWidget() {
           attachments: m.attachments,
         }));
 
+      const geminiHistory = payloadMessages.map((m) => ({
+        role: m.role === "assistant" ? ("model" as const) : ("user" as const),
+        content: m.content,
+        attachments: m.attachments,
+      }));
+
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           messages: payloadMessages,
+          history: geminiHistory,
           model: selectedModel,
         }),
       });

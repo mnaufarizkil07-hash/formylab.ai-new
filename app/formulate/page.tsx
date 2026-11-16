@@ -33,10 +33,16 @@ import {
 } from "../../lib/interactiveAiEngine";
 
 const SKIN_TARGETS = [
-  "Dry & Dehydrated",
-  "Acne-Prone",
+  "Sensitive",
   "Sensitive & Redness",
+  "Oily",
+  "Dry",
+  "Dry & Dehydrated",
+  "Normal",
+  "Combination",
+  "Anti-Aging",
   "Aging & Fine Lines",
+  "Acne-Prone",
   "Dullness & Uneven Tone",
 ];
 
@@ -46,6 +52,7 @@ const TEXTURE_OPTIONS = [
   "Rich Cushion Cream (Velvety Barrier & Lembap Intensif)",
   "Breathable Fluid Lotion (Matte / Soft-Finish Tropis)",
   "Cooling Clear Hydro-Gel (Segar & Menenangkan)",
+  "Gentle Cleanser Low-Surfactant Gel (Lembut, Non-Stripping & Bebas SLS)",
   "Gentle Low-Foam Micellar Gel (Lembut Tanpa Ketarik)",
 ];
 
@@ -61,7 +68,7 @@ export default function FormulatePage() {
 
   // Core Formulation & Rheology Parameters
   const [productType, setProductType] = useState("Facial Moisturizer (Cream)");
-  const [skinTarget, setSkinTarget] = useState("Sensitive & Redness");
+  const [skinTarget, setSkinTarget] = useState("Sensitive");
   const [desiredTexture, setDesiredTexture] = useState(
     "Light Gel-Cream (Cepat Meresap, Non-Sticky)"
   );
@@ -99,7 +106,7 @@ export default function FormulatePage() {
         moq: "1000",
       };
     }
-    if (lower.includes("gel")) {
+    if (lower.includes("gel") && !lower.includes("cleanser")) {
       return {
         texture: "Cooling Clear Hydro-Gel (Segar & Menenangkan)",
         hpp: "11000",
@@ -107,9 +114,10 @@ export default function FormulatePage() {
         moq: "1000",
       };
     }
-    if (lower.includes("cleanser")) {
+    if (lower.includes("cleanser") || lower.includes("wash")) {
       return {
-        texture: "Gentle Low-Foam Micellar Gel (Lembut Tanpa Ketarik)",
+        texture:
+          "Gentle Cleanser Low-Surfactant Gel (Lembut, Non-Stripping & Bebas SLS)",
         hpp: "10500",
         trialBudget: "250000",
         moq: "1500",
@@ -149,25 +157,51 @@ export default function FormulatePage() {
         localStorage.removeItem("importedChatFormulation");
         try {
           const draft = JSON.parse(importedRaw) as ExtractedFormulationDraft;
-          const spec = getProductTypeSpec(draft.productType);
-          const def = getRecommendedBriefDefaults(spec.name);
-          setProductType(spec.name);
-          setSkinTarget(draft.skinTarget || "Sensitive & Redness");
-          setDesiredTexture(def.texture);
-          setTargetPh(draft.targetPh || spec.targetPh);
-          setTargetViscosity(draft.targetViscosity || spec.targetViscosity);
+          const spec = getProductTypeSpec(
+            draft.formulaName || draft.productType
+          );
+          const def = getRecommendedBriefDefaults(
+            draft.formulaName || draft.productType || spec.name
+          );
+          const resolvedFormulaName =
+            draft.formulaName || draft.productType || spec.name;
+          const resolvedSkinTarget =
+            draft.primarySkinTarget || draft.skinTarget || "Sensitive";
+          const resolvedTexture = draft.desiredTexture || def.texture;
+          const resolvedPh = draft.targetPh || spec.targetPh;
+          const resolvedVisc = draft.targetViscosity || spec.targetViscosity;
+          const extractedList = Array.isArray(draft.customIngredients)
+            ? draft.customIngredients
+            : [];
+
+          setProductType(resolvedFormulaName);
+          setSkinTarget(resolvedSkinTarget);
+          setDesiredTexture(resolvedTexture);
+          setTargetPh(resolvedPh);
+          setTargetViscosity(resolvedVisc);
           setBatchSize(draft.batchSize || "100");
           setTargetHppPerUnit(def.hpp);
           setTrialBudgetRp(def.trialBudget);
           setTargetMoq(def.moq);
-          setCustomIngredientsInput((draft.customIngredients || []).join(", "));
+          setCustomIngredientsInput(extractedList.join(", "));
           setImportedBannerText(
-            `Formula berhasil diterapkan dari AI R&D Consultant: ${draft.summaryLabel}`
+            `Formula "${resolvedFormulaName}" berhasil diterapkan dari obrolan AI R&D Consultant: ${extractedList.length} bahan diekstrak (Target Kulit: ${resolvedSkinTarget} · pH ${resolvedPh})`
           );
-          if (draft.customIngredients?.[0]) {
-            setPreviewIngredient3D(
-              draft.customIngredients[0].replace(/\d+(\.\d+)?\s*%/g, "").trim()
-            );
+
+          // Pilih bahan non-air pertama untuk pratinjau molekul 3D
+          const previewCandidate =
+            draft.extractedComposition?.find(
+              (item) => item.category !== "Air/Pelarut"
+            )?.name ||
+            extractedList
+              .find((i) => !/\b(water|aqua|aquadest)\b/i.test(i))
+              ?.replace(
+                /\(?(\d+(?:[.,]\d+)?(?:\s*-\s*\d+(?:[.,]\d+)?)?\s*%|ad\s*100%)\)?/gi,
+                ""
+              )
+              .trim();
+          if (previewCandidate) {
+            setPreviewIngredient3D(previewCandidate);
           }
           return;
         } catch {
@@ -465,6 +499,13 @@ export default function FormulatePage() {
                       onChange={(e) => handleProductTypeChange(e.target.value)}
                       className="w-full p-3 rounded-xl border border-slate-200 bg-white focus:outline-none focus:ring-2 focus:ring-[#14b8a6] text-xs sm:text-sm font-semibold text-slate-900"
                     >
+                      {!VALIDATED_PRODUCT_TYPES.some(
+                        (s) => s.name === productType
+                      ) && (
+                        <option value={productType}>
+                          {productType} (pH {targetPh || activeSpec.targetPh})
+                        </option>
+                      )}
                       {VALIDATED_PRODUCT_TYPES.map((spec) => (
                         <option key={spec.id} value={spec.name}>
                           {spec.name} (pH {spec.targetPh})
@@ -486,6 +527,9 @@ export default function FormulatePage() {
                       onChange={(e) => setSkinTarget(e.target.value)}
                       className="w-full p-3 rounded-xl border border-slate-200 bg-white focus:outline-none focus:ring-2 focus:ring-[#14b8a6] text-xs sm:text-sm font-semibold text-slate-900"
                     >
+                      {!SKIN_TARGETS.includes(skinTarget) && (
+                        <option value={skinTarget}>{skinTarget}</option>
+                      )}
                       {SKIN_TARGETS.map((target) => (
                         <option key={target} value={target}>
                           {target}
@@ -508,6 +552,9 @@ export default function FormulatePage() {
                     onChange={(e) => setDesiredTexture(e.target.value)}
                     className="w-full p-3 rounded-xl border border-slate-200 bg-white focus:outline-none focus:ring-2 focus:ring-[#14b8a6] text-xs sm:text-sm font-semibold text-slate-900"
                   >
+                    {!TEXTURE_OPTIONS.includes(desiredTexture) && (
+                      <option value={desiredTexture}>{desiredTexture}</option>
+                    )}
                     {TEXTURE_OPTIONS.map((tex) => (
                       <option key={tex} value={tex}>
                         {tex}
@@ -532,13 +579,10 @@ export default function FormulatePage() {
                     </div>
                     <input
                       id="target-ph-input"
-                      type="number"
-                      step="0.05"
-                      min="3.2"
-                      max="8.0"
+                      type="text"
                       value={targetPh}
                       onChange={(e) => setTargetPh(e.target.value)}
-                      placeholder={`e.g. ${activeSpec.targetPh}`}
+                      placeholder={`e.g. ${activeSpec.targetPh} atau 5.0 - 5.5`}
                       className="w-full p-3 rounded-xl border border-slate-200 bg-white focus:outline-none focus:ring-2 focus:ring-[#14b8a6] text-sm font-mono font-bold text-slate-900 placeholder:text-slate-400 placeholder:font-normal tabular-nums"
                       required
                     />
@@ -834,6 +878,35 @@ export default function FormulatePage() {
                     .join(", ")}`}
                   className="w-full p-3.5 rounded-xl border border-slate-200 bg-slate-50/80 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#14b8a6] text-sm font-medium text-slate-900 placeholder:text-slate-400 placeholder:font-normal"
                 />
+
+                {copilotEval.categorizedIngredients &&
+                  copilotEval.categorizedIngredients.length > 0 && (
+                    <div className="mt-2.5 p-3 rounded-xl bg-emerald-50/50 border border-emerald-200/70">
+                      <div className="text-[11px] font-bold text-[#12382f] mb-1.5 flex items-center justify-between">
+                        <span>
+                          Komposisi Bahan Terkategorisasi (
+                          {copilotEval.categorizedIngredients.length} Bahan):
+                        </span>
+                        <span className="font-mono text-[10px] text-[#0f766e]">
+                          Aktif: {copilotEval.totalActivePercent}% · Base/Eksipien:{" "}
+                          {copilotEval.estimatedBasePercent}%
+                        </span>
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {copilotEval.categorizedIngredients.map((item, idx) => (
+                          <span
+                            key={`${item.name}-${idx}`}
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-white border border-emerald-900/10 text-[11px] font-semibold text-slate-800 shadow-2xs"
+                          >
+                            <span>{item.label}</span>
+                            <span className="px-1.5 py-0.5 rounded bg-emerald-100/80 text-[#0f766e] text-[10px] font-mono font-bold">
+                              {item.category}
+                            </span>
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
 
                 {/* Quick Add from Full 43-Ingredient Database */}
                 <div className="mt-3">

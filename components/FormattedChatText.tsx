@@ -7,7 +7,7 @@ import React from "react";
 export function cleanComputerArtifacts(raw: string): string {
   if (!raw) return "";
 
-  return (
+  const cleaned = (
     raw
       // Decode any escaped HTML entities first so tags can be cleanly stripped
       .replace(/&lt;/gi, "<")
@@ -64,11 +64,186 @@ export function cleanComputerArtifacts(raw: string): string {
       // Remove stray LaTeX spacing commands
       .replace(/\\[,;!]\s*/g, " ")
       .replace(/\\quad\b|\\qquad\b/g, " ")
+      // Strip search engine breadcrumb trails вместе with any wrapping Markdown (**...**, __...__) and trailing dash (—)
+      .replace(
+        /(?:\*\*|__|\*|_)?\s*(?:https?:\/\/|www\.)?[a-z0-9.-]+\.[a-z]{2,}(?:\s*(?:>|›|»)\s*[^\s\n|*]+)+\s*(?:\*\*|__|\*|_)?\s*(?:[—–:-]\s*)?/gi,
+        " "
+      )
+      .replace(
+        /(?:^|\s)(?:\*\*|__|\*|_)?\s*(?:>|›|»)\s*[a-z0-9_-]+(?:\s*(?:>|›|»)\s*[a-z0-9_-]+)+\s*(?:\*\*|__|\*|_)?\s*(?:[—–:-]\s*)?/gi,
+        " "
+      )
+      // Strip search engine disclaimer / UI Chrome lines (e.g. "Sanggahan: ...", "Disclaimer: ...", "Terjemahkan halaman ini")
+      .replace(
+        /\b(?:Sanggahan|Disclaimer|Terjemahkan\s+halaman\s+ini|Lihat\s+hasil\s+untuk|Hasil\s+pencarian\s+web)\s*:?[^\n]*/gi,
+        ""
+      )
+      // Strip web snippet publication dates embedded in narrative sentences (e.g. "(Fri, 13 Nov 2026)", "(Diterbitkan 12 Mei 2024)", "12 Mei 2024 — ")
+      .replace(
+        /[([][\s]*(?:(?:diterbitkan|dipublikasikan|diperbarui|updated|published)\s*(?:pada)?\s*)?(?:(?:Sen|Sel|Rab|Kam|Jum|Sab|Min|Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\s*,?\s*)?\d{1,2}\s+(?:Jan(?:uari|uary)?|Feb(?:ruari|ruary)?|Mar(?:et|ch)?|Apr(?:il)?|Mei|May|Jun(?:i|e)?|Jul(?:i|y)?|Agu(?:stus)?|Aug(?:ust)?|Sep(?:tember)?|Okt(?:ober)?|Oct(?:ober)?|Nov(?:ember)?|Des(?:ember)?|Dec(?:ember)?)\s+\d{4}[^)\]\n]*[)\]]/gi,
+        ""
+      )
+      .replace(
+        /(?:^|\s|[-–—·•])(?:(?:Sen|Sel|Rab|Kam|Jum|Sab|Min|Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\s*,?\s*)?\d{1,2}\s+(?:Jan(?:uari|uary)?|Feb(?:ruari|ruary)?|Mar(?:et|ch)?|Apr(?:il)?|Mei|May|Jun(?:i|e)?|Jul(?:i|y)?|Agu(?:stus)?|Aug(?:ust)?|Sep(?:tember)?|Okt(?:ober)?|Oct(?:ober)?|Nov(?:ember)?|Des(?:ember)?|Dec(?:ember)?)\s+\d{4}(?:\s*,?\s*\d{1,2}[:.]\d{2}\s*(?:WIB|WITA|WIT)?)?\s*[-–—·•:]+\s*/gim,
+        " "
+      )
+      .replace(
+        /\b(?:yang\s+)?(?:diterbitkan|dipublikasikan|diunggah|diperbarui|published|updated)\s+(?:pada\s+|tanggal\s+)?\d{1,2}\s+(?:Jan(?:uari|uary)?|Feb(?:ruari|ruary)?|Mar(?:et|ch)?|Apr(?:il)?|Mei|May|Jun(?:i|e)?|Jul(?:i|y)?|Agu(?:stus)?|Aug(?:ust)?|Sep(?:tember)?|Okt(?:ober)?|Oct(?:ober)?|Nov(?:ember)?|Des(?:ember)?|Dec(?:ember)?)\s+\d{4}\s*,?\s*/gi,
+        ""
+      )
   );
+
+  return stripDanglingMarkdownAndLeadingSymbols(cleaned);
+}
+
+/**
+ * Menghapus tanda * atau ** yatim (tidak memiliki pasangan pembuka/penutup di baris yang sama)
+ * yang menggantung tepat setelah tanda titik dua (:* atau :**) atau di awal/akhir poin bullet/baris,
+ * tanpa merusak format **bold** dan *italic* yang normal.
+ */
+export function stripOrphanAsterisksInLine(line: string): string {
+  if (!line || !line.includes("*")) return line;
+
+  // Abaikan baris separator horizontal (***) atau baris tabel (| ... |)
+  const trimmed = line.trim();
+  if (/^\*{3,}$/.test(trimmed)) return line;
+
+  // Pisahkan prefix bullet/numbering jika ada (mis. "- ", "* ", "• ", "1. ")
+  const listPrefixMatch = line.match(/^(\s*(?:[-*•]|\d+\.)\s+)(.*)$/);
+  const prefix = listPrefixMatch ? listPrefixMatch[1] : "";
+  let body = listPrefixMatch ? listPrefixMatch[2] : line;
+
+  // Bersihkan tanda * atau ** yatim yang menggantung sendirian tepat di awal isi bullet (mis. "- * Teks" atau "- ** Teks")
+  body = body.replace(/^(?:\*\*|\*)\s+(?=[A-Za-z0-9([])/, "");
+
+  // 1. Lindungi semua pasangan **bold** yang valid pada baris yang sama dengan placeholder sementara
+  const boldPlaceholders: string[] = [];
+  let working = body.replace(/\*\*([^*\n]+?)\*\*/g, (fullMatch) => {
+    const idx = boldPlaceholders.length;
+    boldPlaceholders.push(fullMatch);
+    return `\u0000BOLD_${idx}\u0000`;
+  });
+
+  // Hapus sisa ** yatim (yang tidak memiliki pasangan di baris yang sama, seperti "Komposisi Teoretis (w/w %):**" atau "**Teks tanpa penutup")
+  working = working
+    .replace(/:\s*\*\*+(?=\s|$|[.,;!?—–-])/g, ":")
+    .replace(/\*\*+/g, "");
+
+  // 2. Sebelum memasangkan *italic*, cek apakah ada pola "Label:*" di mana tidak ada "*" pembuka sebelum ":"
+  // Dalam Markdown, ":*" yang diikuti spasi atau akhir baris hanya bisa menjadi penutup; jika tidak ada "*" sebelumnya, maka itu yatim (seperti "Fase Air:*").
+  working = working.replace(
+    /^([^*\n:]+):\*(?=\s|$|[.,;!?—–-])/g,
+    "$1:"
+  );
+
+  // Lindungi semua pasangan *italic* yang valid pada baris yang sama (tidak diawali/diakhiri spasi di dalam *)
+  const italicPlaceholders: string[] = [];
+  working = working.replace(
+    /\*([^\s*\n][^*\n]*?[^\s*\n]|[^\s*\n])\*/g,
+    (fullMatch) => {
+      const idx = italicPlaceholders.length;
+      italicPlaceholders.push(fullMatch);
+      return `\u0000ITALIC_${idx}\u0000`;
+    }
+  );
+
+  // Hapus sisa * yatim yang menggantung setelah titik dua (:*), di awal baris/kata, atau di ujung baris
+  // (Tetap pertahankan perkalian matematika seperti "2 * 3")
+  working = working
+    .replace(/:\s*\*(?=\s|$|[.,;!?—–-])/g, ":")
+    .replace(/(?:^|\s)\*(?=\s|$)/g, " ")
+    .replace(/^\*+|\*+$/g, "")
+    .replace(/([^\d\s])\*(?=\s|$)/g, "$1")
+    .replace(/(?:^|\s)\*(?=[^\d\s])/g, (m) => (m.startsWith(" ") ? " " : ""));
+
+  // Kembalikan placeholder *italic* dan **bold**
+  working = working.replace(
+    /\u0000ITALIC_(\d+)\u0000/g,
+    (_, idx) => italicPlaceholders[Number(idx)] || ""
+  );
+  working = working.replace(
+    /\u0000BOLD_(\d+)\u0000/g,
+    (_, idx) => boldPlaceholders[Number(idx)] || ""
+  );
+
+  return `${prefix}${working}`;
+}
+
+/**
+ * Strips dangling or empty Markdown symbols (such as `**__`, `**`, `__`, `*`, `_`, `#`, `-`, `—`, `()`)
+ * that hang alone at the start of a paragraph or response.
+ */
+export function stripDanglingMarkdownAndLeadingSymbols(input: string): string {
+  if (!input) return "";
+
+  const withoutEmptyWrappers = input
+    // Remove empty bold/italic/underline combinations like "**__", "__**", "****", "** **", "** — **", "()"
+    .replace(/(?:\*\*|__){1,3}\s*(?:[—–:-]\s*)?(?:\*\*|__){1,3}/g, " ")
+    .replace(/\(\s*\)|\[\s*\]/g, " ")
+    // Remove standalone "**", "__" followed by whitespace, dash, or end of line
+    .replace(/(?:^|\s)(?:\*\*|__)+(?=\s|$|[—–:.,;!?-])/gm, " ");
+
+  const lines = withoutEmptyWrappers.split("\n");
+  const cleanedLines = lines.map((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return "";
+
+    // Keep Markdown table rows intact (clean orphan asterisks inside each cell on render)
+    if (trimmed.startsWith("|")) {
+      return line;
+    }
+
+    // Preserve Markdown headings (#, ##, ###, ####) while cleaning orphan asterisks inside the heading text
+    const headingMatch = line.match(/^(\s*#{1,6}\s+)(.*)$/);
+    if (headingMatch) {
+      return `${headingMatch[1]}${stripOrphanAsterisksInLine(headingMatch[2]).trim()}`;
+    }
+
+    // Keep valid bullet list items (e.g. "- **Point**: ..." or "- Text") intact, cleaning dangling/orphan symbols after the bullet
+    const bulletMatch = line.match(/^(\s*[-*•]\s+)(.*)$/);
+    if (bulletMatch) {
+      const rest = stripOrphanAsterisksInLine(
+        bulletMatch[2]
+          .replace(/^(?:[*_#~—–:()[\]>›»-]+\s*)+(?=\s|$)/, "")
+          .replace(
+            /^(?:\*\*|__|\*|_)+(?![^\n]*?(?:\*\*|__|\*|_))\s*(?:[—–:-]\s*)?/,
+            ""
+          )
+      ).trim();
+      return rest ? `${bulletMatch[1]}${rest}` : "";
+    }
+
+    // For regular prose paragraphs:
+    // 1. Strip any leading dangling/unpaired Markdown symbols (*, _, #, -, —, (, ), >, ›) hanging alone with spaces/dashes
+    const cleanedLine = line
+      .replace(/^\s*(?:[*_#~—–:()[\]>›»-]+\s+)+/, "")
+      .replace(/^\s*(?:\*\*|__)+(?:\s*[—–:-]\s*)?(?=\s|$)/, "")
+      // 2. Strip mixed empty markers like "**__Hasil" or "__**Hasil" or "** — Hasil" at the start of a paragraph
+      .replace(/^\s*(?:\*\*__|__\*\*|\*_|_\*)+[\s*_#~—–:()[\]>›»-]*/, "")
+      // 3. Strip unpaired "**" or "__" or "*" or "_" at the start of the line when there is no matching closing marker on that line
+      .replace(
+        /^\s*(?:\*\*|__|\*|_)+(?![^\n]*?(?:\*\*|__|\*|_))[\s*_#~—–:()[\]>›»-]*/,
+        ""
+      )
+      // 4. Strip any leftover leading dash/colon/bracket separator before the first letter
+      .replace(/^\s*[—–:;()[\]>›»#]+\s*/, "");
+
+    return stripOrphanAsterisksInLine(cleanedLine);
+  });
+
+  return cleanedLines
+    .join("\n")
+    .replace(/^\s*(?:[*_#~—–:()[\]>›»-]+\s*)+(?=[A-Za-z0-9])/, (match) => {
+      // Preserve a valid opening "**Word**" or "*Word*" if it is a clean marker
+      if (/^\s*\*\*$/.test(match)) return "**";
+      if (/^\s*\*$/.test(match)) return "*";
+      return "";
+    })
+    .trim();
 }
 
 function renderInlineMarkdown(text: string): React.ReactNode[] {
-  const cleaned = text.trim();
+  const cleaned = stripOrphanAsterisksInLine(text).trim();
   if (!cleaned) return [];
 
   const parts: React.ReactNode[] = [];

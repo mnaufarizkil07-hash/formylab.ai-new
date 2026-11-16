@@ -2158,5 +2158,39 @@ export function getProductTypeSpec(productTypeNameOrId: string): ProductTypeSpec
       clean.includes(p.name.toLowerCase()) ||
       p.name.toLowerCase().includes(clean)
   );
-  return found || VALIDATED_PRODUCT_TYPES[0];
+  if (found) return found;
+
+  if (/\b(cleanser|wash|sabun|pembersih|micellar|surfactant|syndet)\b/i.test(clean)) {
+    return (
+      VALIDATED_PRODUCT_TYPES.find((p) => p.id === "gentle-cleanser") ||
+      VALIDATED_PRODUCT_TYPES[0]
+    );
+  }
+  if (/\b(sunscreen|spf|tabir\s+surya|uv)\b/i.test(clean)) {
+    return (
+      VALIDATED_PRODUCT_TYPES.find((p) => p.id === "sunscreen-lotion") ||
+      VALIDATED_PRODUCT_TYPES[0]
+    );
+  }
+  if (/\b(toner|microbiome)\b/i.test(clean)) {
+    return (
+      VALIDATED_PRODUCT_TYPES.find(
+        (p) => p.id === "microbiome-hydrating-toner-essence"
+      ) || VALIDATED_PRODUCT_TYPES[0]
+    );
+  }
+  if (/\b(serum|peptide|bakuchiol)\b/i.test(clean)) {
+    return (
+      VALIDATED_PRODUCT_TYPES.find((p) => p.id === "anti-aging-serum") ||
+      VALIDATED_PRODUCT_TYPES[0]
+    );
+  }
+  if (/\b(soothing\s+gel|hydro[\s-]?gel|calming\s+gel)\b/i.test(clean)) {
+    return (
+      VALIDATED_PRODUCT_TYPES.find((p) => p.id === "soothing-gel") ||
+      VALIDATED_PRODUCT_TYPES[0]
+    );
+  }
+
+  return VALIDATED_PRODUCT_TYPES[0];
 }

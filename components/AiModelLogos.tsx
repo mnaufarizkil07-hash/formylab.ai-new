@@ -64,10 +64,30 @@ export const AI_MODEL_OPTIONS: AiModelOption[] = [
 
 export function getModelOption(modelId?: string): AiModelOption {
   if (!modelId) return AI_MODEL_OPTIONS[0];
-  if (modelId === "gpt") return AI_MODEL_OPTIONS[1]; // GPT-6 Luna
-  if (modelId === "gemini") return AI_MODEL_OPTIONS[2]; // Gemini 3.8 Flash
+  const normalized = modelId.trim().toLowerCase();
+  if (normalized === "gpt" || normalized === "gpt-6 luna") {
+    return AI_MODEL_OPTIONS[1]; // GPT-6 Luna
+  }
+  if (normalized === "gemini" || normalized === "gemini 3.8 flash") {
+    return AI_MODEL_OPTIONS[2]; // Gemini 3.8 Flash
+  }
+  if (
+    normalized === "gemini 3.8 pro" ||
+    normalized === "gemini-3.1-pro-preview" ||
+    normalized === "models/gemini-3.1-pro-preview"
+  ) {
+    return AI_MODEL_OPTIONS[3]; // Gemini 3.8 Pro
+  }
+  if (normalized === "gpt-6 omni") {
+    return AI_MODEL_OPTIONS[4]; // GPT-6 Omni
+  }
   return (
-    AI_MODEL_OPTIONS.find((m) => m.id === modelId) || AI_MODEL_OPTIONS[0]
+    AI_MODEL_OPTIONS.find(
+      (m) =>
+        m.id.toLowerCase() === normalized ||
+        m.name.toLowerCase() === normalized ||
+        m.shortName.toLowerCase() === normalized
+    ) || AI_MODEL_OPTIONS[0]
   );
 }
 

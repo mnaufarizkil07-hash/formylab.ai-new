@@ -6,6 +6,10 @@ import {
   getProductTypeSpec,
   normalizeIngredientKey,
 } from "../../../lib/cosmeticChemistryData";
+import {
+  parseCategorizedIngredientItem,
+  parseTargetPhNumeric,
+} from "../../../lib/interactiveAiEngine";
 
 // --- FUNGSI PARSER CSV OTOMATIS ---
 function parseCSV(filePath: string) {
@@ -103,7 +107,10 @@ export async function POST(request: Request) {
       );
     }
 
-    const targetPhNum = targetPh ? parseFloat(targetPh) : parseFloat(productSpec.targetPh) || 5.5;
+    const targetPhNum = parseTargetPhNumeric(
+      String(targetPh || ""),
+      productSpec.targetPh || "5.5"
+    );
     let targetViscNum = productSpec.viscosityRangeCps[0] || 6000;
     if (targetViscosity) {
       const nums = String(targetViscosity).match(/\d+/g);
@@ -386,15 +393,16 @@ export async function POST(request: Request) {
       if (effectiveCustomIngs && Array.isArray(effectiveCustomIngs)) {
         effectiveCustomIngs.forEach((ci) => {
           if (!ci || !String(ci).trim()) return;
-          let userPerc: number | null = null;
-          let cleanName = String(ci).trim();
-          const regex = /(\d+(?:\.\d+)?)\s*%/;
-          const match = cleanName.match(regex);
+          const parsedEntry = parseCategorizedIngredientItem(String(ci));
+          const cleanName = parsedEntry.name;
 
-          if (match) {
-            userPerc = parseFloat(match[1]);
-            cleanName = cleanName.replace(regex, "").trim();
+          // Jika bahan adalah Air/Pelarut (ad 100%), biarkan fase Water di list utama yang menyeimbangkan ke 100%
+          if (parsedEntry.category === "Air/Pelarut") {
+            return;
           }
+
+          const userPerc: number | null =
+            parsedEntry.numericPercent > 0 ? parsedEntry.numericPercent : null;
 
           const lowerName = cleanName.toLowerCase().replace(/[^a-z0-9]/g, "");
           const existingIndex = list.findIndex((item) => {
@@ -405,13 +413,13 @@ export async function POST(request: Request) {
           if (existingIndex !== -1) {
             const currentPerc = parseFloat(list[existingIndex].conc);
             if (userPerc !== null) {
-              list[existingIndex].conc = `${(currentPerc + userPerc).toFixed(2)}%`;
+              list[existingIndex].conc = `${userPerc.toFixed(2)}%`;
               const suppInfo = getSupplierInfo(cleanName);
-              totalCost += (userPerc / 100) * finalBatchSize * suppInfo.price;
+              totalCost += (Math.max(0, userPerc - currentPerc) / 100) * finalBatchSize * suppInfo.price;
               list[existingIndex].supplier = suppInfo.name;
               list[existingIndex].isHalal = suppInfo.isHalal;
             }
-            list[existingIndex].riskNote = "✓ Base Formulation (Diprioritaskan sesuai form)";
+            list[existingIndex].riskNote = `✓ ${parsedEntry.category} (Disesuaikan dari resep: ${parsedEntry.rangeOrPct})`;
           } else {
             let concNum = userPerc;
             if (concNum === null) {
@@ -436,7 +444,7 @@ export async function POST(request: Request) {
               }
             }
 
-            // Differentiate active dosage slightly across Variant A (100%), Variant B (85% cost-saver), Variant C (90% ready-stock)
+            // Differentiate dosage slightly across Variant A (100%), Variant B (85% cost-saver), Variant C (90% ready-stock)
             const variantFactor = variantIndex === 0 ? 1.0 : variantIndex === 1 ? 0.85 : 0.9;
             const adjustedConc = Number((concNum * variantFactor).toFixed(2));
 
@@ -447,10 +455,10 @@ export async function POST(request: Request) {
             list.push(
               buildEnrichedItem(
                 cleanName,
-                "Custom Active Compound",
+                parsedEntry.category,
                 adjustedConc,
                 "Low",
-                `Active Compound untuk ${skinTarget || productSpec.shortName}`,
+                `${parsedEntry.category} (${parsedEntry.rangeOrPct}) untuk ${skinTarget || productSpec.shortName}`,
                 suppInfo
               )
             );

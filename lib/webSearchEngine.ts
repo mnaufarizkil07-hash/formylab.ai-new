@@ -216,41 +216,128 @@ export function shouldSearchLiveInternet(query: string): boolean {
   return true;
 }
 
-export function cleanHtmlEntities(raw: string): boolean extends false ? never : string {
+/**
+ * Strips publication dates, timestamps, and relative dates from web search snippets
+ * (e.g. "12 Mei 2024 — ", "May 12, 2024 · ", "(Fri, 13 Nov 2026)", "3 hari yang lalu — ",
+ * "KOMPAS.com - 12/05/2024, 14:30 WIB - ", "(Dipublikasikan 10 Jan 2025)")
+ * so snippet publication dates never leak into the middle of narrative sentences.
+ */
+export function stripWebSnippetPublicationDates(raw: string): string {
   if (!raw) return "";
+  const monthNames =
+    "(?:Jan(?:uari|uary)?|Feb(?:ruari|ruary)?|Mar(?:et|ch)?|Apr(?:il)?|Mei|May|Jun(?:i|e)?|Jul(?:i|y)?|Agu(?:stus)?|Aug(?:ust)?|Sep(?:tember)?|Okt(?:ober)?|Oct(?:ober)?|Nov(?:ember)?|Des(?:ember)?|Dec(?:ember)?)";
+  const dayNames =
+    "(?:Sen(?:in)?|Sel(?:asa)?|Rab(?:u)?|Kam(?:is)?|Jum(?:at)?|Sab(?:tu)?|Min(?:ggu)?|Mon(?:day)?|Tue(?:sday)?|Wed(?:nesday)?|Thu(?:rsday)?|Fri(?:day)?|Sat(?:urday)?|Sun(?:day)?)";
+
   return (
     raw
-      .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
-      // Decode named & numeric HTML entities FIRST before stripping HTML tags
-      .replace(/&amp;/gi, "&")
-      .replace(/&lt;/gi, "<")
-      .replace(/&gt;/gi, ">")
-      .replace(/&quot;/gi, '"')
-      .replace(/&#0*39;|&apos;|&rsquo;|&lsquo;/gi, "'")
-      .replace(/&ldquo;|&rdquo;/gi, '"')
-      .replace(/&mdash;/gi, "—")
-      .replace(/&ndash;/gi, "–")
-      .replace(/&hellip;/gi, "...")
-      .replace(/&nbsp;|&#160;/gi, " ")
-      .replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(parseInt(dec, 10)))
-      // Second decode pass in case of double-encoded entities (&amp;lt; or &amp;rsquo;)
-      .replace(/&lt;/gi, "<")
-      .replace(/&gt;/gi, ">")
-      .replace(/&quot;/gi, '"')
-      .replace(/&#0*39;|&apos;|&rsquo;|&lsquo;/gi, "'")
-      .replace(/&mdash;/gi, "—")
-      .replace(/&ndash;/gi, "–")
-      .replace(/&nbsp;|&#160;/gi, " ")
-      // Strip all HTML tags (<a href=...>, <font color=...>, <span>, etc.) AFTER decoding entities
-      .replace(/<[^>]+>/g, " ")
-      // Remove any leftover angle brackets or raw URL attributes
-      .replace(/href="[^"]*"/gi, " ")
-      .replace(/target="_blank"/gi, " ")
-      .replace(/color="#[0-9a-f]{3,6}"/gi, " ")
-      .replace(/[<>]/g, " ")
+      // 1. Strip parenthetical or bracketed RSS / snippet publication dates: "(Fri, 13 Nov 2026)", "(12 Mei 2024)", "(Diterbitkan 12 Mei 2024)"
+      .replace(
+        new RegExp(
+          `[(\\[]\\s*(?:(?:diterbitkan|dipublikasikan|diperbarui|updated|published)\\s*(?:pada)?\\s*)?(?:${dayNames}\\s*,?\\s*)?\\d{1,2}\\s+${monthNames}\\s+\\d{4}(?:[^)\\]]*)[)\\]]`,
+          "gi"
+        ),
+        " "
+      )
+      .replace(
+        new RegExp(
+          `[(\\[]\\s*(?:${dayNames}\\s*,?\\s*)?${monthNames}\\s+\\d{1,2}\\s*,?\\s*\\d{4}(?:[^)\\]]*)[)\\]]`,
+          "gi"
+        ),
+        " "
+      )
+      .replace(/\(\s*\d{4}-\d{2}-\d{2}(?:[^)]*)\)/g, " ")
+      // 2. Strip news portal dateline prefixes: "KOMPAS.com - 12/05/2024, 14:30 WIB - " or " - 12 Mei 2024, 10:00 WIB - "
+      .replace(
+        /(?:[A-Za-z0-9.-]+\.(?:com|id|co\.id|org|net)\s*[-–—·]\s*)?\d{1,2}[/-]\d{1,2}[/-]\d{2,4}(?:\s*,\s*\d{1,2}[:.]\d{2}\s*(?:WIB|WITA|WIT)?)?\s*[-–—·:]+\s*/gi,
+        " "
+      )
+      // 3. Strip leading or inline snippet dates followed by a snippet separator (—, –, -, ·, •, :): "12 Mei 2024 — ", " — 12 Mei 2024 — ", "May 12, 2024 · "
+      .replace(
+        new RegExp(
+          `(?:^|\\s|[-–—·•])(?:${dayNames}\\s*,?\\s*)?\\d{1,2}\\s+${monthNames}\\s+\\d{4}(?:\\s*,?\\s*\\d{1,2}[:.]\\d{2}\\s*(?:WIB|WITA|WIT)?)?\\s*[-–—·•:]+\\s*`,
+          "gi"
+        ),
+        " "
+      )
+      .replace(
+        new RegExp(
+          `(?:^|\\s|[-–—·•])(?:${dayNames}\\s*,?\\s*)?${monthNames}\\s+\\d{1,2}\\s*,?\\s*\\d{4}\\s*[-–—·•:]+\\s*`,
+          "gi"
+        ),
+        " "
+      )
+      .replace(
+        /(?:^|\s|[-–—·•])\d{4}-\d{2}-\d{2}\s*[-–—·•:]+\s*/g,
+        " "
+      )
+      // 4. Strip relative snippet timestamps: "3 hari yang lalu — ", "2 jam lalu · ", "5 days ago - "
+      .replace(
+        /(?:^|\s|[-–—·•])\d+\s+(?:detik|menit|jam|hari|minggu|bulan|tahun|second|minute|hour|day|week|month|year)s?\s+(?:yang\s+)?(?:lalu|ago)\s*[-–—·•:]+\s*/gi,
+        " "
+      )
+      // 5. Strip explicit publication clauses in the middle of narrative sentences: "diterbitkan pada 12 Mei 2024,", "dipublikasikan tanggal 10 Jan 2024"
+      .replace(
+        new RegExp(
+          `\\b(?:yang\\s+)?(?:diterbitkan|dipublikasikan|diunggah|diperbarui|published|updated)\\s+(?:pada\\s+|tanggal\\s+)?(?:${dayNames}\\s*,?\\s*)?\\d{1,2}\\s+${monthNames}\\s+\\d{4}\\s*,?\\s*`,
+          "gi"
+        ),
+        " "
+      )
       .replace(/\s+/g, " ")
       .trim()
   );
+}
+
+export function cleanHtmlEntities(raw: string): boolean extends false ? never : string {
+  if (!raw) return "";
+  const cleaned = raw
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
+    // Decode named & numeric HTML entities FIRST before stripping HTML tags
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#0*39;|&apos;|&rsquo;|&lsquo;/gi, "'")
+    .replace(/&ldquo;|&rdquo;/gi, '"')
+    .replace(/&mdash;/gi, "—")
+    .replace(/&ndash;/gi, "–")
+    .replace(/&hellip;/gi, "...")
+    .replace(/&nbsp;|&#160;/gi, " ")
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(parseInt(dec, 10)))
+    // Second decode pass in case of double-encoded entities (&amp;lt; or &amp;rsquo;)
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#0*39;|&apos;|&rsquo;|&lsquo;/gi, "'")
+    .replace(/&mdash;/gi, "—")
+    .replace(/&ndash;/gi, "–")
+    .replace(/&nbsp;|&#160;/gi, " ")
+    // Strip all HTML tags (<a href=...>, <font color=...>, <span>, etc.) AFTER decoding entities
+    .replace(/<[^>]+>/g, " ")
+    // Strip search engine URL breadcrumbs (e.g. "domain.com > id > kalkulator", "> id > kalkulator", "› id › kalkulator")
+    .replace(
+      /(?:https?:\/\/|www\.)?[a-z0-9.-]+\.[a-z]{2,}(?:\s*(?:>|›|»)\s*[^\s<>]+)+/gi,
+      " "
+    )
+    .replace(
+      /(?:^|\s)(?:>|›|»)\s*[a-z0-9_-]+(?:\s*(?:>|›|»)\s*[a-z0-9_-]+)+/gi,
+      " "
+    )
+    // Strip search engine disclaimer / UI text (e.g. "Sanggahan: ...", "Disclaimer: ...")
+    .replace(
+      /\b(?:Sanggahan|Disclaimer|Terjemahkan\s+halaman\s+ini|Lihat\s+hasil\s+untuk)\s*:?.*$/gi,
+      " "
+    )
+    // Remove any leftover angle brackets or raw URL attributes
+    .replace(/href="[^"]*"/gi, " ")
+    .replace(/target="_blank"/gi, " ")
+    .replace(/color="#[0-9a-f]{3,6}"/gi, " ")
+    .replace(/[<>›»]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return stripWebSnippetPublicationDates(cleaned);
 }
 
 /**
@@ -420,396 +507,27 @@ export function extractCoreSearchTokens(query: string): string[] {
     .filter(
       (w) =>
         w.length >= 2 &&
-        !/^\d+(?:[.,]\d+)?$/.test(w) &&
+        (!/^\d+(?:[.,]\d+)?$/.test(w) || /^(?:18|19|20)\d{2}$/.test(w)) &&
         !stopWords.has(w.toLowerCase()) &&
         !/^ber+a+p+a+$/i.test(w)
     );
 }
 
 /**
- * Queries 4 real-time public web & knowledge endpoints in parallel:
- * 1. Live Web Search (Yahoo Indonesia / Global Web Search)
- * 2. Wikipedia Full Plain-Text Extracts (Indonesia & English)
- * 3. Google News / Web RSS Search
- * 4. OpenStreetMap Nominatim Location Search & DuckDuckGo Instant Knowledge
+ * Manual web scraper & raw article slicing disabled.
+ * Factual search is handled natively by Gemini API's built-in Google Search grounding (`tools: [{ googleSearch: {} }]`)
+ * so scraped snippets never override or pollute the conversation flow.
  */
-export async function fetchRealtimeWebContext(query: string): Promise<{
+export async function fetchRealtimeWebContext(_query: string): Promise<{
   results: WebSearchResultItem[];
   contextBlockForAi: string;
   sourcesMarkdown: string;
 }> {
-  if (!shouldSearchLiveInternet(query)) {
-    return { results: [], contextBlockForAi: "", sourcesMarkdown: "" };
-  }
-
-  const rawTokens = extractCoreSearchTokens(query);
-  if (rawTokens.length === 0) {
-    return { results: [], contextBlockForAi: "", sourcesMarkdown: "" };
-  }
-
-  const lowerQ = query.toLowerCase();
-  const mentionsSkincareBrand =
-    /\b(kahf|cetaphil|cerave|wardah|emina|make\s*over|somethinc|avoskin|skintific|azarine|labore|lacoco|npure|whitelab|scarlett|garnier|pond|biore|hada\s*labo|cosrx|anua|skin1004|la\s*roche|bioderma|eucerin|kiehl)\b/.test(
-      lowerQ
-    );
-
-  const baseQuery = rawTokens.slice(0, 6).join(" ");
-  const effectiveQuery =
-    mentionsSkincareBrand && !/\b(skincare|kosmetik|sabun|wajah)\b/.test(lowerQ)
-      ? `${baseQuery} skincare kosmetik`
-      : baseQuery;
-
-  const wikiQuery =
-    rawTokens
-      .filter(
-        (w) =>
-          ![
-            "terbaik",
-            "rekomendasi",
-            "paling",
-            "bagus",
-            "merek",
-            "brand",
-            "produk",
-            "dunia",
-            "global",
-          ].includes(w.toLowerCase())
-      )
-      .slice(0, 4)
-      .join(" ") || effectiveQuery;
-
-  const results: WebSearchResultItem[] = [];
-
-  // Normalize alphanumeric tokens so "almatuq" matches "Al-Ma'tuq", "Al-Ma’tuq", "Al Matuq"
-  const normalizedQueryTokens = rawTokens
-    .map((t) => t.toLowerCase().replace(/[^a-z0-9]/g, ""))
-    .filter((t) => t.length >= 3);
-
-  const isRelevantResult = (title: string, snippet: string): boolean => {
-    const combinedLower = `${title} ${snippet}`.toLowerCase();
-    const combinedAlphaNum = combinedLower.replace(/[^a-z0-9]/g, "");
-
-    if (mentionsSkincareBrand) {
-      if (
-        /\b(surah|quran|koran|meccan|cave|nakhchivan|moses|prophet|ayat|bible)\b/.test(
-          combinedLower
-        )
-      ) {
-        return false;
-      }
-    }
-    if (normalizedQueryTokens.length > 0) {
-      const hasTokenOverlap = normalizedQueryTokens.some(
-        (tok) =>
-          combinedLower.includes(tok) ||
-          combinedAlphaNum.includes(tok) ||
-          (tok.length >= 5 && combinedAlphaNum.includes(tok.slice(0, 5)))
-      );
-      if (!hasTokenOverlap) {
-        return false;
-      }
-    }
-    return true;
-  };
-
-  // 1. Live Organic Web Search (Yahoo Indonesia Web Search — fast, rich full-web snippets)
-  const fetchLiveOrganicWebSearch = async (searchTerm: string) => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 2800);
-    try {
-      const url = `https://id.search.yahoo.com/search?p=${encodeURIComponent(
-        searchTerm
-      )}`;
-      const res = await fetch(url, {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-          "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8",
-        },
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-      if (!res.ok) return [];
-      const html = await res.text();
-
-      const titles = [
-        ...html.matchAll(
-          /<h3[^>]*class="[^"]*title[^"]*"[^>]*>([\s\S]*?)<\/h3>/g
-        ),
-      ].map((m) => cleanHtmlEntities(m[1]));
-
-      const compTexts = [
-        ...html.matchAll(/class="[^"]*compText[^"]*"[^>]*>([\s\S]*?)<\/div>/g),
-      ]
-        .map((m) => cleanHtmlEntities(m[1]))
-        .filter((s) => s.length > 30);
-
-      const parsed: WebSearchResultItem[] = [];
-      const count = Math.min(titles.length, compTexts.length, 4);
-      for (let i = 0; i < count; i++) {
-        const rawTitle = titles[i]
-          .replace(/^[^\s]+\s*\.\s*[^\s]+\s+/i, "")
-          .trim();
-        const snippet = compTexts[i];
-        if (rawTitle && snippet && isRelevantResult(rawTitle, snippet)) {
-          parsed.push({
-            title: rawTitle,
-            snippet,
-            url: `https://www.google.com/search?q=${encodeURIComponent(
-              rawTitle
-            )}`,
-            sourceName: "Google / Live Web",
-          });
-        }
-      }
-      return parsed;
-    } catch {
-      clearTimeout(timer);
-      return [];
-    }
-  };
-
-  // 2. Wikipedia Full Plain-Text Extracts (prop=extracts&exintro=1&explaintext=1)
-  const fetchWikiFullExtracts = async (
-    lang: "id" | "en",
-    searchTerm: string
-  ) => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 2500);
-    try {
-      const url = `https://${lang}.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=1&explaintext=1&generator=search&gsrsearch=${encodeURIComponent(
-        searchTerm
-      )}&gsrlimit=2&utf8=1&format=json&origin=*`;
-      const res = await fetch(url, {
-        headers: { "User-Agent": "FormyLabAI/2.0 (https://formylab.ai)" },
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-      if (!res.ok) return [];
-      const data = await res.json();
-      const pages = Object.values(data?.query?.pages || {}) as Array<{
-        title?: string;
-        extract?: string;
-        index?: number;
-      }>;
-      pages.sort((a, b) => (a.index || 99) - (b.index || 99));
-
-      const items: WebSearchResultItem[] = [];
-      for (const p of pages) {
-        const title = cleanHtmlEntities(String(p.title || ""));
-        const extract = cleanHtmlEntities(String(p.extract || "")).slice(
-          0,
-          750
-        );
-        if (title && extract.length > 35 && isRelevantResult(title, extract)) {
-          items.push({
-            title,
-            snippet: extract,
-            url: `https://${lang}.wikipedia.org/wiki/${encodeURIComponent(
-              title.replace(/\s+/g, "_")
-            )}`,
-            sourceName:
-              lang === "id" ? "Wikipedia Indonesia" : "Wikipedia Global",
-          });
-        }
-      }
-      return items;
-    } catch {
-      clearTimeout(timer);
-      return [];
-    }
-  };
-
-  // 3. Live Google News / Web RSS Search
-  const fetchGoogleRssSearch = async (
-    searchTerm: string,
-    lang: "id" | "en"
-  ) => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 2500);
-    try {
-      const hl =
-        lang === "id" ? "hl=id&gl=ID&ceid=ID:id" : "hl=en-US&gl=US&ceid=US:en";
-      const url = `https://news.google.com/rss/search?q=${encodeURIComponent(
-        searchTerm
-      )}&${hl}`;
-      const res = await fetch(url, {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (compatible; FormyLabAI/2.0; +https://formylab.ai)",
-        },
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-      if (!res.ok) return [];
-      const xml = await res.text();
-      const items = xml.match(/<item>[\s\S]*?<\/item>/g) || [];
-      const parsed: WebSearchResultItem[] = [];
-
-      for (const itemXml of items.slice(0, 3)) {
-        const titleMatch = itemXml.match(/<title>([\s\S]*?)<\/title>/);
-        const linkMatch = itemXml.match(/<link>([\s\S]*?)<\/link>/);
-        const sourceMatch = itemXml.match(/<source[^>]*>([\s\S]*?)<\/source>/);
-        const pubDateMatch = itemXml.match(/<pubDate>([\s\S]*?)<\/pubDate>/);
-        const descMatch = itemXml.match(
-          /<description>([\s\S]*?)<\/description>/
-        );
-
-        const rawTitle = titleMatch ? cleanHtmlEntities(titleMatch[1]) : "";
-        const rawLink = linkMatch ? cleanHtmlEntities(linkMatch[1]) : "";
-        const sourceTitle = sourceMatch
-          ? cleanHtmlEntities(sourceMatch[1])
-          : "Google Web";
-        const pubDate = pubDateMatch
-          ? cleanHtmlEntities(pubDateMatch[1]).slice(0, 16)
-          : "";
-        const cleanedDesc = descMatch ? cleanHtmlEntities(descMatch[1]) : "";
-        const rawDesc =
-          cleanedDesc && cleanedDesc.length > rawTitle.length + 15
-            ? cleanedDesc
-            : rawTitle;
-
-        if (rawTitle && rawLink && isRelevantResult(rawTitle, rawDesc)) {
-          parsed.push({
-            title: rawTitle,
-            snippet: `${rawDesc}${pubDate ? ` (${pubDate})` : ""}`,
-            url: rawLink,
-            sourceName: sourceTitle,
-          });
-        }
-      }
-      return parsed;
-    } catch {
-      clearTimeout(timer);
-      return [];
-    }
-  };
-
-  // 4. OpenStreetMap Nominatim Location Search & DuckDuckGo Instant Knowledge
-  const fetchLocationAndDdg = async (searchTerm: string) => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 2200);
-    const items: WebSearchResultItem[] = [];
-    try {
-      const isLocationQuery =
-        /\b(lokasi|alamat|letak|dimana|tempat|kota|kabupaten|provinsi|jalan|pesantren|sekolah|universitas|kampus|gunung|pantai|wisata|masjid|rumah\s+sakit|stasiun|bandara)\b/i.test(
-          lowerQ
-        );
-      if (isLocationQuery || rawTokens.length <= 3) {
-        const nomUrl = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(
-          searchTerm
-        )}&format=json&addressdetails=1&limit=2&accept-language=id`;
-        const nomRes = await fetch(nomUrl, {
-          headers: { "User-Agent": "FormyLabAI/2.0 (https://formylab.ai)" },
-          signal: controller.signal,
-        });
-        if (nomRes.ok) {
-          const nomData = await nomRes.json();
-          if (Array.isArray(nomData)) {
-            for (const loc of nomData.slice(0, 2)) {
-              if (
-                loc?.display_name &&
-                isRelevantResult(loc.name || searchTerm, loc.display_name)
-              ) {
-                items.push({
-                  title: loc.name || searchTerm,
-                  snippet: `Lokasi / Alamat Terdaftar: ${cleanHtmlEntities(
-                    String(loc.display_name)
-                  )} (Koordinat: ${loc.lat}, ${loc.lon})`,
-                  url: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
-                    loc.display_name
-                  )}`,
-                  sourceName: "Google Maps / Geodata",
-                });
-              }
-            }
-          }
-        }
-      }
-
-      const ddgUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(
-        searchTerm
-      )}&format=json&no_html=1&skip_disambig=1`;
-      const ddgRes = await fetch(ddgUrl, { signal: controller.signal });
-      clearTimeout(timer);
-      if (ddgRes.ok) {
-        const data = await ddgRes.json();
-        if (
-          data?.AbstractText &&
-          data?.AbstractURL &&
-          isRelevantResult(data.Heading || searchTerm, String(data.AbstractText))
-        ) {
-          items.push({
-            title: cleanHtmlEntities(String(data.Heading || searchTerm)),
-            snippet: cleanHtmlEntities(String(data.AbstractText)).slice(0, 500),
-            url: String(data.AbstractURL),
-            sourceName: data.AbstractSource || "DuckDuckGo Knowledge",
-          });
-        }
-      }
-      return items;
-    } catch {
-      clearTimeout(timer);
-      return items;
-    }
-  };
-
-  try {
-    const [organicWeb, idWiki, enWiki, googleId, locDdg] = await Promise.all([
-      fetchLiveOrganicWebSearch(effectiveQuery),
-      fetchWikiFullExtracts("id", wikiQuery),
-      fetchWikiFullExtracts("en", wikiQuery),
-      fetchGoogleRssSearch(effectiveQuery, "id"),
-      fetchLocationAndDdg(wikiQuery),
-    ]);
-
-    // Prioritize full Wikipedia extracts and organic web search snippets first, then location/DDG and Google news
-    const combined = [
-      ...idWiki,
-      ...organicWeb,
-      ...locDdg,
-      ...enWiki,
-      ...googleId,
-    ];
-    const seenSnippets = new Set<string>();
-    for (const item of combined) {
-      const normKey = item.snippet.slice(0, 75).toLowerCase();
-      if (item.snippet && !seenSnippets.has(normKey) && results.length < 6) {
-        seenSnippets.add(normKey);
-        results.push(item);
-      }
-    }
-  } catch {
-    // Ignore network errors gracefully
-  }
-
-  if (results.length === 0) {
-    return { results: [], contextBlockForAi: "", sourcesMarkdown: "" };
-  }
-
-  const contextBlockForAi = `\n[LIVE GOOGLE & INTERNET CONTEXT FOR "${query}"]:\n${results
-    .map(
-      (r, idx) =>
-        `${idx + 1}. [${r.sourceName}] ${r.title}: ${r.snippet} (URL: ${r.url})`
-    )
-    .join(
-      "\n"
-    )}\nINSTRUCTION: Synthesize these real-time facts into a comprehensive, well-structured, natural Bahasa Indonesia response that directly answers the user's question. CRITICAL: Do NOT add a "Referensi" or "Sumber" section at the end of your reply unless the user explicitly asked for sources/links.`;
-
-  const sourcesMarkdown = `**Sumber Referensi:**\n${results
-    .slice(0, 4)
-    .map(
-      (r) =>
-        `- [${r.title} (${r.sourceName})](${r.url}) — ${r.snippet.slice(0, 140)}${
-          r.snippet.length > 140 ? "..." : ""
-        }`
-    )
-    .join("\n")}`;
-
   return {
-    results,
-    contextBlockForAi,
-    sourcesMarkdown,
+    results: [],
+    contextBlockForAi: "",
+    sourcesMarkdown: "",
   };
 }
+
 

@@ -20,15 +20,19 @@ import InteractiveLabWidgets from "./InteractiveLabWidgets";
 interface InteractiveMessageActionsProps {
   messageId: string;
   content: string;
+  contextText?: string;
   attachments?: ChatAttachment[];
   voice: VoiceSynthesisState;
   onQuickFollowUp: (promptText: string) => void;
+  onApplyToFormulator?: () => void;
 }
 
 export default function InteractiveMessageActions({
   content,
+  contextText,
   attachments,
   onQuickFollowUp,
+  onApplyToFormulator,
 }: InteractiveMessageActionsProps) {
   const router = useRouter();
   const [copied, setCopied] = useState(false);
@@ -53,7 +57,11 @@ export default function InteractiveMessageActions({
   };
 
   const handleApplyToFormulator = () => {
-    const draft = extractFormulationFromText(content);
+    if (onApplyToFormulator) {
+      onApplyToFormulator();
+      return;
+    }
+    const draft = extractFormulationFromText(content, contextText);
     try {
       localStorage.setItem("importedChatFormulation", JSON.stringify(draft));
     } catch {
