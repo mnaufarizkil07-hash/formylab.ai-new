@@ -27,6 +27,8 @@ export const LIVE_STATUS_LABELS: Record<LiveConnectionStatus, string> = {
 export const LIVE_INPUT_TARGET_SAMPLE_RATE = 16000;
 export const LIVE_INPUT_CHUNK_SAMPLES = 640; // ~40ms @ 16kHz
 export const LIVE_TRANSCRIPT_THROTTLE_MS = 100;
+export const LIVE_ECHO_GUARD_TAIL_MS = 180;
+export const LIVE_SPEECH_QUIET_CONFIRM_MS = 300;
 
 /**
  * Strips system/noise tags such as `<noise>` or `<inaudible>` from Gemini Live
@@ -57,17 +59,16 @@ export function buildLiveVoiceSystemInstruction(
 ): string {
   const lines = [
     "Kamu adalah partner R&D kosmetik Formylab.ai yang sedang mengobrol langsung lewat telepon dengan pengguna.",
-    "Gaya bicara wajib seperti rekan kerja manusia di telepon, BUKAN membacakan artikel atau buku teks:",
-    "- Pakai Bahasa Indonesia lisan sehari-hari yang hangat, santai, luwes, tapi tetap tajam dan profesional.",
-    "- Gunakan penanda percakapan alami yang singkat di awal bila pas, seperti 'Oke, gampangnya gini...', 'Nah, kalau buat kulit sensitif...', atau 'Boleh banget, jadi...', dengan koma sebagai jeda napas yang natural.",
-    "- Jawab langsung ke inti dalam 1 sampai 3 kalimat padat dan enak didengar per giliran supaya obrolan terasa hidup, cepat, dan dua arah.",
-    "- DILARANG membacakan tanda kurung, simbol markdown, atau deretan angka dan persentase panjang sekaligus dalam satu giliran bicara. Ucapkan satuan secara lisan dan santai.",
-    "- Kalau pengguna minta resep atau formula lewat suara, rangkum inti komposisinya secara singkat dan ringan dalam 2 sampai 3 kalimat saja, lalu tawarkan apakah mau dibacakan detail persennya atau langsung dimasukkan ke Formulator.",
+    "Aturan gaya bicara lisan (wajib santai, hangat, responsif seperti rekan kerja manusia):",
+    "- Gunakan Bahasa Indonesia lisan sehari-hari yang natural, hangat, dan langsung ke inti — maksimal 1 sampai 2 kalimat padat per giliran bicara.",
+    "- Pakai pembuka percakapan singkat yang luwes bila pas (misal 'Oke, gampangnya gini...', 'Nah, kalau buat kulit sensitif...', 'Boleh banget...') dengan koma sebagai jeda napas alami.",
+    "- DILARANG membacakan simbol markdown, tanda kurung, atau daftar panjang persentase sekaligus dalam satu giliran. Ucapkan satuan secara lisan dan ringan.",
+    "- Jika pengguna minta resep atau formula lewat suara, rangkum inti bahannya dalam 1 sampai 2 kalimat santai, lalu tawarkan apakah mau dibacakan detail persennya atau langsung dimasukkan ke Formulator.",
   ];
 
   if (enableSearch) {
     lines.push(
-      "- HANYA gunakan tool googleSearch kalau pengguna menanyakan berita terkini, harga terbaru, tanggal atau kejadian aktual, atau fakta eksternal yang berubah-ubah. Untuk sapaan, diskusi umum, dan ide formulasi, jawab langsung tanpa memanggil search."
+      "- HANYA gunakan tool googleSearch untuk berita terkini, harga terbaru, atau fakta eksternal yang berubah-ubah. Untuk obrolan biasa dan formulasi, jawab langsung tanpa search."
     );
   }
 
@@ -295,4 +296,87 @@ export function getScopedChatStorageKey(
   const normalized = (userEmail || "").trim().toLowerCase();
   if (!normalized) return baseKey;
   return `${baseKey}::${normalized}`;
+}
+
+/**
+ * Computes normalized RMS amplitude [0..1] from a 16-bit signed PCM frame.
+ * Used strictly for read-only latency profiling (NEVER modifies or gates audio).
+ */
+export function computeInt16PcmRms(samples: Int16Array): number {
+  if (!samples || samples.length === 0) return 0;
+  let sumSq = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const norm = samples[i] / 32768;
+    sumSq += norm * norm;
+  }
+  return Math.sqrt(sumSq / samples.length);
+}
+
+export interface SpeechEndProfilerState {
+  noiseFloor: number;
+  userSpeaking: boolean;
+  quietSinceMs: number | null;
+  lastSpeechEndedAtMs: number;
+}
+
+export function createSpeechEndProfilerState(
+  initialNoiseFloor = 0.008
+): SpeechEndProfilerState {
+  return {
+    noiseFloor: Math.max(0.003, Math.min(0.03, initialNoiseFloor)),
+    userSpeaking: false,
+    quietSinceMs: null,
+    lastSpeechEndedAtMs: 0,
+  };
+}
+
+/**
+ * Pure read-only RMS speech-end profiler for millisecond latency diagnostics.
+ * Records `lastSpeechEndedAtMs` when user speech drops to quiet level for 300ms.
+ * NEVER modifies audio and NEVER sends manual VAD signals.
+ */
+export function observeMicRmsForProfiler(
+  state: SpeechEndProfilerState,
+  rms: number,
+  nowMs: number,
+  quietConfirmMs = LIVE_SPEECH_QUIET_CONFIRM_MS
+): SpeechEndProfilerState {
+  const speechThreshold = Math.max(0.018, state.noiseFloor * 2.4);
+
+  if (rms >= speechThreshold) {
+    return {
+      ...state,
+      userSpeaking: true,
+      quietSinceMs: null,
+    };
+  }
+
+  // Gently adapt background noise floor during quiet frames
+  const nextNoiseFloor = Math.max(
+    0.003,
+    Math.min(0.03, state.noiseFloor * 0.94 + rms * 0.06)
+  );
+
+  if (!state.userSpeaking) {
+    return {
+      ...state,
+      noiseFloor: nextNoiseFloor,
+    };
+  }
+
+  const quietSince = state.quietSinceMs ?? nowMs;
+  if (nowMs - quietSince >= quietConfirmMs) {
+    return {
+      noiseFloor: nextNoiseFloor,
+      userSpeaking: false,
+      quietSinceMs: null,
+      lastSpeechEndedAtMs: quietSince,
+    };
+  }
+
+  return {
+    ...state,
+    noiseFloor: nextNoiseFloor,
+    quietSinceMs: quietSince,
+  };
 }

@@ -31,6 +31,7 @@ import {
   normalizeGoogleDocArtifact,
 } from "./chatNoteUtils";
 import {
+  LIVE_ECHO_GUARD_TAIL_MS,
   LIVE_INPUT_CHUNK_SAMPLES,
   LIVE_INPUT_TARGET_SAMPLE_RATE,
   LIVE_STATUS_LABELS,
@@ -38,12 +39,16 @@ import {
   LIVE_VOICE_OPTIONS,
   LiveConnectionStatus,
   LiveVoiceName,
+  SpeechEndProfilerState,
   base64PcmToFloat32,
   classifyLiveVoicePillars,
+  computeInt16PcmRms,
+  createSpeechEndProfilerState,
   downsampleFloat32ToInt16Pcm,
   formatLiveConnectionError,
   hasGoogleSearchGrounding,
   int16PcmToBase64,
+  observeMicRmsForProfiler,
   parsePcmSampleRate,
   sanitizeLiveTranscriptText,
   sanitizeLiveUserTranscript,
@@ -756,13 +761,11 @@ interface LiveTokenApiResponse {
   tools?: Tool[];
   thinkingConfig?: LiveConnectConfig["thinkingConfig"];
   realtimeInputConfig?: LiveConnectConfig["realtimeInputConfig"];
-  contextWindowCompression?: LiveConnectConfig["contextWindowCompression"];
-  enableAffectiveDialog?: boolean;
   remainingCandidatesCount?: number;
   error?: string;
 }
 
-const LIVE_FIRST_CHUNK_LEAD_SEC = 0.03;
+const LIVE_FIRST_CHUNK_LEAD_SEC = 0.02;
 
 // Short-lived in-memory cooldown for models that failed WS setup (e.g., quota 1011)
 // so subsequent voice sessions connect on the first attempt without extra round-trip latency.
@@ -1668,6 +1671,8 @@ export function InteractiveVoiceCallOverlay({
   // Gemini Live SDK Session & Dual AudioContext Refs
   const sessionRef = useRef<Session | null>(null);
   const sessionGenerationRef = useRef(0);
+  const bootTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const tokenAbortControllerRef = useRef<AbortController | null>(null);
   const liveInputCtxRef = useRef<AudioContext | null>(null);
   const liveOutputCtxRef = useRef<AudioContext | null>(null);
   const liveMicStreamRef = useRef<MediaStream | null>(null);
@@ -1682,8 +1687,11 @@ export function InteractiveVoiceCallOverlay({
   const liveScriptNodeRef = useRef<ScriptProcessorNode | null>(null);
   const liveSilentGainRef = useRef<GainNode | null>(null);
 
-  // Zero-Wait 24kHz AudioBufferSourceNode Streaming Queue Refs
+  // Zero-Wait 24kHz AudioBufferSourceNode Queue + Smart Echo Guard Refs
   const liveScheduledSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  const activePlaybackNodesRef = useRef<number>(0);
+  const micUnlockAtRef = useRef<number>(0);
+  const echoUnlockTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const liveNextPlayTimeRef = useRef<number>(0);
   const liveTurnCompleteRef = useRef<boolean>(true);
 
@@ -1702,10 +1710,16 @@ export function InteractiveVoiceCallOverlay({
   const turnPendingSourcesRef = useRef<WebSourceCitation[]>([]);
   const turnUsedGoogleSearchRef = useRef<boolean>(false);
 
-  // Per-turn diagnostic log & multi-turn counter refs
+  // Per-turn millisecond latency profiler & counter refs (read-only logging, never alters audio)
   const turnCounterRef = useRef<number>(0);
   const activeTurnNumberRef = useRef<number>(0);
-  const loggedAiAudioStartedForTurnRef = useRef<boolean>(false);
+  const activePlaybackTurnNumberRef = useRef<number>(0);
+  const loggedServerAudioForTurnRef = useRef<boolean>(false);
+  const loggedSpeakerFinishedForTurnRef = useRef<boolean>(false);
+  const speechProfilerRef = useRef<SpeechEndProfilerState>(
+    createSpeechEndProfilerState()
+  );
+  const lastSpeechEndedAtRef = useRef<number>(0);
 
   const startLiveSessionRef = useRef<() => Promise<void>>(async () => {});
 
@@ -1730,6 +1744,13 @@ export function InteractiveVoiceCallOverlay({
     if (assistantFlushTimerRef.current !== null) {
       clearTimeout(assistantFlushTimerRef.current);
       assistantFlushTimerRef.current = null;
+    }
+  }, []);
+
+  const clearEchoUnlockTimer = useCallback(() => {
+    if (echoUnlockTimerRef.current !== null) {
+      clearTimeout(echoUnlockTimerRef.current);
+      echoUnlockTimerRef.current = null;
     }
   }, []);
 
@@ -1820,7 +1841,7 @@ export function InteractiveVoiceCallOverlay({
       turnPendingSourcesRef.current.length > 0;
     const sourcesSnapshot = [...turnPendingSourcesRef.current];
 
-    // Reset turn buffers & log flags immediately so next turn never collides
+    // Reset turn buffers & per-turn server audio flag immediately so next turn never collides
     userTurnIdRef.current = null;
     userTurnTextRef.current = "";
     userTurnCommittedRef.current = false;
@@ -1828,7 +1849,7 @@ export function InteractiveVoiceCallOverlay({
     assistantTurnTextRef.current = "";
     turnPendingSourcesRef.current = [];
     turnUsedGoogleSearchRef.current = false;
-    loggedAiAudioStartedForTurnRef.current = false;
+    loggedServerAudioForTurnRef.current = false;
     activeTurnNumberRef.current = 0;
 
     if (!finalUserText && existingUserId) {
@@ -1867,11 +1888,13 @@ export function InteractiveVoiceCallOverlay({
   }, [clearTranscriptThrottleTimers, ensureAssistantTurnId, ensureUserTurnId]);
 
   /**
-   * Instant Barge-In:
-   * Immediately stops every scheduled/playing AudioBufferSourceNode, clears the queue,
-   * and resets `nextPlayTime = 0` with 0ms delay so the next turn starts cleanly.
+   * Instant Barge-In & Playback Stop:
+   * Immediately stops every active AudioBufferSourceNode, resets activePlaybackNodesRef = 0,
+   * clears Echo Guard tail so mic unlocks instantly, and resets nextPlayTime = 0.
    */
-  const interruptLiveAudioPlayback = useCallback(() => {
+  const stopAllPlayback = useCallback(() => {
+    clearEchoUnlockTimer();
+
     liveScheduledSourcesRef.current.forEach((node) => {
       try {
         node.onended = null;
@@ -1883,24 +1906,80 @@ export function InteractiveVoiceCallOverlay({
     });
     liveScheduledSourcesRef.current.clear();
 
+    activePlaybackNodesRef.current = 0;
+    micUnlockAtRef.current = 0;
     liveNextPlayTimeRef.current = 0;
     liveTurnCompleteRef.current = true;
 
     if (liveMicAnalyserRef.current) {
       activeAnalyserRef.current = liveMicAnalyserRef.current;
     }
-  }, []);
+  }, [clearEchoUnlockTimer]);
+
+  /**
+   * Smart Echo Guard Tail (180ms):
+   * Keeps mic uplink paused for 180ms after the final speaker AudioBufferSourceNode finishes
+   * so residual room echo never leaks back into Gemini Server VAD.
+   */
+  const scheduleEchoGuardUnlock = useCallback(
+    (generation: number, finishedTurnNum: number) => {
+      clearEchoUnlockTimer();
+      micUnlockAtRef.current = performance.now() + LIVE_ECHO_GUARD_TAIL_MS;
+
+      echoUnlockTimerRef.current = setTimeout(() => {
+        echoUnlockTimerRef.current = null;
+        if (
+          !isMountedRef.current ||
+          !callActiveRef.current ||
+          sessionGenerationRef.current !== generation
+        ) {
+          return;
+        }
+        if (activePlaybackNodesRef.current > 0) {
+          return;
+        }
+
+        micUnlockAtRef.current = 0;
+        liveNextPlayTimeRef.current = 0;
+        activeAnalyserRef.current = liveMicAnalyserRef.current;
+
+        if (
+          finishedTurnNum > 0 &&
+          !loggedSpeakerFinishedForTurnRef.current
+        ) {
+          loggedSpeakerFinishedForTurnRef.current = true;
+          console.log(
+            `[VOICE T#${finishedTurnNum}] Speaker finished -> Mic unlocked`
+          );
+        }
+
+        if (liveStatusRef.current !== "error") {
+          updateLiveStatus("listening");
+        }
+      }, LIVE_ECHO_GUARD_TAIL_MS);
+    },
+    [clearEchoUnlockTimer, updateLiveStatus]
+  );
 
   /**
    * Zero-Wait 24kHz PCM Streaming Playback:
-   * Decodes each incoming Int16 LE PCM chunk accurately (`sample / 32768.0`) and schedules
-   * it on the 24kHz AudioContext timeline with a 0.03s initial jitter buffer.
+   * - Tracks real active nodes via `activePlaybackNodesRef` for Smart Echo Guard.
+   * - Resets `nextPlayTime = outCtx.currentTime + 0.02` on the 1st chunk of every turn
+   *   (and whenever `nextPlayTime < currentTime`) so Turn #2+ never drifts into the future.
+   * - Emits exact millisecond profiler logs on chunk #1 of each turn.
    */
   const enqueueLivePcmChunk = useCallback(
-    (base64Pcm: string, mimeType?: string) => {
+    (base64Pcm: string, mimeType: string | undefined, generation: number) => {
       const outCtx = liveOutputCtxRef.current;
       const outAnalyser = liveOutputAnalyserRef.current;
-      if (!outCtx || !outAnalyser || !callActiveRef.current) return;
+      if (
+        !outCtx ||
+        !outAnalyser ||
+        !callActiveRef.current ||
+        sessionGenerationRef.current !== generation
+      ) {
+        return;
+      }
 
       try {
         if (outCtx.state === "suspended") {
@@ -1918,12 +1997,53 @@ export function InteractiveVoiceCallOverlay({
         sourceNode.buffer = audioBuffer;
         sourceNode.connect(outAnalyser);
 
-        const startAt = Math.max(
-          outCtx.currentTime + LIVE_FIRST_CHUNK_LEAD_SEC,
-          liveNextPlayTimeRef.current
-        );
+        // Cancel any pending echo-guard unlock timer while new chunks keep arriving
+        clearEchoUnlockTimer();
+
+        const isFirstChunkOfTurn = !loggedServerAudioForTurnRef.current;
+        const nowCtx = outCtx.currentTime;
+        if (isFirstChunkOfTurn || liveNextPlayTimeRef.current < nowCtx) {
+          liveNextPlayTimeRef.current = nowCtx + LIVE_FIRST_CHUNK_LEAD_SEC;
+        }
+
+        const startAt = liveNextPlayTimeRef.current;
         liveNextPlayTimeRef.current = startAt + audioBuffer.duration;
         liveTurnCompleteRef.current = false;
+
+        activePlaybackNodesRef.current += 1;
+        micUnlockAtRef.current = Number.POSITIVE_INFINITY;
+
+        if (isFirstChunkOfTurn) {
+          loggedServerAudioForTurnRef.current = true;
+          loggedSpeakerFinishedForTurnRef.current = false;
+          const turnNum = ensureActiveTurnNumber();
+          activePlaybackTurnNumberRef.current = turnNum;
+
+          const nowPerf = performance.now();
+          const quietRefTs =
+            lastSpeechEndedAtRef.current > 0
+              ? lastSpeechEndedAtRef.current
+              : speechProfilerRef.current.quietSinceMs ?? 0;
+          const sinceSilenceMs =
+            quietRefTs > 0 ? Math.max(0, Math.round(nowPerf - quietRefTs)) : 0;
+          const queueDelayMs = Math.max(
+            0,
+            Math.round((startAt - outCtx.currentTime) * 1000)
+          );
+
+          console.log(
+            `[VOICE T#${turnNum}] Server 1st audio arrived (+${sinceSilenceMs} ms sejak diam)`
+          );
+          console.log(
+            `[VOICE T#${turnNum}] Speaker play started (queueDelay: +${queueDelayMs} ms)`
+          );
+
+          // Reset read-only profiler for next turn while preserving calibrated noise floor
+          speechProfilerRef.current = createSpeechEndProfilerState(
+            speechProfilerRef.current.noiseFloor
+          );
+          lastSpeechEndedAtRef.current = 0;
+        }
 
         activeAnalyserRef.current = outAnalyser;
         if (liveStatusRef.current !== "speaking") {
@@ -1933,16 +2053,26 @@ export function InteractiveVoiceCallOverlay({
         liveScheduledSourcesRef.current.add(sourceNode);
         sourceNode.onended = () => {
           liveScheduledSourcesRef.current.delete(sourceNode);
+          activePlaybackNodesRef.current = Math.max(
+            0,
+            activePlaybackNodesRef.current - 1
+          );
+
           if (
-            liveScheduledSourcesRef.current.size === 0 &&
-            liveTurnCompleteRef.current &&
+            activePlaybackNodesRef.current === 0 &&
+            sessionGenerationRef.current === generation &&
             isMountedRef.current &&
             callActiveRef.current
           ) {
-            liveNextPlayTimeRef.current = 0;
-            activeAnalyserRef.current = liveMicAnalyserRef.current;
-            if (liveStatusRef.current !== "error") {
-              updateLiveStatus("listening");
+            if (liveTurnCompleteRef.current) {
+              scheduleEchoGuardUnlock(
+                generation,
+                activePlaybackTurnNumberRef.current
+              );
+            } else {
+              // Brief guard until turnComplete or next chunk arrives
+              micUnlockAtRef.current =
+                performance.now() + LIVE_ECHO_GUARD_TAIL_MS;
             }
           }
         };
@@ -1952,18 +2082,53 @@ export function InteractiveVoiceCallOverlay({
         // Ignore single malformed audio frame without tearing down live stream
       }
     },
-    [updateLiveStatus]
+    [
+      clearEchoUnlockTimer,
+      ensureActiveTurnNumber,
+      scheduleEchoGuardUnlock,
+      updateLiveStatus,
+    ]
   );
 
-  const cleanupLiveResources = useCallback(
+  /**
+   * Synchronous Single-Session Clean Teardown:
+   * 1) Increments `sessionGenerationRef` so all stale callbacks/promises are ignored immediately.
+   * 2) Cancels boot/echo/transcript timers and aborts any in-flight `/api/live-token` fetch.
+   * 3) Stops all active `AudioBufferSourceNode`s (`stopAllPlayback`).
+   * 4) Disconnects `AudioWorkletNode`, stops all `MediaStream` tracks, closes input & output `AudioContext`.
+   * 5) Closes the old WebSocket `Session`.
+   */
+  const disconnectLiveSession = useCallback(
     (options?: { keepMicAndAudioCtx?: boolean }) => {
       const keepAudio = options?.keepMicAndAudioCtx === true;
 
+      sessionGenerationRef.current += 1;
+
+      if (bootTimerRef.current !== null) {
+        clearTimeout(bootTimerRef.current);
+        bootTimerRef.current = null;
+      }
+
+      if (tokenAbortControllerRef.current) {
+        try {
+          tokenAbortControllerRef.current.abort();
+        } catch {
+          // ignore
+        }
+        tokenAbortControllerRef.current = null;
+      }
+
       clearTranscriptThrottleTimers();
-      interruptLiveAudioPlayback();
+      stopAllPlayback();
       finalizeCurrentTurnAsync();
+
       turnCounterRef.current = 0;
       activeTurnNumberRef.current = 0;
+      activePlaybackTurnNumberRef.current = 0;
+      loggedServerAudioForTurnRef.current = false;
+      loggedSpeakerFinishedForTurnRef.current = false;
+      speechProfilerRef.current = createSpeechEndProfilerState();
+      lastSpeechEndedAtRef.current = 0;
 
       if (sessionRef.current) {
         const s = sessionRef.current;
@@ -2061,13 +2226,14 @@ export function InteractiveVoiceCallOverlay({
       liveOutputAnalyserRef.current = null;
       activeAnalyserRef.current = null;
     },
-    [clearTranscriptThrottleTimers, finalizeCurrentTurnAsync, interruptLiveAudioPlayback]
+    [clearTranscriptThrottleTimers, finalizeCurrentTurnAsync, stopAllPlayback]
   );
 
   /**
-   * Captures hardware-native mic audio continuously (100% Pure Native Server VAD):
-   * smoothly linear-downsamples from browser `sampleRate` to exact 16000 Hz Int16 mono PCM
-   * and streams steady ~40ms chunks (640 samples) with zero client-side gating or turn signals.
+   * Captures hardware-native mic audio in exact 640-sample (40ms @ 16kHz) Int16 mono PCM frames:
+   * - Smart Echo Guard: pauses mic uplink while AI speaker nodes are playing + 180ms tail.
+   * - Read-only RMS latency profiler: records `lastSpeechEndedAtRef` after 300ms quiet (NEVER alters audio
+   *   and NEVER sends manual `audioStreamEnd`).
    */
   const attachMicCapturePipeline = useCallback(
     async (stream: MediaStream, generation: number) => {
@@ -2112,6 +2278,28 @@ export function InteractiveVoiceCallOverlay({
         ) {
           return;
         }
+
+        // Smart Echo Guard: hold mic frames while AI speaker is active + 180ms room-echo tail
+        const nowPerf = performance.now();
+        if (
+          activePlaybackNodesRef.current > 0 ||
+          nowPerf < micUnlockAtRef.current
+        ) {
+          return;
+        }
+
+        // Read-only RMS profiler (logging only — NEVER modifies PCM samples or sends audioStreamEnd)
+        const rms = computeInt16PcmRms(int16);
+        const nextProfiler = observeMicRmsForProfiler(
+          speechProfilerRef.current,
+          rms,
+          nowPerf
+        );
+        speechProfilerRef.current = nextProfiler;
+        if (nextProfiler.lastSpeechEndedAtMs > 0) {
+          lastSpeechEndedAtRef.current = nextProfiler.lastSpeechEndedAtMs;
+        }
+
         const base64Audio = int16PcmToBase64(int16);
         try {
           activeSession.sendRealtimeInput({
@@ -2187,7 +2375,7 @@ export function InteractiveVoiceCallOverlay({
         }
       }
 
-      // Legacy fallback only when browser lacks AudioWorkletNode (continuous un-gated 16kHz PCM)
+      // Legacy fallback only when browser lacks AudioWorkletNode (accumulated to 640-sample 40ms packets)
       if (!workletAttached && typeof inputCtx.createScriptProcessor === "function") {
         const scriptNode = inputCtx.createScriptProcessor(2048, 1, 1);
         liveScriptNodeRef.current = scriptNode;
@@ -2195,6 +2383,9 @@ export function InteractiveVoiceCallOverlay({
         const silentGain = inputCtx.createGain();
         silentGain.gain.value = 0;
         liveSilentGainRef.current = silentGain;
+
+        let pendingBuffer = new Int16Array(LIVE_INPUT_CHUNK_SAMPLES);
+        let pendingOffset = 0;
 
         scriptNode.onaudioprocess = (ev: AudioProcessingEvent) => {
           const ch0 = ev.inputBuffer.getChannelData(0);
@@ -2204,7 +2395,14 @@ export function InteractiveVoiceCallOverlay({
               inputCtx.sampleRate,
               LIVE_INPUT_TARGET_SAMPLE_RATE
             );
-            sendPcmChunkToSession(int16);
+            for (let i = 0; i < int16.length; i++) {
+              pendingBuffer[pendingOffset++] = int16[i];
+              if (pendingOffset >= LIVE_INPUT_CHUNK_SAMPLES) {
+                sendPcmChunkToSession(pendingBuffer);
+                pendingBuffer = new Int16Array(LIVE_INPUT_CHUNK_SAMPLES);
+                pendingOffset = 0;
+              }
+            }
           }
         };
 
@@ -2217,8 +2415,9 @@ export function InteractiveVoiceCallOverlay({
   );
 
   const startLiveVoiceSession = useCallback(async () => {
-    const generation = ++sessionGenerationRef.current;
-    cleanupLiveResources();
+    // Cleanly tear down any existing session & bump generation synchronously FIRST
+    disconnectLiveSession();
+    const generation = sessionGenerationRef.current;
     voiceStopSpeechRef.current?.();
 
     if (!isMountedRef.current || !callActiveRef.current || !isOpen) return;
@@ -2226,7 +2425,7 @@ export function InteractiveVoiceCallOverlay({
     setLiveError("");
     updateLiveStatus("connecting");
 
-    // 1. Acquire microphone with AEC + NS + AGC enabled so soft/short utterances ("okey", "iya") are crystal clear
+    // 1. Acquire microphone with AEC + NS + AGC enabled so soft/short utterances are crystal clear
     if (
       typeof navigator === "undefined" ||
       !navigator.mediaDevices ||
@@ -2250,6 +2449,7 @@ export function InteractiveVoiceCallOverlay({
         },
       });
     } catch (err: unknown) {
+      if (sessionGenerationRef.current !== generation) return;
       if (isMicPermissionDenied(err)) {
         setLiveError(formatLiveConnectionError("NotAllowedError"));
       } else {
@@ -2280,7 +2480,7 @@ export function InteractiveVoiceCallOverlay({
       (window as unknown as { webkitAudioContext?: typeof AudioContext })
         .webkitAudioContext;
     if (!AudioCtx) {
-      cleanupLiveResources();
+      disconnectLiveSession();
       setLiveError("Browser tidak mendukung Web Audio API untuk audio Live 24kHz.");
       updateLiveStatus("error");
       return;
@@ -2297,6 +2497,15 @@ export function InteractiveVoiceCallOverlay({
       await outCtx.resume().catch(() => {});
     }
 
+    if (
+      !isMountedRef.current ||
+      !callActiveRef.current ||
+      !isOpen ||
+      sessionGenerationRef.current !== generation
+    ) {
+      return;
+    }
+
     const outAnalyser = outCtx.createAnalyser();
     outAnalyser.fftSize = 256;
     outAnalyser.smoothingTimeConstant = 0.78;
@@ -2304,14 +2513,15 @@ export function InteractiveVoiceCallOverlay({
     liveOutputAnalyserRef.current = outAnalyser;
     liveNextPlayTimeRef.current = 0;
     liveTurnCompleteRef.current = true;
-    turnCounterRef.current = 0;
-    activeTurnNumberRef.current = 0;
+    activePlaybackNodesRef.current = 0;
+    micUnlockAtRef.current = 0;
 
-    // 3. Attach 16kHz AudioWorklet mic pipeline so AnalyserNode & PCM packets are ready immediately
+    // 3. Attach 16kHz AudioWorklet mic pipeline (exact 640-sample / 40ms packets)
     try {
       await attachMicCapturePipeline(micStream, generation);
     } catch (err: unknown) {
-      cleanupLiveResources();
+      if (sessionGenerationRef.current !== generation) return;
+      disconnectLiveSession();
       setLiveError(
         formatLiveConnectionError(
           err instanceof Error ? err.message : String(err)
@@ -2335,39 +2545,42 @@ export function InteractiveVoiceCallOverlay({
       excludeModels?: string[];
       disableThinkingConfig?: boolean;
       disableCustomVad?: boolean;
-      disableContextCompression?: boolean;
-      disableAffectiveDialog?: boolean;
     }): Promise<LiveTokenApiResponse> => {
-      const res = await fetch("/api/live-token", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          voiceName: selectedVoiceRef.current,
-          enableSearch: searchEnabledRef.current,
-          recentContext: recentContextRef.current,
-          ...(opts?.excludeModels && opts.excludeModels.length > 0
-            ? { excludeModels: opts.excludeModels }
-            : {}),
-          ...(opts?.disableThinkingConfig ? { disableThinkingConfig: true } : {}),
-          ...(opts?.disableCustomVad ? { disableCustomVad: true } : {}),
-          ...(opts?.disableContextCompression
-            ? { disableContextCompression: true }
-            : {}),
-          ...(opts?.disableAffectiveDialog
-            ? { disableAffectiveDialog: true }
-            : {}),
-        }),
-      });
-      const data = (await res.json().catch(() => ({}))) as LiveTokenApiResponse;
-      if (!res.ok || !data.success || !data.token || !data.model) {
-        return {
-          success: false,
-          error:
-            data.error ||
-            `Gagal mengambil token sesi Live (HTTP ${res.status}).`,
-        };
+      const abortController = new AbortController();
+      tokenAbortControllerRef.current = abortController;
+      try {
+        const res = await fetch("/api/live-token", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: abortController.signal,
+          body: JSON.stringify({
+            voiceName: selectedVoiceRef.current,
+            enableSearch: searchEnabledRef.current,
+            recentContext: recentContextRef.current,
+            ...(opts?.excludeModels && opts.excludeModels.length > 0
+              ? { excludeModels: opts.excludeModels }
+              : {}),
+            ...(opts?.disableThinkingConfig
+              ? { disableThinkingConfig: true }
+              : {}),
+            ...(opts?.disableCustomVad ? { disableCustomVad: true } : {}),
+          }),
+        });
+        const data = (await res.json().catch(() => ({}))) as LiveTokenApiResponse;
+        if (!res.ok || !data.success || !data.token || !data.model) {
+          return {
+            success: false,
+            error:
+              data.error ||
+              `Gagal mengambil token sesi Live (HTTP ${res.status}).`,
+          };
+        }
+        return data;
+      } finally {
+        if (tokenAbortControllerRef.current === abortController) {
+          tokenAbortControllerRef.current = null;
+        }
       }
-      return data;
     };
 
     const excludedModels: string[] = getRecentlyFailedLiveModels();
@@ -2375,10 +2588,8 @@ export function InteractiveVoiceCallOverlay({
     let lastCloseCode: number | undefined = undefined;
     let disableThinkingConfig = false;
     let disableCustomVad = false;
-    let disableContextCompression = false;
-    let disableAffectiveDialog = false;
 
-    const MAX_LIVE_ATTEMPTS = 8;
+    const MAX_LIVE_ATTEMPTS = 6;
 
     for (let attempt = 0; attempt < MAX_LIVE_ATTEMPTS; attempt++) {
       if (
@@ -2396,12 +2607,17 @@ export function InteractiveVoiceCallOverlay({
           excludeModels: excludedModels,
           disableThinkingConfig,
           disableCustomVad,
-          disableContextCompression,
-          disableAffectiveDialog,
         });
       } catch (err: unknown) {
+        if (sessionGenerationRef.current !== generation) {
+          return;
+        }
         lastErrorReason = err instanceof Error ? err.message : String(err);
         break;
+      }
+
+      if (sessionGenerationRef.current !== generation) {
+        return;
       }
 
       if (!tokenCfg.success || !tokenCfg.token || !tokenCfg.model) {
@@ -2415,6 +2631,7 @@ export function InteractiveVoiceCallOverlay({
         break;
       }
 
+      // Standard `@google/genai` LiveConnectConfig ONLY (no experimental affective/compression overhead)
       const liveConfig: LiveConnectConfig = {
         responseModalities: [Modality.AUDIO],
         speechConfig: {
@@ -2437,12 +2654,6 @@ export function InteractiveVoiceCallOverlay({
           : {}),
         ...(tokenCfg.realtimeInputConfig
           ? { realtimeInputConfig: tokenCfg.realtimeInputConfig }
-          : {}),
-        ...(tokenCfg.contextWindowCompression
-          ? { contextWindowCompression: tokenCfg.contextWindowCompression }
-          : {}),
-        ...(tokenCfg.enableAffectiveDialog
-          ? { enableAffectiveDialog: true }
           : {}),
         inputAudioTranscription: {},
         outputAudioTranscription: {},
@@ -2557,9 +2768,19 @@ export function InteractiveVoiceCallOverlay({
               const content = message.serverContent;
               if (!content) return;
 
-              // 2. Instant server-side Barge-In: user spoke over AI -> stop all active nodes immediately
+              // 2. Server-side Barge-In: stop all active nodes immediately and unlock mic
               if (content.interrupted) {
-                interruptLiveAudioPlayback();
+                const interruptedTurn = activePlaybackTurnNumberRef.current;
+                stopAllPlayback();
+                if (
+                  interruptedTurn > 0 &&
+                  !loggedSpeakerFinishedForTurnRef.current
+                ) {
+                  loggedSpeakerFinishedForTurnRef.current = true;
+                  console.log(
+                    `[VOICE T#${interruptedTurn}] Speaker finished -> Mic unlocked`
+                  );
+                }
                 finalizeCurrentTurnAsync();
                 updateLiveStatus("listening");
                 return;
@@ -2574,13 +2795,9 @@ export function InteractiveVoiceCallOverlay({
                     receivedAudio = true;
                     enqueueLivePcmChunk(
                       part.inlineData.data,
-                      part.inlineData.mimeType
+                      part.inlineData.mimeType,
+                      generation
                     );
-                    if (!loggedAiAudioStartedForTurnRef.current) {
-                      loggedAiAudioStartedForTurnRef.current = true;
-                      const turnNum = ensureActiveTurnNumber();
-                      console.log(`[VOICE] Turn #${turnNum} -> AI audio started`);
-                    }
                   }
                 }
                 if (receivedAudio) {
@@ -2640,27 +2857,33 @@ export function InteractiveVoiceCallOverlay({
                 }
               }
 
-              // 7. Turn Complete -> finalize room chat + persist localStorage + reset audio queue cleanly
+              // 7. Turn Complete -> finalize room chat + unlock mic after 180ms Echo Guard tail if speaker already drained
               if (content.turnComplete) {
-                const turnNum = ensureActiveTurnNumber();
-                console.log(`[VOICE] Turn #${turnNum} complete`);
+                const finishedTurn = activePlaybackTurnNumberRef.current;
                 liveTurnCompleteRef.current = true;
                 finalizeCurrentTurnAsync();
-                if (liveScheduledSourcesRef.current.size === 0) {
-                  liveNextPlayTimeRef.current = 0;
-                  activeAnalyserRef.current = liveMicAnalyserRef.current;
-                  updateLiveStatus("listening");
+                if (activePlaybackNodesRef.current === 0) {
+                  if (
+                    finishedTurn > 0 &&
+                    !loggedSpeakerFinishedForTurnRef.current
+                  ) {
+                    scheduleEchoGuardUnlock(generation, finishedTurn);
+                  } else {
+                    liveNextPlayTimeRef.current = 0;
+                    activeAnalyserRef.current = liveMicAnalyserRef.current;
+                    updateLiveStatus("listening");
+                  }
                 }
               }
             },
             onerror: (errEvent: ErrorEvent) => {
+              if (sessionGenerationRef.current !== generation) return;
               const reason =
                 errEvent?.message || "WebSocket error pada sesi Live.";
               unexpectedCloseReason = reason;
               console.error("[VOICE] Error:", reason);
               if (
                 callActiveRef.current &&
-                sessionGenerationRef.current === generation &&
                 sessionRef.current !== null
               ) {
                 setLiveError(formatLiveConnectionError(reason));
@@ -2668,6 +2891,7 @@ export function InteractiveVoiceCallOverlay({
               }
             },
             onclose: (closeEvent: CloseEvent) => {
+              if (sessionGenerationRef.current !== generation) return;
               unexpectedCloseCode = closeEvent?.code;
               unexpectedCloseReason = closeEvent?.reason || "";
 
@@ -2681,12 +2905,11 @@ export function InteractiveVoiceCallOverlay({
               // If session was already live and closed unexpectedly, show clear visible error (NO silent fallback)
               if (
                 callActiveRef.current &&
-                sessionGenerationRef.current === generation &&
                 sessionRef.current !== null &&
                 closeEvent?.code !== 1000
               ) {
                 sessionRef.current = null;
-                interruptLiveAudioPlayback();
+                stopAllPlayback();
                 finalizeCurrentTurnAsync();
                 setLiveError(
                   formatLiveConnectionError(
@@ -2707,7 +2930,11 @@ export function InteractiveVoiceCallOverlay({
           !isOpen ||
           sessionGenerationRef.current !== generation
         ) {
-          connectedSession.close();
+          try {
+            connectedSession.close();
+          } catch {
+            // ignore
+          }
           return;
         }
 
@@ -2715,15 +2942,14 @@ export function InteractiveVoiceCallOverlay({
         setLiveError("");
         updateLiveStatus("listening");
         const activeVoice = tokenCfg.voiceName || selectedVoiceRef.current;
-        const compressionStatus = tokenCfg.contextWindowCompression
-          ? "ON"
-          : "OFF";
-        const affectiveStatus = tokenCfg.enableAffectiveDialog ? "ON" : "OFF";
         console.log(
-          `[VOICE] Live connected (compression ${compressionStatus}, affective ${affectiveStatus}, voice: ${activeVoice})`
+          `[VOICE] Live connected (voice: ${activeVoice}, Search: ${searchEnabledRef.current ? "ON" : "OFF"})`
         );
         return;
       } catch (connectErr: unknown) {
+        if (sessionGenerationRef.current !== generation) {
+          return;
+        }
         const msg =
           connectErr instanceof Error ? connectErr.message : String(connectErr);
         const codeMatch = msg.match(/code\s+(\d{4})/i);
@@ -2738,45 +2964,11 @@ export function InteractiveVoiceCallOverlay({
         const isConfigRejection =
           parsedCode === 1007 ||
           parsedCode === 1008 ||
-          /invalid argument|unsupported|not supported|thinking|activity|affective|compression|sliding/i.test(
+          /invalid argument|unsupported|not supported|thinking|activity/i.test(
             lastErrorReason
           );
 
         // Clean progressive parameter adjustment on SAME Live model before switching models
-        if (
-          isConfigRejection &&
-          !disableAffectiveDialog &&
-          tokenCfg.enableAffectiveDialog &&
-          /affective/i.test(lastErrorReason)
-        ) {
-          disableAffectiveDialog = true;
-          continue;
-        }
-        if (
-          isConfigRejection &&
-          !disableContextCompression &&
-          tokenCfg.contextWindowCompression &&
-          /compression|sliding|trigger/i.test(lastErrorReason)
-        ) {
-          disableContextCompression = true;
-          continue;
-        }
-        if (
-          isConfigRejection &&
-          !disableAffectiveDialog &&
-          tokenCfg.enableAffectiveDialog
-        ) {
-          disableAffectiveDialog = true;
-          continue;
-        }
-        if (
-          isConfigRejection &&
-          !disableContextCompression &&
-          tokenCfg.contextWindowCompression
-        ) {
-          disableContextCompression = true;
-          continue;
-        }
         if (
           isConfigRejection &&
           !disableThinkingConfig &&
@@ -2803,8 +2995,6 @@ export function InteractiveVoiceCallOverlay({
         }
         disableThinkingConfig = false;
         disableCustomVad = false;
-        disableContextCompression = false;
-        disableAffectiveDialog = false;
       }
     }
 
@@ -2814,23 +3004,24 @@ export function InteractiveVoiceCallOverlay({
       callActiveRef.current &&
       sessionGenerationRef.current === generation
     ) {
-      cleanupLiveResources({ keepMicAndAudioCtx: true });
+      disconnectLiveSession({ keepMicAndAudioCtx: true });
       setLiveError(formatLiveConnectionError(lastErrorReason, lastCloseCode));
       updateLiveStatus("error");
     }
   }, [
     attachMicCapturePipeline,
-    cleanupLiveResources,
     commitUserTurnIfPending,
+    disconnectLiveSession,
     emitPendingSourcesAsync,
     enqueueLivePcmChunk,
     ensureActiveTurnNumber,
     ensureAssistantTurnId,
     finalizeCurrentTurnAsync,
-    interruptLiveAudioPlayback,
     isOpen,
     scheduleAssistantTranscriptFlush,
+    scheduleEchoGuardUnlock,
     scheduleUserTranscriptFlush,
+    stopAllPlayback,
     updateLiveStatus,
   ]);
 
@@ -2848,31 +3039,34 @@ export function InteractiveVoiceCallOverlay({
     }
   }, [isMicMuted]);
 
-  // Open / close lifecycle — depends ONLY on isOpen so chat/transcript updates NEVER trigger reconnects
+  // Open / close lifecycle — single active session guaranteed (StrictMode-safe via bootTimerRef + disconnectLiveSession)
   useEffect(() => {
     isMountedRef.current = true;
     callActiveRef.current = isOpen;
 
     if (!isOpen) {
-      sessionGenerationRef.current += 1;
+      disconnectLiveSession();
       queueMicrotask(() => {
         setLiveError("");
-        cleanupLiveResources();
       });
       return;
     }
 
-    const bootTimer = setTimeout(() => {
+    if (bootTimerRef.current !== null) {
+      clearTimeout(bootTimerRef.current);
+      bootTimerRef.current = null;
+    }
+
+    bootTimerRef.current = setTimeout(() => {
+      bootTimerRef.current = null;
       if (!isMountedRef.current || !callActiveRef.current) return;
       void startLiveSessionRef.current();
-    }, 20);
+    }, 40);
 
     return () => {
       isMountedRef.current = false;
       callActiveRef.current = false;
-      sessionGenerationRef.current += 1;
-      clearTimeout(bootTimer);
-      cleanupLiveResources();
+      disconnectLiveSession();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
@@ -2884,6 +3078,7 @@ export function InteractiveVoiceCallOverlay({
     selectedVoiceRef.current = nextVoice;
     setSelectedVoice(nextVoice);
     if (callActiveRef.current) {
+      disconnectLiveSession();
       void startLiveSessionRef.current();
     }
   };
@@ -2893,12 +3088,14 @@ export function InteractiveVoiceCallOverlay({
     searchEnabledRef.current = next;
     setSearchEnabled(next);
     if (callActiveRef.current) {
+      disconnectLiveSession();
       void startLiveSessionRef.current();
     }
   };
 
   const handleOrbInteract = () => {
     if (liveStatus === "error") {
+      disconnectLiveSession();
       void startLiveSessionRef.current();
       return;
     }
@@ -2908,9 +3105,16 @@ export function InteractiveVoiceCallOverlay({
     if (liveInputCtxRef.current?.state === "suspended") {
       liveInputCtxRef.current.resume().catch(() => {});
     }
-    // Manual barge-in when tapping orb while AI is speaking
-    if (liveStatus === "speaking") {
-      interruptLiveAudioPlayback();
+    // Instant Manual Barge-In: clicking the orb while AI is speaking stops all audio & unlocks mic immediately
+    if (liveStatus === "speaking" || activePlaybackNodesRef.current > 0) {
+      const interruptedTurn = activePlaybackTurnNumberRef.current;
+      stopAllPlayback();
+      if (interruptedTurn > 0 && !loggedSpeakerFinishedForTurnRef.current) {
+        loggedSpeakerFinishedForTurnRef.current = true;
+        console.log(
+          `[VOICE T#${interruptedTurn}] Speaker finished -> Mic unlocked`
+        );
+      }
       finalizeCurrentTurnAsync();
       updateLiveStatus("listening");
     }
@@ -3053,7 +3257,10 @@ export function InteractiveVoiceCallOverlay({
           <span className="flex-1">{liveError}</span>
           <button
             type="button"
-            onClick={() => void startLiveSessionRef.current()}
+            onClick={() => {
+              disconnectLiveSession();
+              void startLiveSessionRef.current();
+            }}
             className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-[#b91c1c] hover:bg-[#991b1b] text-white text-[10.5px] font-medium whitespace-nowrap cursor-pointer transition-colors shrink-0"
           >
             <RefreshCw className="w-3 h-3" aria-hidden="true" />

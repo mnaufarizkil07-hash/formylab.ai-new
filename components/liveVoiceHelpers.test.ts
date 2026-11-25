@@ -1,26 +1,33 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  LIVE_ECHO_GUARD_TAIL_MS,
   LIVE_INPUT_CHUNK_SAMPLES,
+  LIVE_SPEECH_QUIET_CONFIRM_MS,
   LIVE_STATUS_LABELS,
   LIVE_TRANSCRIPT_THROTTLE_MS,
   LIVE_VOICE_OPTIONS,
   base64PcmToFloat32,
   buildLiveVoiceSystemInstruction,
   classifyLiveVoicePillars,
+  computeInt16PcmRms,
+  createSpeechEndProfilerState,
   downsampleFloat32ToInt16Pcm,
   formatLiveConnectionError,
   getScopedChatStorageKey,
   hasGoogleSearchGrounding,
   int16PcmToBase64,
+  observeMicRmsForProfiler,
   parsePcmSampleRate,
   sanitizeLiveTranscriptText,
   sanitizeLiveUserTranscript,
 } from "./liveVoiceHelpers";
 
-test("Live Voice constants use 40ms (640-sample) 16kHz chunks, 100ms transcript throttle, 4 natural voices, and no thinking label", () => {
+test("Live Voice constants use 40ms (640-sample) chunks, 180ms Echo Guard tail, 300ms quiet profiler, 4 natural voices, and no thinking label", () => {
   assert.equal(LIVE_INPUT_CHUNK_SAMPLES, 640); // ~40ms @ 16kHz
   assert.equal(LIVE_TRANSCRIPT_THROTTLE_MS, 100);
+  assert.equal(LIVE_ECHO_GUARD_TAIL_MS, 180);
+  assert.equal(LIVE_SPEECH_QUIET_CONFIRM_MS, 300);
   assert.deepEqual(
     LIVE_VOICE_OPTIONS.map((v) => v.id),
     ["Aoede", "Zephyr", "Kore", "Puck"]
@@ -112,17 +119,16 @@ test("parsePcmSampleRate extracts rate from mimeType or falls back cleanly", () 
   assert.equal(parsePcmSampleRate(undefined, 24000), 24000);
 });
 
-test("buildLiveVoiceSystemInstruction enforces natural phone-call Indonesian style and opt-in Search", () => {
+test("buildLiveVoiceSystemInstruction enforces concise 1-2 sentence spoken Indonesian style and opt-in Search", () => {
   const purePrompt = buildLiveVoiceSystemInstruction(
     "Diskusi moisturizer ceramide",
     false
   );
-  assert.ok(purePrompt.length < 1300);
+  assert.ok(purePrompt.length < 1150);
   assert.equal(purePrompt.includes("googleSearch"), false);
   assert.equal(purePrompt.includes("create_chat_note"), false);
   assert.equal(purePrompt.includes("create_google_doc"), false);
-  assert.ok(purePrompt.includes("telepon"));
-  assert.ok(purePrompt.includes("Oke, gampangnya gini"));
+  assert.ok(purePrompt.includes("1 sampai 2 kalimat"));
   assert.ok(purePrompt.includes("Formulator"));
   assert.ok(purePrompt.includes("Diskusi moisturizer ceramide"));
 
@@ -131,7 +137,7 @@ test("buildLiveVoiceSystemInstruction enforces natural phone-call Indonesian sty
     true
   );
   assert.ok(searchPrompt.includes("HANYA gunakan tool googleSearch"));
-  assert.ok(searchPrompt.includes("DILARANG membacakan tanda kurung"));
+  assert.ok(searchPrompt.includes("DILARANG membacakan simbol markdown"));
 });
 
 test("hasGoogleSearchGrounding detects search queries or grounding chunks", () => {
@@ -166,4 +172,31 @@ test("getScopedChatStorageKey scopes keys per normalized user email", () => {
     getScopedChatStorageKey("formylab_chat_sessions", ""),
     "formylab_chat_sessions"
   );
+});
+
+test("computeInt16PcmRms and observeMicRmsForProfiler detect speech end after 300ms quiet without mutating audio", () => {
+  const silent = new Int16Array(640);
+  assert.equal(computeInt16PcmRms(silent), 0);
+
+  const loud = new Int16Array(640).fill(16384); // ~0.5 amplitude
+  assert.ok(Math.abs(computeInt16PcmRms(loud) - 0.5) < 0.001);
+
+  let state = createSpeechEndProfilerState();
+  // User speaks at t=1000ms and t=1040ms
+  state = observeMicRmsForProfiler(state, 0.09, 1000);
+  state = observeMicRmsForProfiler(state, 0.08, 1040);
+  assert.equal(state.userSpeaking, true);
+  assert.equal(state.lastSpeechEndedAtMs, 0);
+
+  // User goes quiet at t=1080ms; not yet 300ms quiet at t=1280ms
+  state = observeMicRmsForProfiler(state, 0.004, 1080);
+  state = observeMicRmsForProfiler(state, 0.004, 1280);
+  assert.equal(state.userSpeaking, true);
+  assert.equal(state.quietSinceMs, 1080);
+  assert.equal(state.lastSpeechEndedAtMs, 0);
+
+  // At t=1380ms (300ms quiet confirmed), stamps exact quiet onset timestamp
+  state = observeMicRmsForProfiler(state, 0.004, 1380);
+  assert.equal(state.userSpeaking, false);
+  assert.equal(state.lastSpeechEndedAtMs, 1080);
 });

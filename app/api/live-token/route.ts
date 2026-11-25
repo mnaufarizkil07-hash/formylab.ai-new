@@ -14,9 +14,9 @@ import {
 
 /**
  * Native Audio Live models ordered for instant Vercel-compatible browser connections:
- * Gemini 2.5 Flash Native Audio models support Ephemeral Tokens, Native Server VAD,
- * `thinkingConfig: { thinkingBudget: 0 }`, `contextWindowCompression` sliding window,
- * `enableAffectiveDialog`, and optional Google Search grounding.
+ * Gemini 2.5 Flash Native Audio models support Ephemeral Tokens, Pure Native Server VAD,
+ * `thinkingConfig: { thinkingBudget: 0 }`, and optional Google Search grounding
+ * without experimental affective/compression overhead on multi-turn dialogues.
  */
 const LIVE_NATIVE_AUDIO_MODELS = [
   "gemini-2.5-flash-native-audio-preview-12-2025",
@@ -54,14 +54,6 @@ const WS_SERVER_VAD_CONFIG = {
   activityHandling: "START_OF_ACTIVITY_INTERRUPTS",
 };
 
-// Sliding-window context compression keeps multi-turn audio latency fast on turn #2, #3, #N
-const CONTEXT_WINDOW_COMPRESSION_CONFIG = {
-  triggerTokens: "12000",
-  slidingWindow: {
-    targetTokens: "6000",
-  },
-};
-
 // ONLY attached when the user explicitly toggles Search ON (zero custom function declarations!)
 const SDK_SEARCH_ONLY_TOOLS: Tool[] = [{ googleSearch: {} }];
 const WS_SEARCH_ONLY_TOOLS = [{ googleSearch: {} }];
@@ -86,8 +78,6 @@ export async function POST(req: NextRequest) {
     let excludeModelSet = new Set<string>();
     let disableThinkingConfig = false;
     let disableCustomVad = false;
-    let disableContextCompression = false;
-    let disableAffectiveDialog = false;
 
     try {
       const body = await req.json();
@@ -115,12 +105,6 @@ export async function POST(req: NextRequest) {
       }
       if (body?.disableThinkingConfig === true) disableThinkingConfig = true;
       if (body?.disableCustomVad === true) disableCustomVad = true;
-      if (body?.disableContextCompression === true) {
-        disableContextCompression = true;
-      }
-      if (body?.disableAffectiveDialog === true) {
-        disableAffectiveDialog = true;
-      }
     } catch {
       // Empty JSON body is allowed
     }
@@ -183,16 +167,10 @@ export async function POST(req: NextRequest) {
       const vadPatch = disableCustomVad
         ? {}
         : { realtimeInputConfig: SDK_SERVER_VAD_CONFIG };
-      const compressionPatch = disableContextCompression
-        ? {}
-        : { contextWindowCompression: CONTEXT_WINDOW_COMPRESSION_CONFIG };
-      const affectivePatch = disableAffectiveDialog
-        ? {}
-        : { enableAffectiveDialog: true };
       const sdkToolsPatch = enableSearch ? { tools: SDK_SEARCH_ONLY_TOOLS } : {};
       const wsTools = enableSearch ? WS_SEARCH_ONLY_TOOLS : undefined;
 
-      // Tier 1: Constrained Ephemeral Token with Context Compression + Affective Dialog + Pure Voice / Search
+      // Tier 1: Constrained Ephemeral Token with zero-thinking budget + Pure Native Server VAD
       try {
         const tokenRes = await ai.authTokens.create({
           config: {
@@ -216,8 +194,6 @@ export async function POST(req: NextRequest) {
                 ...sdkToolsPatch,
                 ...thinkingPatch,
                 ...vadPatch,
-                ...compressionPatch,
-                ...affectivePatch,
               },
             },
           },
@@ -238,10 +214,6 @@ export async function POST(req: NextRequest) {
             realtimeInputConfig: disableCustomVad
               ? undefined
               : WS_SERVER_VAD_CONFIG,
-            contextWindowCompression: disableContextCompression
-              ? undefined
-              : CONTEXT_WINDOW_COMPRESSION_CONFIG,
-            enableAffectiveDialog: !disableAffectiveDialog,
             expireTime,
             remainingCandidatesCount,
           });
@@ -252,7 +224,7 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      // Tier 2: Model-only constrained token (client sends Live setup via ai.live.connect)
+      // Tier 2: Model-only constrained token (client sends standard Live setup via ai.live.connect)
       try {
         const tokenRes = await ai.authTokens.create({
           config: {
@@ -280,10 +252,6 @@ export async function POST(req: NextRequest) {
             realtimeInputConfig: disableCustomVad
               ? undefined
               : WS_SERVER_VAD_CONFIG,
-            contextWindowCompression: disableContextCompression
-              ? undefined
-              : CONTEXT_WINDOW_COMPRESSION_CONFIG,
-            enableAffectiveDialog: !disableAffectiveDialog,
             expireTime,
             remainingCandidatesCount,
           });
