@@ -31,13 +31,20 @@ import {
   normalizeGoogleDocArtifact,
 } from "./chatNoteUtils";
 import {
+  LIVE_INPUT_CHUNK_SAMPLES,
+  LIVE_INPUT_TARGET_SAMPLE_RATE,
+  LIVE_NOISE_GATE_HOLD_MS,
+  LIVE_NOISE_GATE_RMS_THRESHOLD,
   LIVE_STATUS_LABELS,
   LIVE_VOICE_OPTIONS,
   LiveConnectionStatus,
   LiveVoiceName,
   base64PcmToFloat32,
   classifyLiveVoicePillars,
+  computeFrameRms,
+  createSilenceGateState,
   downsampleFloat32ToInt16Pcm,
+  evaluateSilenceGate,
   formatLiveConnectionError,
   hasGoogleSearchGrounding,
   int16PcmToBase64,
@@ -754,8 +761,7 @@ interface LiveTokenApiResponse {
   error?: string;
 }
 
-const LIVE_TRANSCRIPT_THROTTLE_MS = 90;
-const LIVE_FIRST_CHUNK_LEAD_SEC = 0.02;
+const LIVE_FIRST_CHUNK_LEAD_SEC = 0.01;
 
 // Short-lived in-memory cooldown for models that failed WS setup (e.g., quota 1011)
 // so subsequent voice sessions connect on the first attempt without extra round-trip latency.
@@ -776,21 +782,39 @@ function getRecentlyFailedLiveModels(): string[] {
 }
 
 /**
- * Off-main-thread 16kHz Int16 PCM Mic Capture AudioWorklet:
- * Downsamples hardware microphone input (e.g., 48kHz -> 16kHz) inside the AudioWorklet thread
- * and emits ultra-low-latency 30ms packets (480 samples @ 16kHz) for near-instant turn-taking.
+ * Off-main-thread 16kHz Int16 PCM Mic Capture AudioWorklet with Client-Side RMS Noise Gate:
+ * - Reads actual AudioContext `sampleRate` (e.g., 48000 Hz or 44100 Hz) and mathematically
+ *   linear-downsamples to exact 16000 Hz Int16 mono PCM.
+ * - Emits ultra-low-latency 25ms chunks (400 samples @ 16kHz, within 20-32ms window).
+ * - Computes frame RMS: if RMS < 0.012 for > 150ms, engages silence gate and transmits
+ *   pure digital zero Int16 buffers so Gemini server VAD detects end-of-speech instantly.
  */
 const PCM_CAPTURE_WORKLET_CODE = `
 class FormylabLivePcmCaptureProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    this._targetRate = 16000;
+    this._targetRate = ${LIVE_INPUT_TARGET_SAMPLE_RATE};
     this._ratio = Math.max(0.25, sampleRate / this._targetRate);
-    this._packetSamples = 480; // 30ms @ 16kHz (within 20-40ms low-latency window)
+    this._packetSamples = ${LIVE_INPUT_CHUNK_SAMPLES}; // 25ms @ 16kHz (400 samples)
+    this._rmsThreshold = ${LIVE_NOISE_GATE_RMS_THRESHOLD};
+    this._silenceHoldMs = ${LIVE_NOISE_GATE_HOLD_MS};
     this._out = new Int16Array(this._packetSamples);
     this._outIndex = 0;
     this._phase = 0;
     this._lastSample = 0;
+    this._silenceMs = 0;
+    this._gateActive = false;
+    this._hadSpeechBeforeGate = false;
+  }
+
+  _pushSample(int16Sample) {
+    this._out[this._outIndex++] = int16Sample;
+    if (this._outIndex >= this._packetSamples) {
+      const packet = this._out;
+      this._out = new Int16Array(this._packetSamples);
+      this._outIndex = 0;
+      this.port.postMessage({ type: "pcm", samples: packet }, [packet.buffer]);
+    }
   }
 
   process(inputs) {
@@ -801,16 +825,45 @@ class FormylabLivePcmCaptureProcessor extends AudioWorkletProcessor {
     const ch = input[0];
     const len = ch.length;
 
+    // 1. Compute frame RMS and evaluate 150ms client-side noise gate
+    let sumSq = 0;
+    for (let i = 0; i < len; i++) {
+      const v = ch[i];
+      sumSq += v * v;
+    }
+    const rms = Math.sqrt(sumSq / len);
+    const frameMs = (len / sampleRate) * 1000;
+
+    if (rms >= this._rmsThreshold) {
+      this._silenceMs = 0;
+      this._gateActive = false;
+      this._hadSpeechBeforeGate = true;
+    } else {
+      this._silenceMs += frameMs;
+      if (this._silenceMs > this._silenceHoldMs) {
+        const wasActive = this._gateActive;
+        this._gateActive = true;
+        if (!wasActive && this._hadSpeechBeforeGate) {
+          this._hadSpeechBeforeGate = false;
+          this.port.postMessage({
+            type: "silence_gate_active",
+            rms,
+            silenceMs: Math.round(this._silenceMs),
+          });
+        }
+      }
+    }
+
+    // 2. Mathematically linear-downsample from actual sampleRate -> exact 16000 Hz
     if (Math.abs(this._ratio - 1.0) < 0.001) {
       for (let i = 0; i < len; i++) {
-        const clamped = Math.max(-1, Math.min(1, ch[i]));
-        this._out[this._outIndex++] =
-          clamped < 0 ? Math.round(clamped * 0x8000) : Math.round(clamped * 0x7fff);
-        if (this._outIndex >= this._packetSamples) {
-          const packet = this._out;
-          this._out = new Int16Array(this._packetSamples);
-          this._outIndex = 0;
-          this.port.postMessage(packet, [packet.buffer]);
+        if (this._gateActive) {
+          this._pushSample(0);
+        } else {
+          const clamped = Math.max(-1, Math.min(1, ch[i]));
+          this._pushSample(
+            clamped < 0 ? Math.round(clamped * 0x8000) : Math.round(clamped * 0x7fff)
+          );
         }
       }
       this._lastSample = ch[len - 1];
@@ -819,19 +872,18 @@ class FormylabLivePcmCaptureProcessor extends AudioWorkletProcessor {
 
     let pos = this._phase;
     while (pos < len) {
-      const idx0 = Math.floor(pos);
-      const frac = pos - idx0;
-      const s0 = idx0 < 0 ? this._lastSample : ch[idx0];
-      const s1 = idx0 + 1 < len ? ch[idx0 + 1] : ch[len - 1];
-      const interp = s0 + (s1 - s0) * frac;
-      const clamped = Math.max(-1, Math.min(1, interp));
-      this._out[this._outIndex++] =
-        clamped < 0 ? Math.round(clamped * 0x8000) : Math.round(clamped * 0x7fff);
-      if (this._outIndex >= this._packetSamples) {
-        const packet = this._out;
-        this._out = new Int16Array(this._packetSamples);
-        this._outIndex = 0;
-        this.port.postMessage(packet, [packet.buffer]);
+      if (this._gateActive) {
+        this._pushSample(0);
+      } else {
+        const idx0 = Math.floor(pos);
+        const frac = pos - idx0;
+        const s0 = idx0 < 0 ? this._lastSample : ch[idx0];
+        const s1 = idx0 + 1 < len ? ch[idx0 + 1] : ch[len - 1];
+        const interp = s0 + (s1 - s0) * frac;
+        const clamped = Math.max(-1, Math.min(1, interp));
+        this._pushSample(
+          clamped < 0 ? Math.round(clamped * 0x8000) : Math.round(clamped * 0x7fff)
+        );
       }
       pos += this._ratio;
     }
@@ -1669,18 +1721,17 @@ export function InteractiveVoiceCallOverlay({
   const userTurnIdRef = useRef<string | null>(null);
   const userTurnTextRef = useRef<string>("");
   const userTurnCommittedRef = useRef<boolean>(false);
-  const userFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const userLastFlushMsRef = useRef<number>(0);
 
   const assistantTurnIdRef = useRef<string | null>(null);
   const assistantTurnTextRef = useRef<string>("");
-  const assistantFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
-    null
-  );
-  const assistantLastFlushMsRef = useRef<number>(0);
 
   const turnPendingSourcesRef = useRef<WebSourceCitation[]>([]);
   const turnUsedGoogleSearchRef = useRef<boolean>(false);
+
+  // Latency measurement telemetry refs (console verification)
+  const userSilenceGateAtRef = useRef<number | null>(null);
+  const loggedFirstAudioForTurnRef = useRef<boolean>(false);
+  const loggedInputTranscriptForTurnRef = useRef<boolean>(false);
 
   const startLiveSessionRef = useRef<() => Promise<void>>(async () => {});
 
@@ -1708,34 +1759,13 @@ export function InteractiveVoiceCallOverlay({
   }, []);
 
   const flushUserTranscriptNow = useCallback(() => {
-    if (userFlushTimerRef.current) {
-      clearTimeout(userFlushTimerRef.current);
-      userFlushTimerRef.current = null;
-    }
     const clean = userTurnTextRef.current.replace(/\s+/g, " ").trim();
     if (!clean) return;
     const turnId = ensureUserTurnId();
-    userLastFlushMsRef.current = performance.now();
     queueMicrotask(() => {
       onLiveUserStreamRef.current?.(turnId, clean);
     });
   }, [ensureUserTurnId]);
-
-  const scheduleUserTranscriptFlush = useCallback(() => {
-    const now = performance.now();
-    const elapsed = now - userLastFlushMsRef.current;
-    if (elapsed >= LIVE_TRANSCRIPT_THROTTLE_MS) {
-      flushUserTranscriptNow();
-      return;
-    }
-    if (!userFlushTimerRef.current) {
-      const waitMs = Math.max(16, LIVE_TRANSCRIPT_THROTTLE_MS - elapsed);
-      userFlushTimerRef.current = setTimeout(() => {
-        userFlushTimerRef.current = null;
-        flushUserTranscriptNow();
-      }, waitMs);
-    }
-  }, [flushUserTranscriptNow]);
 
   const emitPendingSourcesAsync = useCallback((turnId: string) => {
     if (turnPendingSourcesRef.current.length === 0) return;
@@ -1746,35 +1776,14 @@ export function InteractiveVoiceCallOverlay({
   }, []);
 
   const flushAssistantTranscriptNow = useCallback(() => {
-    if (assistantFlushTimerRef.current) {
-      clearTimeout(assistantFlushTimerRef.current);
-      assistantFlushTimerRef.current = null;
-    }
     const clean = assistantTurnTextRef.current.replace(/\s+/g, " ").trim();
     if (!clean) return;
     const turnId = ensureAssistantTurnId();
-    assistantLastFlushMsRef.current = performance.now();
     queueMicrotask(() => {
       onLiveAssistantStreamRef.current?.(turnId, clean);
     });
     emitPendingSourcesAsync(turnId);
   }, [emitPendingSourcesAsync, ensureAssistantTurnId]);
-
-  const scheduleAssistantTranscriptFlush = useCallback(() => {
-    const now = performance.now();
-    const elapsed = now - assistantLastFlushMsRef.current;
-    if (elapsed >= LIVE_TRANSCRIPT_THROTTLE_MS) {
-      flushAssistantTranscriptNow();
-      return;
-    }
-    if (!assistantFlushTimerRef.current) {
-      const waitMs = Math.max(16, LIVE_TRANSCRIPT_THROTTLE_MS - elapsed);
-      assistantFlushTimerRef.current = setTimeout(() => {
-        assistantFlushTimerRef.current = null;
-        flushAssistantTranscriptNow();
-      }, waitMs);
-    }
-  }, [flushAssistantTranscriptNow]);
 
   const commitUserTurnIfPending = useCallback(() => {
     if (userTurnCommittedRef.current) return;
@@ -1785,15 +1794,6 @@ export function InteractiveVoiceCallOverlay({
   }, [flushUserTranscriptNow]);
 
   const finalizeCurrentTurnAsync = useCallback(() => {
-    if (userFlushTimerRef.current) {
-      clearTimeout(userFlushTimerRef.current);
-      userFlushTimerRef.current = null;
-    }
-    if (assistantFlushTimerRef.current) {
-      clearTimeout(assistantFlushTimerRef.current);
-      assistantFlushTimerRef.current = null;
-    }
-
     const finalUserText = userTurnTextRef.current.replace(/\s+/g, " ").trim();
     const finalUserId = finalUserText ? ensureUserTurnId() : undefined;
 
@@ -1806,7 +1806,7 @@ export function InteractiveVoiceCallOverlay({
       turnPendingSourcesRef.current.length > 0;
     const sourcesSnapshot = [...turnPendingSourcesRef.current];
 
-    // Reset turn buffers immediately so next speech turn never collides
+    // Reset turn buffers & latency turn flags immediately so next speech turn never collides
     userTurnIdRef.current = null;
     userTurnTextRef.current = "";
     userTurnCommittedRef.current = false;
@@ -1814,10 +1814,12 @@ export function InteractiveVoiceCallOverlay({
     assistantTurnTextRef.current = "";
     turnPendingSourcesRef.current = [];
     turnUsedGoogleSearchRef.current = false;
+    loggedFirstAudioForTurnRef.current = false;
+    loggedInputTranscriptForTurnRef.current = false;
 
     if (!finalUserText && !finalAiText) return;
 
-    // 100% asynchronous UI & localStorage persistence (0 ms audio impact)
+    // 100% asynchronous UI & localStorage persistence (runs only on turnComplete; 0 ms audio impact)
     queueMicrotask(() => {
       if (finalUserId && finalUserText) {
         onLiveUserStreamRef.current?.(finalUserId, finalUserText);
@@ -2042,8 +2044,9 @@ export function InteractiveVoiceCallOverlay({
   );
 
   /**
-   * Captures 16kHz mono PCM 16-bit audio via inline-Blob AudioWorkletNode (30ms / 480 samples)
-   * and streams continuously into the active Gemini Live SDK session.
+   * Captures hardware-native mic audio, mathematically linear-downsamples from actual
+   * AudioContext sampleRate -> exact 16000 Hz Int16 mono PCM in 25ms chunks (400 samples),
+   * applies a 150ms RMS client-side noise gate, and streams continuously to Gemini Live.
    */
   const attachMicCapturePipeline = useCallback(
     async (stream: MediaStream, generation: number) => {
@@ -2059,16 +2062,17 @@ export function InteractiveVoiceCallOverlay({
         throw new Error("Browser tidak mendukung Web Audio API.");
       }
 
-      let inputCtx: AudioContext;
-      try {
-        inputCtx = new AudioCtx({ sampleRate: 16000 });
-      } catch {
-        inputCtx = new AudioCtx();
-      }
+      // Use native hardware sampleRate (do NOT assume `{ sampleRate: 16000 }` is honored by OS/browser);
+      // AudioWorklet mathematically linear-downsamples actual `sampleRate` -> exact 16000 Hz.
+      const inputCtx = new AudioCtx();
       liveInputCtxRef.current = inputCtx;
       if (inputCtx.state === "suspended") {
         await inputCtx.resume().catch(() => {});
       }
+
+      console.log(
+        `[VOICE] Actual input sampleRate: ${inputCtx.sampleRate} -> resampled to ${LIVE_INPUT_TARGET_SAMPLE_RATE}`
+      );
 
       const micSource = inputCtx.createMediaStreamSource(stream);
       liveMicSourceRef.current = micSource;
@@ -2081,6 +2085,15 @@ export function InteractiveVoiceCallOverlay({
       if (liveStatusRef.current !== "speaking") {
         activeAnalyserRef.current = micAnalyser;
       }
+
+      const markUserStoppedSpeaking = () => {
+        userSilenceGateAtRef.current = performance.now();
+        loggedFirstAudioForTurnRef.current = false;
+        loggedInputTranscriptForTurnRef.current = false;
+        console.log(
+          `[VOICE] User stopped speaking (silence gate active) @ ${new Date().toISOString()}`
+        );
+      };
 
       const sendPcmChunkToSession = (int16: Int16Array) => {
         const activeSession = sessionRef.current;
@@ -2142,8 +2155,16 @@ export function InteractiveVoiceCallOverlay({
           );
           liveWorkletNodeRef.current = workletNode;
           workletNode.port.onmessage = (event: MessageEvent) => {
-            if (event.data instanceof Int16Array) {
-              sendPcmChunkToSession(event.data);
+            const payload = event.data;
+            if (!payload) return;
+            if (payload instanceof Int16Array) {
+              sendPcmChunkToSession(payload);
+              return;
+            }
+            if (payload.type === "pcm" && payload.samples instanceof Int16Array) {
+              sendPcmChunkToSession(payload.samples);
+            } else if (payload.type === "silence_gate_active") {
+              markUserStoppedSpeaking();
             }
           };
 
@@ -2167,10 +2188,11 @@ export function InteractiveVoiceCallOverlay({
         }
       }
 
-      // Legacy fallback only when browser lacks AudioWorkletNode (still streams pure 16kHz PCM to Live API)
+      // Legacy fallback only when browser lacks AudioWorkletNode (512-sample small chunks + RMS noise gate)
       if (!workletAttached && typeof inputCtx.createScriptProcessor === "function") {
         const scriptNode = inputCtx.createScriptProcessor(512, 1, 1);
         liveScriptNodeRef.current = scriptNode;
+        const gateState = createSilenceGateState();
 
         const silentGain = inputCtx.createGain();
         silentGain.gain.value = 0;
@@ -2179,12 +2201,36 @@ export function InteractiveVoiceCallOverlay({
         scriptNode.onaudioprocess = (ev: AudioProcessingEvent) => {
           const ch0 = ev.inputBuffer.getChannelData(0);
           if (ch0 && ch0.length > 0) {
-            const int16 = downsampleFloat32ToInt16Pcm(
-              new Float32Array(ch0),
-              inputCtx.sampleRate,
-              16000
+            const copy = new Float32Array(ch0);
+            const rms = computeFrameRms(copy);
+            const frameMs = (copy.length / inputCtx.sampleRate) * 1000;
+            const gate = evaluateSilenceGate(
+              gateState,
+              rms,
+              frameMs,
+              LIVE_NOISE_GATE_RMS_THRESHOLD,
+              LIVE_NOISE_GATE_HOLD_MS
             );
-            sendPcmChunkToSession(int16);
+            if (gate.justActivatedAfterSpeech) {
+              markUserStoppedSpeaking();
+            }
+            if (gate.emitZeroSilence) {
+              const zeroLen = Math.max(
+                1,
+                Math.floor(
+                  copy.length /
+                    (inputCtx.sampleRate / LIVE_INPUT_TARGET_SAMPLE_RATE)
+                )
+              );
+              sendPcmChunkToSession(new Int16Array(zeroLen));
+            } else {
+              const int16 = downsampleFloat32ToInt16Pcm(
+                copy,
+                inputCtx.sampleRate,
+                LIVE_INPUT_TARGET_SAMPLE_RATE
+              );
+              sendPcmChunkToSession(int16);
+            }
           }
         };
 
@@ -2206,7 +2252,7 @@ export function InteractiveVoiceCallOverlay({
     setLiveError("");
     updateLiveStatus("connecting");
 
-    // 1. Acquire microphone with hardware echo cancellation, noise suppression, auto gain
+    // 1. Acquire microphone with AEC + NS and AGC DISABLED (prevents ambient room noise amplification during silence)
     if (
       typeof navigator === "undefined" ||
       !navigator.mediaDevices ||
@@ -2225,7 +2271,7 @@ export function InteractiveVoiceCallOverlay({
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
-          autoGainControl: true,
+          autoGainControl: false,
           channelCount: 1,
         },
       });
@@ -2518,7 +2564,48 @@ export function InteractiveVoiceCallOverlay({
               const content = message.serverContent;
               if (!content) return;
 
-              // 2. Google Search grounding metadata (non-blocking)
+              // 2. Instant server-side Barge-In: user spoke over AI -> stop all active nodes immediately
+              if (content.interrupted) {
+                interruptLiveAudioPlayback();
+                finalizeCurrentTurnAsync();
+                updateLiveStatus("listening");
+                return;
+              }
+
+              // 3. ZERO-WAIT 24kHz PCM Output Playback FIRST (never waits for outputTranscription or turnComplete)
+              const parts = content.modelTurn?.parts;
+              if (Array.isArray(parts)) {
+                let receivedAudio = false;
+                for (const part of parts) {
+                  if (part.inlineData?.data) {
+                    if (!loggedFirstAudioForTurnRef.current) {
+                      loggedFirstAudioForTurnRef.current = true;
+                      const deltaMs =
+                        userSilenceGateAtRef.current !== null
+                          ? Math.max(
+                              0,
+                              Math.round(
+                                performance.now() - userSilenceGateAtRef.current
+                              )
+                            )
+                          : 0;
+                      console.log(
+                        `[VOICE] First AI audio chunk received (+${deltaMs} ms)`
+                      );
+                    }
+                    receivedAudio = true;
+                    enqueueLivePcmChunk(
+                      part.inlineData.data,
+                      part.inlineData.mimeType
+                    );
+                  }
+                }
+                if (receivedAudio) {
+                  commitUserTurnIfPending();
+                }
+              }
+
+              // 4. Google Search grounding metadata (non-blocking)
               if (content.groundingMetadata) {
                 if (hasGoogleSearchGrounding(content.groundingMetadata)) {
                   turnUsedGoogleSearchRef.current = true;
@@ -2541,20 +2628,22 @@ export function InteractiveVoiceCallOverlay({
                 }
               }
 
-              // 3. Instant server-side Barge-In: user spoke over AI -> stop all active nodes immediately
-              if (content.interrupted) {
-                interruptLiveAudioPlayback();
-                finalizeCurrentTurnAsync();
-                updateLiveStatus("listening");
-                return;
-              }
-
-              // 4. Streaming User Speech Transcription -> async update right-side bubble
+              // 5. Live Streaming User Speech Transcription -> instant async bubble update
               if (content.inputTranscription?.text) {
-                if (liveStatusRef.current === "speaking") {
-                  interruptLiveAudioPlayback();
-                  finalizeCurrentTurnAsync();
-                  updateLiveStatus("listening");
+                if (!loggedInputTranscriptForTurnRef.current) {
+                  loggedInputTranscriptForTurnRef.current = true;
+                  const deltaMs =
+                    userSilenceGateAtRef.current !== null
+                      ? Math.max(
+                          0,
+                          Math.round(
+                            performance.now() - userSilenceGateAtRef.current
+                          )
+                        )
+                      : 0;
+                  console.log(
+                    `[VOICE] Input transcript received (+${deltaMs} ms)`
+                  );
                 }
                 if (userTurnCommittedRef.current) {
                   userTurnCommittedRef.current = false;
@@ -2563,33 +2652,15 @@ export function InteractiveVoiceCallOverlay({
                 }
                 userTurnTextRef.current += content.inputTranscription.text;
                 speechPulseRef.current = 0.6;
-                scheduleUserTranscriptFlush();
+                flushUserTranscriptNow();
               }
 
-              // 5. Streaming AI Speech Transcription -> async update left-side bubble (`Auto · Suara`)
+              // 6. Live Streaming AI Speech Transcription -> instant async bubble update (`Auto · Suara`)
               if (content.outputTranscription?.text) {
                 commitUserTurnIfPending();
                 assistantTurnTextRef.current += content.outputTranscription.text;
                 ensureAssistantTurnId();
-                scheduleAssistantTranscriptFlush();
-              }
-
-              // 6. Zero-Wait 24kHz PCM Output Playback (plays on chunk #1, never waits for turnComplete)
-              const parts = content.modelTurn?.parts;
-              if (Array.isArray(parts)) {
-                let receivedAudio = false;
-                for (const part of parts) {
-                  if (part.inlineData?.data) {
-                    receivedAudio = true;
-                    enqueueLivePcmChunk(
-                      part.inlineData.data,
-                      part.inlineData.mimeType
-                    );
-                  }
-                }
-                if (receivedAudio) {
-                  commitUserTurnIfPending();
-                }
+                flushAssistantTranscriptNow();
               }
 
               // 7. Turn Complete -> finalize room chat + 0ms PILAR AI AKTIF + Google Search badge + localStorage
@@ -2713,10 +2784,10 @@ export function InteractiveVoiceCallOverlay({
     enqueueLivePcmChunk,
     ensureAssistantTurnId,
     finalizeCurrentTurnAsync,
+    flushAssistantTranscriptNow,
+    flushUserTranscriptNow,
     interruptLiveAudioPlayback,
     isOpen,
-    scheduleAssistantTranscriptFlush,
-    scheduleUserTranscriptFlush,
     updateLiveStatus,
   ]);
 

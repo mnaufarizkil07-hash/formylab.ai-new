@@ -858,8 +858,9 @@ export default function ChatPage() {
       if (!turnId || !trimmed) return;
       const targetId = activeSessionIdRef.current;
 
-      setSessions((prev) => {
-        const next = prev.map((sess) => {
+      // Stream directly into React state (ZERO localStorage I/O until turnComplete)
+      setSessions((prev) =>
+        prev.map((sess) => {
           if (sess.id !== targetId) return sess;
           const existingIdx = sess.messages.findIndex((m) => m.id === turnId);
           if (existingIdx !== -1) {
@@ -892,12 +893,10 @@ export default function ChatPage() {
             title: nextTitle,
             messages: [...sess.messages, userMsg],
           };
-        });
-        persistSessions(next);
-        return next;
-      });
+        })
+      );
     },
-    [persistSessions]
+    []
   );
 
   const handleLiveAssistantStream = useCallback(
@@ -907,8 +906,9 @@ export default function ChatPage() {
       const targetId = activeSessionIdRef.current;
       const modelBadge = selectedModelRef.current;
 
-      setSessions((prev) => {
-        const next = prev.map((sess) => {
+      // Stream directly into React state (ZERO localStorage I/O until turnComplete)
+      setSessions((prev) =>
+        prev.map((sess) => {
           if (sess.id !== targetId) return sess;
           const existingIdx = sess.messages.findIndex((m) => m.id === turnId);
           if (existingIdx !== -1) {
@@ -928,12 +928,10 @@ export default function ChatPage() {
             ...sess,
             messages: [...sess.messages, aiMsg],
           };
-        });
-        persistSessions(next);
-        return next;
-      });
+        })
+      );
     },
-    [persistSessions]
+    []
   );
 
   const handleLiveTurnComplete = useCallback(
@@ -945,15 +943,60 @@ export default function ChatPage() {
       activePillars: string[];
       usedGoogleSearch: boolean;
     }) => {
-      if (payload.userTurnId && payload.userText?.trim()) {
-        handleLiveUserStream(payload.userTurnId, payload.userText);
-      }
-      if (payload.assistantTurnId && payload.assistantText?.trim()) {
-        handleLiveAssistantStream(
-          payload.assistantTurnId,
-          payload.assistantText
-        );
-      }
+      const targetId = activeSessionIdRef.current;
+      const modelBadge = selectedModelRef.current;
+      const cleanUser = payload.userText?.trim() || "";
+      const cleanAi = payload.assistantText?.trim() || "";
+
+      // Finalize turn text and persist to per-account localStorage ONCE on turnComplete
+      setSessions((prev) => {
+        const next = prev.map((sess) => {
+          if (sess.id !== targetId) return sess;
+          const msgs = [...sess.messages];
+          let nextTitle = sess.title;
+
+          if (payload.userTurnId && cleanUser) {
+            const idx = msgs.findIndex((m) => m.id === payload.userTurnId);
+            if (idx !== -1) {
+              msgs[idx] = { ...msgs[idx], content: cleanUser };
+            } else {
+              msgs.push({
+                id: payload.userTurnId,
+                role: "user",
+                content: cleanUser,
+                timestamp: "Suara",
+              });
+            }
+            if (msgs.filter((m) => m.role === "user").length === 1) {
+              nextTitle = generateSessionTitle(cleanUser, true, false);
+            }
+          }
+
+          if (payload.assistantTurnId && cleanAi) {
+            const idx = msgs.findIndex((m) => m.id === payload.assistantTurnId);
+            if (idx !== -1) {
+              msgs[idx] = { ...msgs[idx], content: cleanAi };
+            } else {
+              msgs.push({
+                id: payload.assistantTurnId,
+                role: "assistant",
+                content: cleanAi,
+                modelBadge,
+                timestamp: "Suara",
+              });
+            }
+          }
+
+          return {
+            ...sess,
+            title: nextTitle,
+            messages: msgs,
+          };
+        });
+        persistSessions(next);
+        return next;
+      });
+
       if (payload.assistantTurnId) {
         const msgId = payload.assistantTurnId;
         if (payload.activePillars.length > 0) {
@@ -973,12 +1016,7 @@ export default function ChatPage() {
         }
       }
     },
-    [
-      handleLiveAssistantStream,
-      handleLiveUserStream,
-      persistMessageGoogleSearch,
-      persistMessagePillars,
-    ]
+    [persistMessageGoogleSearch, persistMessagePillars, persistSessions]
   );
 
   const handleCreateChatNote = useCallback(

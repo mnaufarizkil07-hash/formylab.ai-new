@@ -36,8 +36,8 @@ const SDK_LIVE_REALTIME_INPUT_CONFIG = {
     disabled: false,
     startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
     endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_HIGH,
-    prefixPaddingMs: 150,
-    silenceDurationMs: 400,
+    prefixPaddingMs: 100,
+    silenceDurationMs: 250,
   },
   activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
 };
@@ -47,8 +47,8 @@ const WS_LIVE_REALTIME_INPUT_CONFIG = {
     disabled: false,
     startOfSpeechSensitivity: "START_SENSITIVITY_HIGH",
     endOfSpeechSensitivity: "END_SENSITIVITY_HIGH",
-    prefixPaddingMs: 150,
-    silenceDurationMs: 400,
+    prefixPaddingMs: 100,
+    silenceDurationMs: 250,
   },
   activityHandling: "START_OF_ACTIVITY_INTERRUPTS",
 };

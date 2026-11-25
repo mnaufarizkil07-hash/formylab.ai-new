@@ -24,6 +24,68 @@ export const LIVE_STATUS_LABELS: Record<LiveConnectionStatus, string> = {
   error: "Koneksi Live Terputus",
 };
 
+export const LIVE_INPUT_TARGET_SAMPLE_RATE = 16000;
+export const LIVE_INPUT_CHUNK_SAMPLES = 400; // 25ms @ 16kHz (within 20-32ms / 320-512 sample window)
+export const LIVE_NOISE_GATE_RMS_THRESHOLD = 0.012;
+export const LIVE_NOISE_GATE_HOLD_MS = 150;
+
+export interface SilenceGateState {
+  silenceMs: number;
+  gateActive: boolean;
+  hadSpeechBeforeGate: boolean;
+}
+
+export function createSilenceGateState(): SilenceGateState {
+  return {
+    silenceMs: 0,
+    gateActive: false,
+    hadSpeechBeforeGate: false,
+  };
+}
+
+export function computeFrameRms(samples: Float32Array): number {
+  if (!samples || samples.length === 0) return 0;
+  let sumSq = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const v = samples[i];
+    sumSq += v * v;
+  }
+  return Math.sqrt(sumSq / samples.length);
+}
+
+/**
+ * Evaluates client-side RMS noise gate for a single audio frame.
+ * Returns whether the frame should be replaced with pure digital zero silence
+ * and whether the user just transitioned from speech into silence-gate active.
+ */
+export function evaluateSilenceGate(
+  state: SilenceGateState,
+  rms: number,
+  frameDurationMs: number,
+  rmsThreshold = LIVE_NOISE_GATE_RMS_THRESHOLD,
+  holdMs = LIVE_NOISE_GATE_HOLD_MS
+): { emitZeroSilence: boolean; justActivatedAfterSpeech: boolean } {
+  if (rms >= rmsThreshold) {
+    state.silenceMs = 0;
+    state.gateActive = false;
+    state.hadSpeechBeforeGate = true;
+    return { emitZeroSilence: false, justActivatedAfterSpeech: false };
+  }
+
+  state.silenceMs += Math.max(0, frameDurationMs);
+  if (state.silenceMs > holdMs) {
+    const wasActive = state.gateActive;
+    state.gateActive = true;
+    if (!wasActive && state.hadSpeechBeforeGate) {
+      state.hadSpeechBeforeGate = false;
+      return { emitZeroSilence: true, justActivatedAfterSpeech: true };
+    }
+    return { emitZeroSilence: true, justActivatedAfterSpeech: false };
+  }
+
+  return { emitZeroSilence: false, justActivatedAfterSpeech: false };
+}
+
 /**
  * Concise, human-like Bahasa Indonesia voice system instruction engineered for
  * minimal Time-To-First-Audio (TTFA) on Gemini Live Native Audio.
@@ -37,7 +99,7 @@ export function buildLiveVoiceSystemInstruction(
     "Aturan wajib mode suara:",
     "- Langsung jawab ke inti dalam 1 hingga 3 kalimat padat dan jelas agar obrolan terasa cepat dan hidup, kecuali pengguna meminta penjelasan rinci.",
     "- DILARANG menyebutkan simbol markdown (bintang, pagar, garis miring, atau daftar bernomor panjang); ucapkan angka dan satuan secara lisan (misalnya 'lima persen', 'pH lima koma lima').",
-    "- Gunakan Google Search otomatis setiap kali pengguna menanyakan berita terkini, regulasi BPOM/Halal terbaru, harga/tren bahan kosmetik, fakta spesifik, atau saat pengguna mengoreksi jawabanmu; akui singkat jika sebelumnya keliru lalu sampaikan fakta terverifikasi.",
+    "- HANYA gunakan tool googleSearch jika user menanyakan berita terkini, harga terbaru, tanggal/kejadian aktual, atau fakta eksternal yang berubah-ubah. Untuk sapaan, diskusi umum, dan formulasi kosmetik standar, JAWAB LANGSUNG dengan suara secepat mungkin tanpa memanggil search.",
     "- Jika diminta membuat catatan/tabel di chat, panggil `create_chat_note`; jika diminta membuat Google Docs, panggil `create_google_doc`, lalu konfirmasi singkat dalam 1 kalimat.",
   ];
 
@@ -86,13 +148,14 @@ export function classifyLiveVoicePillars(
 }
 
 /**
- * Downsamples Float32 PCM audio from hardware sample rate (e.g. 48kHz / 44.1kHz)
- * to 16kHz signed 16-bit Little-Endian PCM for Gemini Live realtimeInput.
+ * Mathematically linear-downsamples Float32 PCM audio from actual hardware
+ * sample rate (e.g. 48000 Hz or 44100 Hz) to exact 16000 Hz signed 16-bit
+ * Little-Endian mono PCM for Gemini Live realtimeInput.
  */
 export function downsampleFloat32ToInt16Pcm(
   input: Float32Array,
   sourceRate: number,
-  targetRate = 16000
+  targetRate = LIVE_INPUT_TARGET_SAMPLE_RATE
 ): Int16Array {
   if (input.length === 0) return new Int16Array(0);
 
@@ -100,7 +163,8 @@ export function downsampleFloat32ToInt16Pcm(
     const out = new Int16Array(input.length);
     for (let i = 0; i < input.length; i++) {
       const clamped = Math.max(-1, Math.min(1, input[i]));
-      out[i] = clamped < 0 ? Math.round(clamped * 0x8000) : Math.round(clamped * 0x7fff);
+      out[i] =
+        clamped < 0 ? Math.round(clamped * 0x8000) : Math.round(clamped * 0x7fff);
     }
     return out;
   }
@@ -110,18 +174,14 @@ export function downsampleFloat32ToInt16Pcm(
   const out = new Int16Array(outputLength);
 
   for (let i = 0; i < outputLength; i++) {
-    const start = Math.floor(i * ratio);
-    const end = Math.min(input.length, Math.floor((i + 1) * ratio));
-    let sum = 0;
-    let count = 0;
-    for (let j = start; j < end; j++) {
-      sum += input[j];
-      count++;
-    }
-    const sample =
-      count > 0 ? sum / count : input[Math.min(start, input.length - 1)];
+    const srcPos = i * ratio;
+    const idx0 = Math.floor(srcPos);
+    const idx1 = Math.min(idx0 + 1, input.length - 1);
+    const frac = srcPos - idx0;
+    const sample = input[idx0] + (input[idx1] - input[idx0]) * frac;
     const clamped = Math.max(-1, Math.min(1, sample));
-    out[i] = clamped < 0 ? Math.round(clamped * 0x8000) : Math.round(clamped * 0x7fff);
+    out[i] =
+      clamped < 0 ? Math.round(clamped * 0x8000) : Math.round(clamped * 0x7fff);
   }
   return out;
 }
