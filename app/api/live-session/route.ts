@@ -1,12 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
-import { GoogleGenAI, Modality, Tool, Type } from "@google/genai";
+import {
+  ActivityHandling,
+  EndSensitivity,
+  GoogleGenAI,
+  Modality,
+  StartSensitivity,
+  Tool,
+  Type,
+} from "@google/genai";
 import {
   CREATE_CHAT_NOTE_TOOL_DECLARATION,
   CREATE_GOOGLE_DOC_TOOL_DECLARATION,
-  FACT_CHECK_ANTI_KEKEH_DIRECTIVE,
-  GDOC_ARTIFACT_LIVE_DIRECTIVE,
-  NOTE_ARTIFACT_LIVE_DIRECTIVE,
-  WEB_SEARCH_LIVE_DIRECTIVE,
   WEB_SEARCH_TOOL_DECLARATION,
 } from "../../../components/chatNoteUtils";
 
@@ -17,6 +21,31 @@ const LIVE_AUDIO_MODELS = [
 ] as const;
 
 const PREFERRED_LIVE_VOICES = ["Aoede", "Kore"] as const;
+
+// Low-latency turn-taking & instant barge-in VAD config:
+// ~420ms silence threshold responds almost immediately after user stops speaking
+// while tolerating brief natural pauses/breaths (~150-350ms).
+const SDK_LIVE_REALTIME_INPUT_CONFIG = {
+  automaticActivityDetection: {
+    disabled: false,
+    startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
+    endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_HIGH,
+    prefixPaddingMs: 120,
+    silenceDurationMs: 420,
+  },
+  activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
+};
+
+const WS_LIVE_REALTIME_INPUT_CONFIG = {
+  automaticActivityDetection: {
+    disabled: false,
+    startOfSpeechSensitivity: "START_SENSITIVITY_HIGH",
+    endOfSpeechSensitivity: "END_SENSITIVITY_HIGH",
+    prefixPaddingMs: 120,
+    silenceDurationMs: 420,
+  },
+  activityHandling: "START_OF_ACTIVITY_INTERRUPTS",
+};
 
 const SDK_LIVE_FUNCTION_TOOLS: Tool[] = [
   {
@@ -115,36 +144,29 @@ const WS_LIVE_HYBRID_TOOLS = [
   ...WS_LIVE_FUNCTION_TOOLS,
 ];
 
+/**
+ * Concise, high-signal voice system instruction tuned for minimal time-to-first-audio (TTFA):
+ * eliminates verbose boilerplate while preserving Senior Cosmetic R&D persona, Google Search grounding,
+ * anti-hallucination fact-checking, and real Note/Google Docs tool calls.
+ */
 function buildLiveVoiceSystemInstruction(recentContext?: string): string {
   const baseLines = [
-    "Kamu adalah asisten suara AI Formylab.ai berperan sebagai Senior Cosmetic R&D Chemist.",
-    "Gaya bicara WAJIB alami, hangat, luwes, dan santai profesional dalam Bahasa Indonesia seperti rekan kerja R&D di telepon.",
-    "Aturan percakapan telepon real-time:",
-    "1. Jawab langsung ke inti dalam 1 sampai 3 kalimat singkat yang enak didengar; hindari monolog panjang, gaya artikel, atau bahasa kaku/robotik.",
-    "2. Untuk sapaan ringan seperti 'Halo' atau 'Apa kabar', balas ramah dan singkat dalam 1 kalimat lalu tanyakan ada yang bisa dibantu.",
-    "3. Untuk pertanyaan teknis formulasi kosmetik & skincare (BPOM, Halal, pH, HLB, viskositas, stabilitas emulsi, bahan aktif, substitusi bahan, estimasi HPP), jawab akurat, praktis, dan berbasis ilmu kimia kosmetik.",
-    "4. Kamu juga fleksibel menjawab pertanyaan umum di luar kosmetik secara natural dan membantu.",
-    "5. Jangan pernah membaca simbol markdown, tanda bintang, pagar, atau daftar poin kaku; ucapkan angka dan satuan secara lisan (misalnya 'lima persen', 'pH lima koma lima').",
-    "",
-    FACT_CHECK_ANTI_KEKEH_DIRECTIVE,
-    "",
-    WEB_SEARCH_LIVE_DIRECTIVE,
-    "",
-    NOTE_ARTIFACT_LIVE_DIRECTIVE,
-    "",
-    GDOC_ARTIFACT_LIVE_DIRECTIVE,
+    "Kamu asisten suara AI Formylab.ai (Senior Cosmetic R&D Chemist). Berbicara Bahasa Indonesia alami, hangat, dan lugas seperti di telepon.",
+    "Aturan respons cepat:",
+    "- Langsung ke inti dalam 1-2 kalimat singkat tanpa pembukaan bertele-tele atau simbol markdown; ucapkan angka secara lisan (misal 'lima persen', 'pH lima koma lima').",
+    "- Sapaan ringan: balas ramah 1 kalimat singkat.",
+    "- Pertanyaan kosmetik/skincare (BPOM, Halal, pH, HLB, stabilitas, bahan aktif, HPP) maupun topik umum: jawab akurat dan praktis.",
+    "- Fakta spesifik/terkini atau saat pengguna mengoreksi/meragukan jawabanmu: WAJIB cek Google Search / panggil `web_search` dulu (jangan ngeyel atau mengarang); jika keliru, akui singkat lalu koreksi sesuai fakta.",
+    "- Diminta buat catatan/tabel di chat: WAJIB panggil `create_chat_note`. Diminta buat Google Docs/simpan ke Drive: WAJIB panggil `create_google_doc` (sertakan isi lengkap bila membahas catatan/formula sebelumnya). Konfirmasi 1 kalimat setelah tool selesai.",
   ];
 
   const trimmedContext =
     typeof recentContext === "string"
-      ? recentContext.replace(/\s+/g, " ").trim().slice(0, 750)
+      ? recentContext.replace(/\s+/g, " ").trim().slice(0, 420)
       : "";
 
   if (trimmedContext) {
-    baseLines.push(
-      "",
-      `Konteks diskusi chat terakhir pengguna (gunakan hanya jika relevan dengan obrolan telepon): "${trimmedContext}"`
-    );
+    baseLines.push(`Konteks chat terakhir (pakai bila relevan): "${trimmedContext}"`);
   }
 
   return baseLines.join("\n");
@@ -171,6 +193,7 @@ export async function POST(req: NextRequest) {
     let excludeModelSet = new Set<string>();
     let preferSimpleTools = false;
     let preferNoTools = false;
+    let disableCustomVad = false;
     try {
       const body = await req.json();
       if (typeof body?.recentContext === "string") {
@@ -193,6 +216,9 @@ export async function POST(req: NextRequest) {
       if (body?.preferNoTools === true) {
         preferNoTools = true;
       }
+      if (body?.disableCustomVad === true) {
+        disableCustomVad = true;
+      }
     } catch {
       // Empty body is valid
     }
@@ -211,6 +237,12 @@ export async function POST(req: NextRequest) {
     }
 
     const systemInstruction = buildLiveVoiceSystemInstruction(recentContext);
+    const sdkVadPatch = disableCustomVad
+      ? {}
+      : { realtimeInputConfig: SDK_LIVE_REALTIME_INPUT_CONFIG };
+    const wsVadConfig = disableCustomVad
+      ? undefined
+      : WS_LIVE_REALTIME_INPUT_CONFIG;
 
     const ai = new GoogleGenAI({
       apiKey,
@@ -264,6 +296,7 @@ export async function POST(req: NextRequest) {
                     tools: SDK_LIVE_HYBRID_TOOLS,
                     inputAudioTranscription: {},
                     outputAudioTranscription: {},
+                    ...sdkVadPatch,
                   },
                 },
               },
@@ -278,6 +311,7 @@ export async function POST(req: NextRequest) {
                 voiceName,
                 systemInstruction,
                 tools: WS_LIVE_HYBRID_TOOLS,
+                realtimeInputConfig: wsVadConfig,
                 wsUrl: buildLiveWsUrl(tokenRes.name),
                 expireTime,
                 lockedConfig: true,
@@ -315,6 +349,7 @@ export async function POST(req: NextRequest) {
                     tools: SDK_LIVE_FUNCTION_TOOLS,
                     inputAudioTranscription: {},
                     outputAudioTranscription: {},
+                    ...sdkVadPatch,
                   },
                 },
               },
@@ -329,6 +364,7 @@ export async function POST(req: NextRequest) {
                 voiceName,
                 systemInstruction,
                 tools: WS_LIVE_FUNCTION_TOOLS,
+                realtimeInputConfig: wsVadConfig,
                 wsUrl: buildLiveWsUrl(tokenRes.name),
                 expireTime,
                 lockedConfig: true,
@@ -365,6 +401,7 @@ export async function POST(req: NextRequest) {
               voiceName,
               systemInstruction,
               tools: preferNoTools ? [] : WS_LIVE_FUNCTION_TOOLS,
+              realtimeInputConfig: wsVadConfig,
               wsUrl: buildLiveWsUrl(tokenRes.name),
               expireTime,
               lockedConfig: false,

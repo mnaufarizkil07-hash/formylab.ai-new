@@ -1026,11 +1026,9 @@ async function synthesizeVoiceCallNativeAudio(
 }
 
 const VOICE_CALL_SPOKEN_STYLE_GUIDANCE = [
-  "[INSTRUKSI GAYA LISAN TELEPON AI 2 ARAH (VOICE CALL MODE)]:",
-  "- Berbicaralah dalam Bahasa Indonesia yang sangat natural, hangat, luwes, dan berwibawa layaknya Senior Cosmetic R&D Chemist yang sedang ditelepon langsung.",
-  "- Pertahankan kecerdasan penuh setara chat utama: gunakan seluruh pengetahuan R&D kosmetik dan riwayat percakapan untuk menjawab secara akurat dan langsung ke inti (umumnya 2 hingga 4 kalimat padat berisi, atau sedikit lebih panjang namun tetap mengalir bila user menanyakan detail formulasi atau parameter teknis).",
-  "- DILARANG keras menggunakan simbol markdown apa pun (seperti *, **, #, backtick, bullet points, tabel, atau tanda kutip aneh).",
-  "- Tulis istilah teknis dan angka agar alami diucapkan telinga manusia (contohnya: pH lima koma lima, lima persen, sekitar sepuluh ribu centipoise, bukan kode mentah yang kaku).",
+  "[MODE SUARA TELEPON]:",
+  "- Jawab dalam Bahasa Indonesia alami, hangat, dan langsung ke inti dalam 1-2 kalimat singkat tanpa pembukaan bertele-tele.",
+  "- Tanpa simbol markdown (*, **, #, backtick, bullet, tabel); ucapkan angka dan satuan secara lisan (misal pH lima koma lima, lima persen).",
 ].join("\n");
 
 export async function POST(req: NextRequest) {

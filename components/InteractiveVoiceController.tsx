@@ -717,6 +717,7 @@ interface LiveSessionConfigResponse {
   voiceName?: string;
   systemInstruction?: string;
   tools?: unknown[];
+  realtimeInputConfig?: Record<string, unknown>;
   wsUrl?: string;
   lockedConfig?: boolean;
   searchMode?: "hybrid" | "function_tool" | "none";
@@ -724,13 +725,31 @@ interface LiveSessionConfigResponse {
   reason?: string;
 }
 
-const LIVE_TRANSCRIPT_THROTTLE_MS = 120;
-const LIVE_FALLBACK_LOOKAHEAD_SEC = 0.1;
+const LIVE_TRANSCRIPT_THROTTLE_MS = 100;
+const LIVE_FALLBACK_LOOKAHEAD_SEC = 0.02;
+
+// Short-lived in-memory cooldown for models that failed WS setup (e.g., quota 1011)
+// so subsequent voice sessions connect on the first attempt without extra round-trip latency.
+const LIVE_MODEL_COOLDOWN_MS = 5 * 60 * 1000;
+const recentlyFailedLiveModels = new Map<string, number>();
+
+function getRecentlyFailedLiveModels(): string[] {
+  const now = Date.now();
+  const active: string[] = [];
+  recentlyFailedLiveModels.forEach((failedAt, modelId) => {
+    if (now - failedAt < LIVE_MODEL_COOLDOWN_MS) {
+      active.push(modelId);
+    } else {
+      recentlyFailedLiveModels.delete(modelId);
+    }
+  });
+  return active;
+}
 
 /**
  * Off-main-thread 16kHz Int16 PCM Mic Capture AudioWorklet:
  * Downsamples hardware microphone input (e.g., 48kHz -> 16kHz) inside the AudioWorklet thread
- * and emits stable ~90ms packets (1440 samples @ 16kHz) so WebSocket traffic stays smooth.
+ * and emits ultra-low-latency 30ms packets (480 samples @ 16kHz) for near-instant turn-taking.
  */
 const PCM_CAPTURE_WORKLET_CODE = `
 class FormylabPcmCaptureProcessor extends AudioWorkletProcessor {
@@ -738,7 +757,7 @@ class FormylabPcmCaptureProcessor extends AudioWorkletProcessor {
     super();
     this._targetRate = 16000;
     this._ratio = Math.max(0.25, sampleRate / this._targetRate);
-    this._packetSamples = 1440; // 90ms @ 16kHz (within 80ms-100ms ideal window)
+    this._packetSamples = 480; // 30ms @ 16kHz (ultra-low-latency 20-40ms streaming window)
     this._out = new Int16Array(this._packetSamples);
     this._outIndex = 0;
     this._phase = 0;
@@ -811,9 +830,10 @@ class FormylabPcmRingPlayerProcessor extends AudioWorkletProcessor {
     this._writeIdx = 0;
     this._available = 0;
 
-    this._prebufferSamples = Math.round(sampleRate * 0.1);  // 100ms low-latency jitter pre-buffer
-    this._rebufferSamples = Math.round(sampleRate * 0.12);  // 120ms recovery pre-buffer
-    this._fadeSamples = Math.max(16, Math.round(sampleRate * 0.005)); // 5ms soft ramp
+    this._initialPrebufferSamples = Math.max(128, Math.round(sampleRate * 0.02)); // 20ms instant first-chunk playback
+    this._prebufferSamples = this._initialPrebufferSamples;
+    this._rebufferSamples = Math.round(sampleRate * 0.06);  // 60ms recovery pre-buffer only on mid-stream underrun
+    this._fadeSamples = Math.max(16, Math.round(sampleRate * 0.003)); // 3ms crisp click-free ramp
 
     this._isPlaying = false;
     this._turnComplete = true;
@@ -827,7 +847,7 @@ class FormylabPcmRingPlayerProcessor extends AudioWorkletProcessor {
       if (!msg || typeof msg !== "object") return;
 
       if (msg.type === "clear") {
-        // Trigger 5ms soft ramp-out before flushing ring buffer to prevent speaker click/pop
+        // Trigger 3ms soft ramp-out before flushing ring buffer for instant barge-in with zero click
         if (this._isPlaying && this._available > 0) {
           this._fadeOutRemaining = this._fadeSamples;
           this._clearAfterFadeOut = true;
@@ -839,7 +859,8 @@ class FormylabPcmRingPlayerProcessor extends AudioWorkletProcessor {
 
       if (msg.type === "turnComplete") {
         this._turnComplete = true;
-        // Release short utterances (< 180ms) immediately when server finishes turn
+        this._prebufferSamples = this._initialPrebufferSamples;
+        // Release short utterances immediately when server finishes turn
         if (!this._isPlaying && this._available > 0 && !this._clearAfterFadeOut) {
           this._isPlaying = true;
           this._fadeInRemaining = this._fadeSamples;
@@ -887,6 +908,7 @@ class FormylabPcmRingPlayerProcessor extends AudioWorkletProcessor {
     this._readIdx = 0;
     this._writeIdx = 0;
     this._available = 0;
+    this._prebufferSamples = this._initialPrebufferSamples;
     this._isPlaying = false;
     this._turnComplete = true;
     this._fadeInRemaining = 0;
@@ -2125,7 +2147,7 @@ export function InteractiveVoiceCallOverlay({
           if (isMountedRef.current && callActiveRef.current) {
             startListeningRef.current();
           }
-        }, 250);
+        }, 120);
       };
 
       // Primary path: Play Gemini Native Neural WAV via Web Audio API + AnalyserNode
@@ -2291,8 +2313,8 @@ export function InteractiveVoiceCallOverlay({
               lastVoiceMs = Date.now();
             } else if (
               hasDetectedVoice &&
-              Date.now() - lastVoiceMs > 1100 &&
-              Date.now() - fallbackStartMsRef.current > 850
+              Date.now() - lastVoiceMs > 650 &&
+              Date.now() - fallbackStartMsRef.current > 550
             ) {
               submitFallbackAudioRef.current();
               return;
@@ -2572,13 +2594,13 @@ export function InteractiveVoiceCallOverlay({
           if (silenceTimerRef.current) {
             clearTimeout(silenceTimerRef.current);
           }
-          // ~1.1s natural silence detector -> send automatically
+          // ~650ms snappy silence detector -> responds rapidly while tolerating brief breaths
           silenceTimerRef.current = setTimeout(() => {
             const finalSpoken = latestSpokenTextRef.current.trim();
             if (finalSpoken.length > 0 && !isSubmittingTurnRef.current) {
               submitSpokenTextRef.current(finalSpoken);
             }
-          }, 1100);
+          }, 650);
         }
       };
 
@@ -3125,7 +3147,7 @@ export function InteractiveVoiceCallOverlay({
 
       // Fallback path ONLY when AudioWorklet is unavailable
       if (!workletAttached && typeof inputCtx.createScriptProcessor === "function") {
-        const scriptNode = inputCtx.createScriptProcessor(2048, 1, 1);
+        const scriptNode = inputCtx.createScriptProcessor(1024, 1, 1);
         liveScriptNodeRef.current = scriptNode;
 
         const silentGain = inputCtx.createGain();
@@ -3162,6 +3184,7 @@ export function InteractiveVoiceCallOverlay({
       excludeModels?: string[];
       preferSimpleTools?: boolean;
       preferNoTools?: boolean;
+      disableCustomVad?: boolean;
     }): Promise<LiveSessionConfigResponse | null> => {
       try {
         const res = await fetch("/api/live-session", {
@@ -3174,6 +3197,7 @@ export function InteractiveVoiceCallOverlay({
               : {}),
             ...(opts?.preferSimpleTools ? { preferSimpleTools: true } : {}),
             ...(opts?.preferNoTools ? { preferNoTools: true } : {}),
+            ...(opts?.disableCustomVad ? { disableCustomVad: true } : {}),
           }),
         });
         if (res.ok) {
@@ -3185,8 +3209,11 @@ export function InteractiveVoiceCallOverlay({
       return { fallbackMode: true };
     };
 
-    // 1. Fetch initial short-lived Gemini Live ephemeral token & config from server
-    const initialConfig = await requestLiveSessionConfig();
+    // 1. Fetch initial short-lived Gemini Live ephemeral token (skip models on cooldown for instant 1-shot connect)
+    const initialExcluded = getRecentlyFailedLiveModels();
+    const initialConfig = await requestLiveSessionConfig(
+      initialExcluded.length > 0 ? { excludeModels: initialExcluded } : undefined
+    );
 
     if (!isMountedRef.current || !callActiveRef.current || !isOpen) return;
 
@@ -3344,9 +3371,9 @@ export function InteractiveVoiceCallOverlay({
       startListeningRef.current();
     };
 
-    const excludedModels: string[] = [];
+    const excludedModels: string[] = [...initialExcluded];
     let attemptCount = 0;
-    const MAX_LIVE_WS_ATTEMPTS = 4;
+    const MAX_LIVE_WS_ATTEMPTS = 5;
 
     const connectLiveWebSocketWithConfig = (
       sessionConfig: LiveSessionConfigResponse
@@ -3389,33 +3416,53 @@ export function InteractiveVoiceCallOverlay({
         const isConfigRejection =
           closeCode === 1007 || closeCode === 1008 || closeCode === 1003;
 
-        // If hybrid googleSearch + functionDeclarations was rejected on setup, retry same model with simple tools
-        if (
-          isConfigRejection &&
-          sessionConfig.searchMode === "hybrid" &&
-          failedModel
-        ) {
-          const nextCfg = await requestLiveSessionConfig({
-            excludeModels: excludedModels,
-            preferSimpleTools: true,
-          });
-          if (
-            isMountedRef.current &&
-            callActiveRef.current &&
-            isOpen &&
-            nextCfg &&
-            !nextCfg.fallbackMode &&
-            nextCfg.wsUrl &&
-            nextCfg.token
-          ) {
-            connectLiveWebSocketWithConfig(nextCfg);
-            return;
+        // If custom VAD or hybrid tools was rejected on setup, retry same model safely
+        if (isConfigRejection && failedModel) {
+          if (sessionConfig.realtimeInputConfig) {
+            const nextCfg = await requestLiveSessionConfig({
+              excludeModels: excludedModels,
+              disableCustomVad: true,
+              preferSimpleTools: sessionConfig.searchMode !== "hybrid",
+            });
+            if (
+              isMountedRef.current &&
+              callActiveRef.current &&
+              isOpen &&
+              nextCfg &&
+              !nextCfg.fallbackMode &&
+              nextCfg.wsUrl &&
+              nextCfg.token
+            ) {
+              connectLiveWebSocketWithConfig(nextCfg);
+              return;
+            }
+          } else if (sessionConfig.searchMode === "hybrid") {
+            const nextCfg = await requestLiveSessionConfig({
+              excludeModels: excludedModels,
+              preferSimpleTools: true,
+              disableCustomVad: true,
+            });
+            if (
+              isMountedRef.current &&
+              callActiveRef.current &&
+              isOpen &&
+              nextCfg &&
+              !nextCfg.fallbackMode &&
+              nextCfg.wsUrl &&
+              nextCfg.token
+            ) {
+              connectLiveWebSocketWithConfig(nextCfg);
+              return;
+            }
           }
         }
 
         // Otherwise move to next Live Audio candidate model without re-requesting mic permission
         if (failedModel && !excludedModels.includes(failedModel)) {
           excludedModels.push(failedModel);
+          if (closeCode === 1011 || closeCode === 1008) {
+            recentlyFailedLiveModels.set(failedModel, Date.now());
+          }
         }
 
         if ((sessionConfig.remainingCandidatesCount ?? 0) > 0) {
@@ -3443,7 +3490,7 @@ export function InteractiveVoiceCallOverlay({
         const ws = new WebSocket(sessionConfig.wsUrl);
         liveWsRef.current = ws;
 
-        // Safety watchdog: if Live handshake doesn't finish in 5s, fail over cleanly
+        // Safety watchdog: if Live handshake doesn't finish in 4s, fail over cleanly
         liveConnectTimerRef.current = setTimeout(() => {
           if (
             callActiveRef.current &&
@@ -3461,7 +3508,7 @@ export function InteractiveVoiceCallOverlay({
             }
             void handlePreSetupFailure(1006);
           }
-        }, 5000);
+        }, 4000);
 
         const liveModelPath = (sessionConfig.model || "gemini-3.8-live").startsWith(
           "models/"
@@ -3494,6 +3541,9 @@ export function InteractiveVoiceCallOverlay({
               ...(Array.isArray(sessionConfig?.tools) &&
               sessionConfig.tools.length > 0
                 ? { tools: sessionConfig.tools }
+                : {}),
+              ...(sessionConfig?.realtimeInputConfig
+                ? { realtimeInputConfig: sessionConfig.realtimeInputConfig }
                 : {}),
               inputAudioTranscription: {},
               outputAudioTranscription: {},
@@ -3768,6 +3818,13 @@ export function InteractiveVoiceCallOverlay({
 
           // Real-time user speech transcription -> accumulated & committed cleanly to right-side bubble
           if (content.inputTranscription?.text) {
+            // Instant barge-in safeguard: if user speech transcription starts while AI is still speaking,
+            // cut AI audio output immediately rather than waiting for trailing frames
+            if (phaseRef.current === "speaking") {
+              interruptLivePlayback();
+              flushLiveTurnTranscripts();
+              updatePhase("listening");
+            }
             if (liveUserCommittedRef.current) {
               liveUserCommittedRef.current = false;
               liveInputTurnTextRef.current = "";
