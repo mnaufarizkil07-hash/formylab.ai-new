@@ -74,7 +74,10 @@ import {
   saveStoredSessions,
 } from "../../lib/chatStorage";
 import { ACTIVE_USER_STORAGE_KEY, UserAccount } from "../../lib/auth";
-import { getScopedChatStorageKey } from "../../components/liveVoiceHelpers";
+import {
+  LIVE_USER_LISTENING_PLACEHOLDER,
+  getScopedChatStorageKey,
+} from "../../components/liveVoiceHelpers";
 
 export default function ChatPage() {
   const router = useRouter();
@@ -857,6 +860,7 @@ export default function ChatPage() {
       const trimmed = spokenText.trim();
       if (!turnId || !trimmed) return;
       const targetId = activeSessionIdRef.current;
+      const isPlaceholder = trimmed === LIVE_USER_LISTENING_PLACEHOLDER;
 
       // Stream directly into React state (ZERO localStorage I/O until turnComplete)
       setSessions((prev) =>
@@ -871,17 +875,19 @@ export default function ChatPage() {
               updatedMsgs.filter((m) => m.role === "user").length === 1;
             return {
               ...sess,
-              title: isOnlyUserMsg
-                ? generateSessionTitle(trimmed, true, false)
-                : sess.title,
+              title:
+                !isPlaceholder && isOnlyUserMsg
+                  ? generateSessionTitle(trimmed, true, false)
+                  : sess.title,
               messages: updatedMsgs,
             };
           }
           const isFirstUser =
             sess.messages.filter((m) => m.role === "user").length === 0;
-          const nextTitle = isFirstUser
-            ? generateSessionTitle(trimmed, true, false)
-            : sess.title;
+          const nextTitle =
+            !isPlaceholder && isFirstUser
+              ? generateSessionTitle(trimmed, true, false)
+              : sess.title;
           const userMsg: ChatMessage = {
             id: turnId,
             role: "user",
@@ -898,6 +904,21 @@ export default function ChatPage() {
     },
     []
   );
+
+  const handleLiveRemoveMessage = useCallback((turnId: string) => {
+    if (!turnId) return;
+    const targetId = activeSessionIdRef.current;
+    setSessions((prev) =>
+      prev.map((sess) => {
+        if (sess.id !== targetId) return sess;
+        if (!sess.messages.some((m) => m.id === turnId)) return sess;
+        return {
+          ...sess,
+          messages: sess.messages.filter((m) => m.id !== turnId),
+        };
+      })
+    );
+  }, []);
 
   const handleLiveAssistantStream = useCallback(
     (turnId: string, text: string) => {
@@ -1914,6 +1935,7 @@ export default function ChatPage() {
                     latestAiReply={latestAiContextSnippet}
                     onLiveUserStream={handleLiveUserStream}
                     onLiveAssistantStream={handleLiveAssistantStream}
+                    onLiveRemoveMessage={handleLiveRemoveMessage}
                     onLiveTurnComplete={handleLiveTurnComplete}
                     onLiveWebSources={attachWebSourcesToMessage}
                     onCreateChatNote={handleCreateChatNote}

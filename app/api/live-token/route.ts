@@ -31,24 +31,25 @@ const LIVE_NATIVE_AUDIO_MODELS = [
 
 const ALLOWED_VOICES = new Set<LiveVoiceName>(["Aoede", "Zephyr"]);
 
-const SDK_LIVE_REALTIME_INPUT_CONFIG = {
+// Server VAD enabled with maximum sensitivity + non-destructive client `audioStreamEnd: true` flush
+const SDK_SERVER_VAD_CONFIG = {
   automaticActivityDetection: {
     disabled: false,
     startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
     endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_HIGH,
     prefixPaddingMs: 100,
-    silenceDurationMs: 250,
+    silenceDurationMs: 200,
   },
   activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
 };
 
-const WS_LIVE_REALTIME_INPUT_CONFIG = {
+const WS_SERVER_VAD_CONFIG = {
   automaticActivityDetection: {
     disabled: false,
     startOfSpeechSensitivity: "START_SENSITIVITY_HIGH",
     endOfSpeechSensitivity: "END_SENSITIVITY_HIGH",
     prefixPaddingMs: 100,
-    silenceDurationMs: 250,
+    silenceDurationMs: 200,
   },
   activityHandling: "START_OF_ACTIVITY_INTERRUPTS",
 };
@@ -230,9 +231,11 @@ export async function POST(req: NextRequest) {
       const thinkingPatch = supportsZeroThinkingBudget
         ? { thinkingConfig: { thinkingBudget: 0 } }
         : {};
+      const vadMode = "auto_stream_end" as const;
+      const wsRealtimeConfig = WS_SERVER_VAD_CONFIG;
       const vadPatch = disableCustomVad
         ? {}
-        : { realtimeInputConfig: SDK_LIVE_REALTIME_INPUT_CONFIG };
+        : { realtimeInputConfig: SDK_SERVER_VAD_CONFIG };
 
       // Tier 1: Constrained Ephemeral Token with Google Search + Artifact tools
       if (!searchOnlyTools) {
@@ -277,7 +280,8 @@ export async function POST(req: NextRequest) {
                 : undefined,
               realtimeInputConfig: disableCustomVad
                 ? undefined
-                : WS_LIVE_REALTIME_INPUT_CONFIG,
+                : wsRealtimeConfig,
+              vadMode,
               toolMode: "hybrid",
               expireTime,
               remainingCandidatesCount,
@@ -332,7 +336,8 @@ export async function POST(req: NextRequest) {
               : undefined,
             realtimeInputConfig: disableCustomVad
               ? undefined
-              : WS_LIVE_REALTIME_INPUT_CONFIG,
+              : wsRealtimeConfig,
+            vadMode,
             toolMode: "google_search",
             expireTime,
             remainingCandidatesCount,
@@ -370,7 +375,8 @@ export async function POST(req: NextRequest) {
               : undefined,
             realtimeInputConfig: disableCustomVad
               ? undefined
-              : WS_LIVE_REALTIME_INPUT_CONFIG,
+              : wsRealtimeConfig,
+            vadMode,
             toolMode: "google_search",
             expireTime,
             remainingCandidatesCount,

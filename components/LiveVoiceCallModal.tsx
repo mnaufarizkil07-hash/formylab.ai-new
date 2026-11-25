@@ -53,6 +53,7 @@ interface LiveVoiceCallModalProps {
   latestAiReply?: string;
   onLiveUserStream?: (turnId: string, text: string) => void;
   onLiveAssistantStream?: (turnId: string, text: string) => void;
+  onLiveRemoveMessage?: (turnId: string) => void;
   onLiveTurnComplete?: (payload: {
     userTurnId?: string;
     userText?: string;
@@ -74,6 +75,7 @@ export default function LiveVoiceCallModal({
   latestAiReply,
   onLiveUserStream,
   onLiveAssistantStream,
+  onLiveRemoveMessage,
   onLiveTurnComplete,
   onLiveWebSources,
   onCreateChatNote,
@@ -88,6 +90,7 @@ export default function LiveVoiceCallModal({
       recentChatContext={latestAiReply}
       onLiveUserStream={onLiveUserStream}
       onLiveAssistantStream={onLiveAssistantStream}
+      onLiveRemoveMessage={onLiveRemoveMessage}
       onLiveTurnComplete={onLiveTurnComplete}
       onLiveWebSources={onLiveWebSources}
       onCreateChatNote={onCreateChatNote}

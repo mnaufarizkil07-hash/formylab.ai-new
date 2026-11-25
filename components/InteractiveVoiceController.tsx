@@ -33,8 +33,9 @@ import {
 import {
   LIVE_INPUT_CHUNK_SAMPLES,
   LIVE_INPUT_TARGET_SAMPLE_RATE,
-  LIVE_NOISE_GATE_HOLD_MS,
-  LIVE_NOISE_GATE_RMS_THRESHOLD,
+  LIVE_MIN_SPEECH_MS,
+  LIVE_NOISE_CALIBRATION_MS,
+  LIVE_SPEECH_END_SILENCE_MS,
   LIVE_STATUS_LABELS,
   LIVE_VOICE_OPTIONS,
   LiveConnectionStatus,
@@ -42,13 +43,15 @@ import {
   base64PcmToFloat32,
   classifyLiveVoicePillars,
   computeFrameRms,
-  createSilenceGateState,
+  createAdaptiveVoiceDetectorState,
   downsampleFloat32ToInt16Pcm,
-  evaluateSilenceGate,
   formatLiveConnectionError,
   hasGoogleSearchGrounding,
   int16PcmToBase64,
   parsePcmSampleRate,
+  resetDetectorTurnFlush,
+  sanitizeLiveTranscriptText,
+  stepAdaptiveVoiceDetector,
 } from "./liveVoiceHelpers";
 
 export interface VoiceSynthesisState {
@@ -734,6 +737,7 @@ interface InteractiveVoiceCallOverlayProps {
   recentChatContext?: string;
   onLiveUserStream?: (turnId: string, text: string) => void;
   onLiveAssistantStream?: (turnId: string, text: string) => void;
+  onLiveRemoveMessage?: (turnId: string) => void;
   onLiveTurnComplete?: (payload: {
     userTurnId?: string;
     userText?: string;
@@ -756,7 +760,7 @@ interface LiveTokenApiResponse {
   tools?: Tool[];
   thinkingConfig?: LiveConnectConfig["thinkingConfig"];
   realtimeInputConfig?: LiveConnectConfig["realtimeInputConfig"];
-  toolMode?: "hybrid" | "search_only";
+  toolMode?: "hybrid" | "search_only" | "google_search";
   remainingCandidatesCount?: number;
   error?: string;
 }
@@ -782,12 +786,15 @@ function getRecentlyFailedLiveModels(): string[] {
 }
 
 /**
- * Off-main-thread 16kHz Int16 PCM Mic Capture AudioWorklet with Client-Side RMS Noise Gate:
- * - Reads actual AudioContext `sampleRate` (e.g., 48000 Hz or 44100 Hz) and mathematically
- *   linear-downsamples to exact 16000 Hz Int16 mono PCM.
- * - Emits ultra-low-latency 25ms chunks (400 samples @ 16kHz, within 20-32ms window).
- * - Computes frame RMS: if RMS < 0.012 for > 150ms, engages silence gate and transmits
- *   pure digital zero Int16 buffers so Gemini server VAD detects end-of-speech instantly.
+ * Off-main-thread 16kHz Int16 PCM Mic Capture AudioWorklet (NO silence gate, NEVER zeroes audio):
+ * - Smooth linear interpolation downsampling from actual AudioContext `sampleRate` (e.g. 48kHz / 44.1kHz)
+ *   to exact 16000 Hz mono Int16 PCM, emitting continuous 20ms chunks (320 samples @ 16kHz).
+ * - Non-destructive RMS monitor:
+ *   1. Calibrates room noise floor during the first 400ms after Live connection opens.
+ *   2. If RMS exceeds Math.max(noiseFloor * 2.2, 0.008) for >= 100ms, then drops back near
+ *      noiseFloor for 350ms, emits `speech_end_flush` ONCE so the client sends `audioStreamEnd: true`.
+ *   3. Never sends duplicate flush signals while user remains silent; resets only when user
+ *      speaks again (>= 100ms) or upon `turn_complete` from Gemini.
  */
 const PCM_CAPTURE_WORKLET_CODE = `
 class FormylabLivePcmCaptureProcessor extends AudioWorkletProcessor {
@@ -795,16 +802,65 @@ class FormylabLivePcmCaptureProcessor extends AudioWorkletProcessor {
     super();
     this._targetRate = ${LIVE_INPUT_TARGET_SAMPLE_RATE};
     this._ratio = Math.max(0.25, sampleRate / this._targetRate);
-    this._packetSamples = ${LIVE_INPUT_CHUNK_SAMPLES}; // 25ms @ 16kHz (400 samples)
-    this._rmsThreshold = ${LIVE_NOISE_GATE_RMS_THRESHOLD};
-    this._silenceHoldMs = ${LIVE_NOISE_GATE_HOLD_MS};
+    this._packetSamples = ${LIVE_INPUT_CHUNK_SAMPLES}; // 20ms @ 16kHz (320 samples)
+    this._calibrationMs = ${LIVE_NOISE_CALIBRATION_MS}; // 400ms automatic noise floor calibration
+    this._minSpeechMs = ${LIVE_MIN_SPEECH_MS}; // 100ms minimum speech before eligible to flush
+    this._speechEndSilenceMs = ${LIVE_SPEECH_END_SILENCE_MS}; // 350ms silence flush
+
     this._out = new Int16Array(this._packetSamples);
     this._outIndex = 0;
-    this._phase = 0;
-    this._lastSample = 0;
-    this._silenceMs = 0;
-    this._gateActive = false;
-    this._hadSpeechBeforeGate = false;
+    // Virtual buffer [this._prevSample, ch[0..len-1]] -> starts at phase 1.0 (ch[0]) for seamless boundary interpolation
+    this._phase = 1.0;
+    this._prevSample = 0;
+
+    // Non-destructive adaptive noise floor & end-of-speech monitor
+    this._calibrated = false;
+    this._calElapsedMs = 0;
+    this._calRmsSum = 0;
+    this._calFrames = 0;
+    this._noiseFloor = 0.004;
+    this._speechThreshold = 0.0088;
+    this._silenceThreshold = 0.0065;
+
+    this._speechElapsedMs = 0;
+    this._hasQualifiedSpeech = false;
+    this._silenceElapsedMs = 0;
+    this._flushSentForTurn = false;
+    this._aiSpeaking = false;
+
+    this.port.onmessage = (event) => {
+      const msg = event.data;
+      if (!msg || typeof msg !== "object") return;
+      if (msg.type === "ai_speaking") {
+        this._aiSpeaking = Boolean(msg.value);
+      } else if (msg.type === "turn_complete") {
+        this._flushSentForTurn = false;
+        this._hasQualifiedSpeech = false;
+        this._speechElapsedMs = 0;
+        this._silenceElapsedMs = 0;
+      } else if (msg.type === "reset_calibration") {
+        this._calibrated = false;
+        this._calElapsedMs = 0;
+        this._calRmsSum = 0;
+        this._calFrames = 0;
+        this._hasQualifiedSpeech = false;
+        this._speechElapsedMs = 0;
+        this._silenceElapsedMs = 0;
+        this._flushSentForTurn = false;
+      }
+    };
+  }
+
+  _recomputeThresholds(floor) {
+    const clamped = Math.max(0.001, Math.min(0.05, floor));
+    const speech = Math.max(clamped * 2.2, 0.008);
+    const silence = Math.min(
+      Math.max(clamped * 1.45, clamped + 0.0025),
+      speech * 0.82
+    );
+    this._noiseFloor = clamped;
+    this._speechThreshold = speech;
+    this._silenceThreshold = silence;
   }
 
   _pushSample(int16Sample) {
@@ -813,6 +869,7 @@ class FormylabLivePcmCaptureProcessor extends AudioWorkletProcessor {
       const packet = this._out;
       this._out = new Int16Array(this._packetSamples);
       this._outIndex = 0;
+      // ALWAYS forward natural, un-gated 16kHz PCM audio
       this.port.postMessage({ type: "pcm", samples: packet }, [packet.buffer]);
     }
   }
@@ -825,7 +882,7 @@ class FormylabLivePcmCaptureProcessor extends AudioWorkletProcessor {
     const ch = input[0];
     const len = ch.length;
 
-    // 1. Compute frame RMS and evaluate 150ms client-side noise gate
+    // 1. Compute real-time RMS on raw mic audio (strictly read-only, never alters PCM)
     let sumSq = 0;
     for (let i = 0; i < len; i++) {
       const v = ch[i];
@@ -834,61 +891,85 @@ class FormylabLivePcmCaptureProcessor extends AudioWorkletProcessor {
     const rms = Math.sqrt(sumSq / len);
     const frameMs = (len / sampleRate) * 1000;
 
-    if (rms >= this._rmsThreshold) {
-      this._silenceMs = 0;
-      this._gateActive = false;
-      this._hadSpeechBeforeGate = true;
-    } else {
-      this._silenceMs += frameMs;
-      if (this._silenceMs > this._silenceHoldMs) {
-        const wasActive = this._gateActive;
-        this._gateActive = true;
-        if (!wasActive && this._hadSpeechBeforeGate) {
-          this._hadSpeechBeforeGate = false;
-          this.port.postMessage({
-            type: "silence_gate_active",
-            rms,
-            silenceMs: Math.round(this._silenceMs),
-          });
-        }
-      }
-    }
-
-    // 2. Mathematically linear-downsample from actual sampleRate -> exact 16000 Hz
+    // 2. Smooth linear interpolation downsampling -> exact 16000 Hz Int16 mono PCM (continuous stream)
     if (Math.abs(this._ratio - 1.0) < 0.001) {
       for (let i = 0; i < len; i++) {
-        if (this._gateActive) {
-          this._pushSample(0);
-        } else {
-          const clamped = Math.max(-1, Math.min(1, ch[i]));
-          this._pushSample(
-            clamped < 0 ? Math.round(clamped * 0x8000) : Math.round(clamped * 0x7fff)
-          );
-        }
+        const clamped = Math.max(-1, Math.min(1, ch[i]));
+        this._pushSample(
+          clamped < 0 ? Math.round(clamped * 0x8000) : Math.round(clamped * 0x7fff)
+        );
       }
-      this._lastSample = ch[len - 1];
-      return true;
-    }
-
-    let pos = this._phase;
-    while (pos < len) {
-      if (this._gateActive) {
-        this._pushSample(0);
-      } else {
+      this._prevSample = ch[len - 1];
+    } else {
+      let pos = this._phase;
+      while (pos < len) {
         const idx0 = Math.floor(pos);
         const frac = pos - idx0;
-        const s0 = idx0 < 0 ? this._lastSample : ch[idx0];
-        const s1 = idx0 + 1 < len ? ch[idx0 + 1] : ch[len - 1];
+        const s0 = idx0 <= 0 ? this._prevSample : ch[idx0 - 1];
+        const s1 = ch[idx0];
         const interp = s0 + (s1 - s0) * frac;
         const clamped = Math.max(-1, Math.min(1, interp));
         this._pushSample(
           clamped < 0 ? Math.round(clamped * 0x8000) : Math.round(clamped * 0x7fff)
         );
+        pos += this._ratio;
       }
-      pos += this._ratio;
+      this._phase = pos - len;
+      this._prevSample = ch[len - 1];
     }
-    this._phase = pos - len;
-    this._lastSample = ch[len - 1];
+
+    // 3. Non-destructive 400ms noise-floor calibration & 100ms speech -> 350ms flush monitor
+    if (!this._calibrated) {
+      this._calElapsedMs += frameMs;
+      this._calRmsSum += rms;
+      this._calFrames += 1;
+      if (this._calElapsedMs >= this._calibrationMs) {
+        const avg = this._calFrames > 0 ? this._calRmsSum / this._calFrames : 0.004;
+        this._recomputeThresholds(avg);
+        this._calibrated = true;
+      }
+      return true;
+    }
+
+    const activeSpeechThreshold = this._aiSpeaking
+      ? Math.max(this._speechThreshold * 1.8, 0.035)
+      : this._speechThreshold;
+
+    if (rms >= activeSpeechThreshold) {
+      const wasQualified = this._hasQualifiedSpeech;
+      this._speechElapsedMs += frameMs;
+      this._silenceElapsedMs = 0;
+      if (this._speechElapsedMs >= this._minSpeechMs) {
+        this._hasQualifiedSpeech = true;
+        this._flushSentForTurn = false;
+        if (!wasQualified) {
+          this.port.postMessage({ type: "speech_active" });
+        }
+      }
+    } else if (this._hasQualifiedSpeech) {
+      if (rms <= this._silenceThreshold) {
+        this._silenceElapsedMs += frameMs;
+        if (
+          this._silenceElapsedMs >= this._speechEndSilenceMs &&
+          !this._flushSentForTurn
+        ) {
+          this._flushSentForTurn = true;
+          this._hasQualifiedSpeech = false;
+          this._speechElapsedMs = 0;
+          this._silenceElapsedMs = 0;
+          this.port.postMessage({ type: "speech_end_flush" });
+        }
+      } else {
+        this._silenceElapsedMs = 0;
+      }
+    } else {
+      this._speechElapsedMs = 0;
+      this._silenceElapsedMs = 0;
+      if (!this._aiSpeaking) {
+        this._recomputeThresholds(this._noiseFloor * 0.992 + rms * 0.008);
+      }
+    }
+
     return true;
   }
 }
@@ -1632,6 +1713,7 @@ export function InteractiveVoiceCallOverlay({
   recentChatContext,
   onLiveUserStream,
   onLiveAssistantStream,
+  onLiveRemoveMessage,
   onLiveTurnComplete,
   onLiveWebSources,
   onCreateChatNote,
@@ -1653,6 +1735,7 @@ export function InteractiveVoiceCallOverlay({
   // Latest callback refs
   const onLiveUserStreamRef = useRef(onLiveUserStream);
   const onLiveAssistantStreamRef = useRef(onLiveAssistantStream);
+  const onLiveRemoveMessageRef = useRef(onLiveRemoveMessage);
   const onLiveTurnCompleteRef = useRef(onLiveTurnComplete);
   const onLiveWebSourcesRef = useRef(onLiveWebSources);
   const onCreateChatNoteRef = useRef(onCreateChatNote);
@@ -1666,6 +1749,10 @@ export function InteractiveVoiceCallOverlay({
   useEffect(() => {
     onLiveAssistantStreamRef.current = onLiveAssistantStream;
   }, [onLiveAssistantStream]);
+
+  useEffect(() => {
+    onLiveRemoveMessageRef.current = onLiveRemoveMessage;
+  }, [onLiveRemoveMessage]);
 
   useEffect(() => {
     onLiveTurnCompleteRef.current = onLiveTurnComplete;
@@ -1721,6 +1808,7 @@ export function InteractiveVoiceCallOverlay({
   const userTurnIdRef = useRef<string | null>(null);
   const userTurnTextRef = useRef<string>("");
   const userTurnCommittedRef = useRef<boolean>(false);
+  const userTurnPlaceholderShownRef = useRef<boolean>(false);
 
   const assistantTurnIdRef = useRef<string | null>(null);
   const assistantTurnTextRef = useRef<string>("");
@@ -1728,17 +1816,44 @@ export function InteractiveVoiceCallOverlay({
   const turnPendingSourcesRef = useRef<WebSourceCitation[]>([]);
   const turnUsedGoogleSearchRef = useRef<boolean>(false);
 
-  // Latency measurement telemetry refs (console verification)
-  const userSilenceGateAtRef = useRef<number | null>(null);
+  // Non-destructive client-side end-of-speech flush & latency telemetry refs
+  const fallbackDetectorRef = useRef(createAdaptiveVoiceDetectorState());
+  const speechEndedAtRef = useRef<number | null>(null);
   const loggedFirstAudioForTurnRef = useRef<boolean>(false);
   const loggedInputTranscriptForTurnRef = useRef<boolean>(false);
+  const thinkingFallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null
+  );
+
+  const clearThinkingFallbackTimer = useCallback(() => {
+    if (thinkingFallbackTimerRef.current) {
+      clearTimeout(thinkingFallbackTimerRef.current);
+      thinkingFallbackTimerRef.current = null;
+    }
+  }, []);
 
   const startLiveSessionRef = useRef<() => Promise<void>>(async () => {});
 
-  const updateLiveStatus = useCallback((next: LiveConnectionStatus) => {
-    liveStatusRef.current = next;
-    setLiveStatus(next);
-  }, []);
+  const updateLiveStatus = useCallback(
+    (next: LiveConnectionStatus) => {
+      if (next !== "thinking") {
+        clearThinkingFallbackTimer();
+      }
+      liveStatusRef.current = next;
+      setLiveStatus(next);
+      if (liveWorkletNodeRef.current) {
+        try {
+          liveWorkletNodeRef.current.port.postMessage({
+            type: "ai_speaking",
+            value: next === "speaking",
+          });
+        } catch {
+          // ignore if port closed
+        }
+      }
+    },
+    [clearThinkingFallbackTimer]
+  );
 
   const ensureUserTurnId = useCallback((): string => {
     if (!userTurnIdRef.current) {
@@ -1759,9 +1874,10 @@ export function InteractiveVoiceCallOverlay({
   }, []);
 
   const flushUserTranscriptNow = useCallback(() => {
-    const clean = userTurnTextRef.current.replace(/\s+/g, " ").trim();
+    const clean = sanitizeLiveTranscriptText(userTurnTextRef.current);
     if (!clean) return;
     const turnId = ensureUserTurnId();
+    userTurnPlaceholderShownRef.current = false;
     queueMicrotask(() => {
       onLiveUserStreamRef.current?.(turnId, clean);
     });
@@ -1776,7 +1892,7 @@ export function InteractiveVoiceCallOverlay({
   }, []);
 
   const flushAssistantTranscriptNow = useCallback(() => {
-    const clean = assistantTurnTextRef.current.replace(/\s+/g, " ").trim();
+    const clean = sanitizeLiveTranscriptText(assistantTurnTextRef.current);
     if (!clean) return;
     const turnId = ensureAssistantTurnId();
     queueMicrotask(() => {
@@ -1787,19 +1903,20 @@ export function InteractiveVoiceCallOverlay({
 
   const commitUserTurnIfPending = useCallback(() => {
     if (userTurnCommittedRef.current) return;
-    const clean = userTurnTextRef.current.replace(/\s+/g, " ").trim();
+    const clean = sanitizeLiveTranscriptText(userTurnTextRef.current);
     if (!clean) return;
     userTurnCommittedRef.current = true;
     flushUserTranscriptNow();
   }, [flushUserTranscriptNow]);
 
   const finalizeCurrentTurnAsync = useCallback(() => {
-    const finalUserText = userTurnTextRef.current.replace(/\s+/g, " ").trim();
+    const existingUserId = userTurnIdRef.current;
+    const finalUserText = sanitizeLiveTranscriptText(userTurnTextRef.current);
+    const hadUnfilledPlaceholder =
+      userTurnPlaceholderShownRef.current && finalUserText.length === 0;
     const finalUserId = finalUserText ? ensureUserTurnId() : undefined;
 
-    const finalAiText = assistantTurnTextRef.current
-      .replace(/\s+/g, " ")
-      .trim();
+    const finalAiText = sanitizeLiveTranscriptText(assistantTurnTextRef.current);
     const finalAiId = finalAiText ? ensureAssistantTurnId() : undefined;
     const usedGoogleSearch =
       turnUsedGoogleSearchRef.current ||
@@ -1810,12 +1927,20 @@ export function InteractiveVoiceCallOverlay({
     userTurnIdRef.current = null;
     userTurnTextRef.current = "";
     userTurnCommittedRef.current = false;
+    userTurnPlaceholderShownRef.current = false;
     assistantTurnIdRef.current = null;
     assistantTurnTextRef.current = "";
     turnPendingSourcesRef.current = [];
     turnUsedGoogleSearchRef.current = false;
     loggedFirstAudioForTurnRef.current = false;
     loggedInputTranscriptForTurnRef.current = false;
+
+    // Clean up any orphan bubble if cleaned user transcript ended up empty (e.g. only <noise>)
+    if (hadUnfilledPlaceholder && existingUserId && !finalUserText) {
+      queueMicrotask(() => {
+        onLiveRemoveMessageRef.current?.(existingUserId);
+      });
+    }
 
     if (!finalUserText && !finalAiText) return;
 
@@ -1941,6 +2066,7 @@ export function InteractiveVoiceCallOverlay({
     (options?: { keepMicAndAudioCtx?: boolean }) => {
       const keepAudio = options?.keepMicAndAudioCtx === true;
 
+      clearThinkingFallbackTimer();
       interruptLiveAudioPlayback();
       finalizeCurrentTurnAsync();
 
@@ -2040,13 +2166,14 @@ export function InteractiveVoiceCallOverlay({
       liveOutputAnalyserRef.current = null;
       activeAnalyserRef.current = null;
     },
-    [finalizeCurrentTurnAsync, interruptLiveAudioPlayback]
+    [clearThinkingFallbackTimer, finalizeCurrentTurnAsync, interruptLiveAudioPlayback]
   );
 
   /**
-   * Captures hardware-native mic audio, mathematically linear-downsamples from actual
-   * AudioContext sampleRate -> exact 16000 Hz Int16 mono PCM in 25ms chunks (400 samples),
-   * applies a 150ms RMS client-side noise gate, and streams continuously to Gemini Live.
+   * Captures hardware-native mic audio continuously (NO silence gate, NEVER zeroes audio),
+   * smoothly linear-downsamples to exact 16000 Hz Int16 mono PCM in 20ms chunks (320 samples),
+   * and runs a non-destructive 400ms-calibrated RMS monitor that sends `audioStreamEnd: true`
+   * exactly ONCE after >= 100ms speech + 350ms silence.
    */
   const attachMicCapturePipeline = useCallback(
     async (stream: MediaStream, generation: number) => {
@@ -2062,8 +2189,6 @@ export function InteractiveVoiceCallOverlay({
         throw new Error("Browser tidak mendukung Web Audio API.");
       }
 
-      // Use native hardware sampleRate (do NOT assume `{ sampleRate: 16000 }` is honored by OS/browser);
-      // AudioWorklet mathematically linear-downsamples actual `sampleRate` -> exact 16000 Hz.
       const inputCtx = new AudioCtx();
       liveInputCtxRef.current = inputCtx;
       if (inputCtx.state === "suspended") {
@@ -2071,7 +2196,7 @@ export function InteractiveVoiceCallOverlay({
       }
 
       console.log(
-        `[VOICE] Actual input sampleRate: ${inputCtx.sampleRate} -> resampled to ${LIVE_INPUT_TARGET_SAMPLE_RATE}`
+        `[VOICE] Mic 16kHz ready (from ${inputCtx.sampleRate}Hz, AGC on, no silence gate)`
       );
 
       const micSource = inputCtx.createMediaStreamSource(stream);
@@ -2085,15 +2210,6 @@ export function InteractiveVoiceCallOverlay({
       if (liveStatusRef.current !== "speaking") {
         activeAnalyserRef.current = micAnalyser;
       }
-
-      const markUserStoppedSpeaking = () => {
-        userSilenceGateAtRef.current = performance.now();
-        loggedFirstAudioForTurnRef.current = false;
-        loggedInputTranscriptForTurnRef.current = false;
-        console.log(
-          `[VOICE] User stopped speaking (silence gate active) @ ${new Date().toISOString()}`
-        );
-      };
 
       const sendPcmChunkToSession = (int16: Int16Array) => {
         const activeSession = sessionRef.current;
@@ -2117,6 +2233,45 @@ export function InteractiveVoiceCallOverlay({
         } catch {
           // Ignore if session closed mid-frame
         }
+      };
+
+      const handleNonDestructiveSpeechEndFlush = () => {
+        const activeSession = sessionRef.current;
+        if (
+          !activeSession ||
+          !callActiveRef.current ||
+          sessionGenerationRef.current !== generation ||
+          isMicMutedRef.current
+        ) {
+          return;
+        }
+
+        speechEndedAtRef.current = performance.now();
+        loggedFirstAudioForTurnRef.current = false;
+        loggedInputTranscriptForTurnRef.current = false;
+
+        try {
+          activeSession.sendRealtimeInput({ audioStreamEnd: true });
+        } catch {
+          // ignore on closing socket
+        }
+
+        if (liveStatusRef.current === "listening") {
+          updateLiveStatus("thinking");
+          clearThinkingFallbackTimer();
+          thinkingFallbackTimerRef.current = setTimeout(() => {
+            if (
+              isMountedRef.current &&
+              callActiveRef.current &&
+              sessionGenerationRef.current === generation &&
+              liveStatusRef.current === "thinking"
+            ) {
+              updateLiveStatus("listening");
+            }
+          }, 4500);
+        }
+
+        console.log("[VOICE] Speech ended -> audioStreamEnd sent");
       };
 
       let workletAttached = false;
@@ -2163,8 +2318,12 @@ export function InteractiveVoiceCallOverlay({
             }
             if (payload.type === "pcm" && payload.samples instanceof Int16Array) {
               sendPcmChunkToSession(payload.samples);
-            } else if (payload.type === "silence_gate_active") {
-              markUserStoppedSpeaking();
+            } else if (payload.type === "speech_active") {
+              if (liveStatusRef.current === "thinking") {
+                updateLiveStatus("listening");
+              }
+            } else if (payload.type === "speech_end_flush") {
+              handleNonDestructiveSpeechEndFlush();
             }
           };
 
@@ -2188,11 +2347,11 @@ export function InteractiveVoiceCallOverlay({
         }
       }
 
-      // Legacy fallback only when browser lacks AudioWorkletNode (512-sample small chunks + RMS noise gate)
+      // Legacy fallback only when browser lacks AudioWorkletNode (continuous un-gated 16kHz PCM + non-destructive flush)
       if (!workletAttached && typeof inputCtx.createScriptProcessor === "function") {
         const scriptNode = inputCtx.createScriptProcessor(512, 1, 1);
         liveScriptNodeRef.current = scriptNode;
-        const gateState = createSilenceGateState();
+        fallbackDetectorRef.current = createAdaptiveVoiceDetectorState();
 
         const silentGain = inputCtx.createGain();
         silentGain.gain.value = 0;
@@ -2204,32 +2363,27 @@ export function InteractiveVoiceCallOverlay({
             const copy = new Float32Array(ch0);
             const rms = computeFrameRms(copy);
             const frameMs = (copy.length / inputCtx.sampleRate) * 1000;
-            const gate = evaluateSilenceGate(
-              gateState,
+            const int16 = downsampleFloat32ToInt16Pcm(
+              copy,
+              inputCtx.sampleRate,
+              LIVE_INPUT_TARGET_SAMPLE_RATE
+            );
+
+            // ALWAYS stream intact mic PCM audio (zero gating)
+            sendPcmChunkToSession(int16);
+
+            const step = stepAdaptiveVoiceDetector(
+              fallbackDetectorRef.current,
               rms,
               frameMs,
-              LIVE_NOISE_GATE_RMS_THRESHOLD,
-              LIVE_NOISE_GATE_HOLD_MS
+              liveStatusRef.current === "speaking"
             );
-            if (gate.justActivatedAfterSpeech) {
-              markUserStoppedSpeaking();
-            }
-            if (gate.emitZeroSilence) {
-              const zeroLen = Math.max(
-                1,
-                Math.floor(
-                  copy.length /
-                    (inputCtx.sampleRate / LIVE_INPUT_TARGET_SAMPLE_RATE)
-                )
-              );
-              sendPcmChunkToSession(new Int16Array(zeroLen));
-            } else {
-              const int16 = downsampleFloat32ToInt16Pcm(
-                copy,
-                inputCtx.sampleRate,
-                LIVE_INPUT_TARGET_SAMPLE_RATE
-              );
-              sendPcmChunkToSession(int16);
+            if (step.event === "speech_start") {
+              if (liveStatusRef.current === "thinking") {
+                updateLiveStatus("listening");
+              }
+            } else if (step.event === "speech_end") {
+              handleNonDestructiveSpeechEndFlush();
             }
           }
         };
@@ -2239,7 +2393,7 @@ export function InteractiveVoiceCallOverlay({
         silentGain.connect(inputCtx.destination);
       }
     },
-    []
+    [clearThinkingFallbackTimer, updateLiveStatus]
   );
 
   const startLiveVoiceSession = useCallback(async () => {
@@ -2252,7 +2406,7 @@ export function InteractiveVoiceCallOverlay({
     setLiveError("");
     updateLiveStatus("connecting");
 
-    // 1. Acquire microphone with AEC + NS and AGC DISABLED (prevents ambient room noise amplification during silence)
+    // 1. Acquire microphone with AEC + NS + AGC enabled so soft/short utterances ("okey", "iya") are crystal clear
     if (
       typeof navigator === "undefined" ||
       !navigator.mediaDevices ||
@@ -2271,7 +2425,7 @@ export function InteractiveVoiceCallOverlay({
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
-          autoGainControl: false,
+          autoGainControl: true,
           channelCount: 1,
         },
       });
@@ -2394,7 +2548,7 @@ export function InteractiveVoiceCallOverlay({
     let disableThinkingConfig = false;
     let disableCustomVad = false;
 
-    const MAX_LIVE_ATTEMPTS = 5;
+    const MAX_LIVE_ATTEMPTS = 6;
 
     for (let attempt = 0; attempt < MAX_LIVE_ATTEMPTS; attempt++) {
       if (
@@ -2578,14 +2732,19 @@ export function InteractiveVoiceCallOverlay({
                 let receivedAudio = false;
                 for (const part of parts) {
                   if (part.inlineData?.data) {
+                    receivedAudio = true;
+                    enqueueLivePcmChunk(
+                      part.inlineData.data,
+                      part.inlineData.mimeType
+                    );
                     if (!loggedFirstAudioForTurnRef.current) {
                       loggedFirstAudioForTurnRef.current = true;
                       const deltaMs =
-                        userSilenceGateAtRef.current !== null
+                        speechEndedAtRef.current !== null
                           ? Math.max(
                               0,
                               Math.round(
-                                performance.now() - userSilenceGateAtRef.current
+                                performance.now() - speechEndedAtRef.current
                               )
                             )
                           : 0;
@@ -2593,11 +2752,6 @@ export function InteractiveVoiceCallOverlay({
                         `[VOICE] First AI audio chunk received (+${deltaMs} ms)`
                       );
                     }
-                    receivedAudio = true;
-                    enqueueLivePcmChunk(
-                      part.inlineData.data,
-                      part.inlineData.mimeType
-                    );
                   }
                 }
                 if (receivedAudio) {
@@ -2609,7 +2763,10 @@ export function InteractiveVoiceCallOverlay({
               if (content.groundingMetadata) {
                 if (hasGoogleSearchGrounding(content.groundingMetadata)) {
                   turnUsedGoogleSearchRef.current = true;
-                  if (liveStatusRef.current === "listening") {
+                  if (
+                    liveStatusRef.current === "listening" ||
+                    liveStatusRef.current === "thinking"
+                  ) {
                     updateLiveStatus("searching");
                   }
                 }
@@ -2628,44 +2785,64 @@ export function InteractiveVoiceCallOverlay({
                 }
               }
 
-              // 5. Live Streaming User Speech Transcription -> instant async bubble update
+              // 5. Live Streaming User Speech Transcription (strip <noise>/<inaudible> tags; never create empty bubbles)
               if (content.inputTranscription?.text) {
-                if (!loggedInputTranscriptForTurnRef.current) {
-                  loggedInputTranscriptForTurnRef.current = true;
-                  const deltaMs =
-                    userSilenceGateAtRef.current !== null
-                      ? Math.max(
-                          0,
-                          Math.round(
-                            performance.now() - userSilenceGateAtRef.current
-                          )
-                        )
-                      : 0;
-                  console.log(
-                    `[VOICE] Input transcript received (+${deltaMs} ms)`
-                  );
-                }
                 if (userTurnCommittedRef.current) {
                   userTurnCommittedRef.current = false;
                   userTurnIdRef.current = null;
                   userTurnTextRef.current = "";
                 }
                 userTurnTextRef.current += content.inputTranscription.text;
-                speechPulseRef.current = 0.6;
-                flushUserTranscriptNow();
+                const cleanedInput = sanitizeLiveTranscriptText(
+                  userTurnTextRef.current
+                );
+                if (cleanedInput.length > 0) {
+                  if (!loggedInputTranscriptForTurnRef.current) {
+                    loggedInputTranscriptForTurnRef.current = true;
+                    const deltaMs =
+                      speechEndedAtRef.current !== null
+                        ? Math.max(
+                            0,
+                            Math.round(
+                              performance.now() - speechEndedAtRef.current
+                            )
+                          )
+                        : 0;
+                    console.log(
+                      `[VOICE] Input transcript received (+${deltaMs} ms)`
+                    );
+                  }
+                  speechPulseRef.current = 0.6;
+                  flushUserTranscriptNow();
+                }
               }
 
               // 6. Live Streaming AI Speech Transcription -> instant async bubble update (`Auto · Suara`)
               if (content.outputTranscription?.text) {
                 commitUserTurnIfPending();
                 assistantTurnTextRef.current += content.outputTranscription.text;
-                ensureAssistantTurnId();
-                flushAssistantTranscriptNow();
+                if (
+                  sanitizeLiveTranscriptText(assistantTurnTextRef.current)
+                    .length > 0
+                ) {
+                  ensureAssistantTurnId();
+                  flushAssistantTranscriptNow();
+                }
               }
 
-              // 7. Turn Complete -> finalize room chat + 0ms PILAR AI AKTIF + Google Search badge + localStorage
+              // 7. Turn Complete -> finalize room chat, persist localStorage, and reset flush flag
               if (content.turnComplete) {
                 liveTurnCompleteRef.current = true;
+                resetDetectorTurnFlush(fallbackDetectorRef.current);
+                if (liveWorkletNodeRef.current) {
+                  try {
+                    liveWorkletNodeRef.current.port.postMessage({
+                      type: "turn_complete",
+                    });
+                  } catch {
+                    // ignore
+                  }
+                }
                 finalizeCurrentTurnAsync();
                 if (liveScheduledSourcesRef.current.size === 0) {
                   const ctx = liveOutputCtxRef.current;
@@ -2717,6 +2894,18 @@ export function InteractiveVoiceCallOverlay({
           return;
         }
 
+        // Start 400ms ambient noise-floor calibration cleanly now that Live connection is open
+        fallbackDetectorRef.current = createAdaptiveVoiceDetectorState();
+        if (liveWorkletNodeRef.current) {
+          try {
+            liveWorkletNodeRef.current.port.postMessage({
+              type: "reset_calibration",
+            });
+          } catch {
+            // ignore
+          }
+        }
+
         sessionRef.current = connectedSession;
         setLiveError("");
         updateLiveStatus("listening");
@@ -2735,7 +2924,7 @@ export function InteractiveVoiceCallOverlay({
         const isConfigRejection =
           parsedCode === 1007 ||
           parsedCode === 1008 ||
-          /invalid argument|unsupported|not supported|thinking/i.test(
+          /invalid argument|unsupported|not supported|thinking|activity/i.test(
             lastErrorReason
           );
 
@@ -2867,7 +3056,9 @@ export function InteractiveVoiceCallOverlay({
   const orbPhase: LivingOrbPhase =
     liveStatus === "speaking"
       ? "speaking"
-      : liveStatus === "connecting" || liveStatus === "searching"
+      : liveStatus === "connecting" ||
+          liveStatus === "thinking" ||
+          liveStatus === "searching"
         ? "thinking"
         : "listening";
 
@@ -2882,11 +3073,13 @@ export function InteractiveVoiceCallOverlay({
         ? "Mikrofon dibisukan"
         : liveStatus === "speaking"
           ? "AI sedang berbicara, ketuk Orb untuk menyela"
-          : liveStatus === "searching"
-            ? "AI sedang mencari di Google"
-            : liveStatus === "connecting"
-              ? "Menghubungkan ke Gemini Live Audio"
-              : "Live aktif dan mendengarkan suara Anda";
+          : liveStatus === "thinking"
+            ? "AI sedang memproses jawaban"
+            : liveStatus === "searching"
+              ? "AI sedang mencari di Google"
+              : liveStatus === "connecting"
+                ? "Menghubungkan ke Gemini Live Audio"
+                : "Live aktif dan mendengarkan suara Anda";
 
   return (
     <div
@@ -2922,10 +3115,12 @@ export function InteractiveVoiceCallOverlay({
               ? "bg-[#fef2f2]/95 text-[#b91c1c] border-[#b91c1c]/25"
               : liveStatus === "searching"
                 ? "bg-[#eff6ff]/95 text-[#0369a1] border-[#0369a1]/25"
-                : "bg-white/90 text-[#0B2B26] border-[#0B2B26]/12"
+                : liveStatus === "thinking"
+                  ? "bg-[#f0fdf9]/95 text-[#0E807E] border-[#0E807E]/25"
+                  : "bg-white/90 text-[#0B2B26] border-[#0B2B26]/12"
           }`}
         >
-          {liveStatus === "connecting" ? (
+          {liveStatus === "connecting" || liveStatus === "thinking" ? (
             <Loader2
               className="w-3 h-3 text-[#0E807E] animate-spin shrink-0"
               aria-hidden="true"

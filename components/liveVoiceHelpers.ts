@@ -1,8 +1,11 @@
 export type LiveVoiceName = "Aoede" | "Zephyr";
 
+export type LiveVadMode = "explicit" | "auto_stream_end";
+
 export type LiveConnectionStatus =
   | "connecting"
   | "listening"
+  | "thinking"
   | "speaking"
   | "searching"
   | "error";
@@ -19,28 +22,83 @@ export const LIVE_VOICE_OPTIONS: ReadonlyArray<{
 export const LIVE_STATUS_LABELS: Record<LiveConnectionStatus, string> = {
   connecting: "Menghubungkan Live Audio...",
   listening: "Live · Mendengarkan",
+  thinking: "Live · AI Berpikir...",
   speaking: "Live · AI Berbicara",
   searching: "Live · Mencari di Google",
   error: "Koneksi Live Terputus",
 };
 
 export const LIVE_INPUT_TARGET_SAMPLE_RATE = 16000;
-export const LIVE_INPUT_CHUNK_SAMPLES = 400; // 25ms @ 16kHz (within 20-32ms / 320-512 sample window)
-export const LIVE_NOISE_GATE_RMS_THRESHOLD = 0.012;
-export const LIVE_NOISE_GATE_HOLD_MS = 150;
+export const LIVE_INPUT_CHUNK_SAMPLES = 320; // 20ms @ 16kHz
+export const LIVE_NOISE_CALIBRATION_MS = 400;
+export const LIVE_MIN_SPEECH_MS = 100;
+export const LIVE_SPEECH_END_SILENCE_MS = 350;
+export const LIVE_USER_LISTENING_PLACEHOLDER = "Mendengarkan...";
 
-export interface SilenceGateState {
-  silenceMs: number;
-  gateActive: boolean;
-  hadSpeechBeforeGate: boolean;
+/**
+ * Strips system/noise tags such as `<noise>` or `<inaudible>` from Gemini Live
+ * transcriptions before rendering in the chat room.
+ */
+export function sanitizeLiveTranscriptText(raw: string): string {
+  if (!raw) return "";
+  return raw.replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
 }
 
-export function createSilenceGateState(): SilenceGateState {
+export interface AdaptiveVoiceDetectorState {
+  calibrated: boolean;
+  calibrationElapsedMs: number;
+  calibrationRmsSum: number;
+  calibrationFrameCount: number;
+  noiseFloor: number;
+  speechThreshold: number;
+  silenceThreshold: number;
+  speechElapsedMs: number;
+  hasQualifiedSpeech: boolean;
+  silenceElapsedMs: number;
+  flushSentForTurn: boolean;
+}
+
+export function createAdaptiveVoiceDetectorState(): AdaptiveVoiceDetectorState {
   return {
-    silenceMs: 0,
-    gateActive: false,
-    hadSpeechBeforeGate: false,
+    calibrated: false,
+    calibrationElapsedMs: 0,
+    calibrationRmsSum: 0,
+    calibrationFrameCount: 0,
+    noiseFloor: 0.004,
+    speechThreshold: 0.0088,
+    silenceThreshold: 0.0065,
+    speechElapsedMs: 0,
+    hasQualifiedSpeech: false,
+    silenceElapsedMs: 0,
+    flushSentForTurn: false,
   };
+}
+
+export function computeThresholdsFromNoiseFloor(noiseFloor: number): {
+  noiseFloor: number;
+  speechThreshold: number;
+  silenceThreshold: number;
+} {
+  const clampedFloor = Math.max(0.001, Math.min(0.05, noiseFloor));
+  const speechThreshold = Math.max(clampedFloor * 2.2, 0.008);
+  const silenceThreshold = Math.min(
+    Math.max(clampedFloor * 1.45, clampedFloor + 0.0025),
+    speechThreshold * 0.82
+  );
+  return {
+    noiseFloor: clampedFloor,
+    speechThreshold,
+    silenceThreshold,
+  };
+}
+
+export function resetDetectorTurnFlush(
+  state: AdaptiveVoiceDetectorState
+): void {
+  state.flushSentForTurn = false;
+  state.hasQualifiedSpeech = false;
+  state.speechElapsedMs = 0;
+  state.silenceElapsedMs = 0;
 }
 
 export function computeFrameRms(samples: Float32Array): number {
@@ -54,36 +112,97 @@ export function computeFrameRms(samples: Float32Array): number {
 }
 
 /**
- * Evaluates client-side RMS noise gate for a single audio frame.
- * Returns whether the frame should be replaced with pure digital zero silence
- * and whether the user just transitioned from speech into silence-gate active.
+ * Pure client-side NON-DESTRUCTIVE RMS monitor for audioStreamEnd flushing:
+ * - Never gates, mutes, or zeroes out audio frames.
+ * - Calibrates room noise floor during the first 400ms.
+ * - Requires RMS >= Math.max(noiseFloor * 2.2, 0.008) for >= 100ms, then
+ *   return near noiseFloor for 350ms to emit `speech_end` ONCE.
+ * - Will not emit `speech_end` again while silent until user speaks again
+ *   or `resetDetectorTurnFlush` is called on `turnComplete`.
  */
-export function evaluateSilenceGate(
-  state: SilenceGateState,
+export function stepAdaptiveVoiceDetector(
+  state: AdaptiveVoiceDetectorState,
   rms: number,
   frameDurationMs: number,
-  rmsThreshold = LIVE_NOISE_GATE_RMS_THRESHOLD,
-  holdMs = LIVE_NOISE_GATE_HOLD_MS
-): { emitZeroSilence: boolean; justActivatedAfterSpeech: boolean } {
-  if (rms >= rmsThreshold) {
-    state.silenceMs = 0;
-    state.gateActive = false;
-    state.hadSpeechBeforeGate = true;
-    return { emitZeroSilence: false, justActivatedAfterSpeech: false };
-  }
+  aiSpeaking = false
+): {
+  event: "none" | "calibrated" | "speech_start" | "speech_end";
+  isSpeaking: boolean;
+} {
+  const dt = Math.max(0, frameDurationMs);
 
-  state.silenceMs += Math.max(0, frameDurationMs);
-  if (state.silenceMs > holdMs) {
-    const wasActive = state.gateActive;
-    state.gateActive = true;
-    if (!wasActive && state.hadSpeechBeforeGate) {
-      state.hadSpeechBeforeGate = false;
-      return { emitZeroSilence: true, justActivatedAfterSpeech: true };
+  // Phase 1: 400ms automatic noise-floor calibration
+  if (!state.calibrated) {
+    state.calibrationElapsedMs += dt;
+    state.calibrationRmsSum += rms;
+    state.calibrationFrameCount += 1;
+
+    if (state.calibrationElapsedMs >= LIVE_NOISE_CALIBRATION_MS) {
+      const avgFloor =
+        state.calibrationFrameCount > 0
+          ? state.calibrationRmsSum / state.calibrationFrameCount
+          : 0.004;
+      const thresholds = computeThresholdsFromNoiseFloor(avgFloor);
+      state.noiseFloor = thresholds.noiseFloor;
+      state.speechThreshold = thresholds.speechThreshold;
+      state.silenceThreshold = thresholds.silenceThreshold;
+      state.calibrated = true;
+      return { event: "calibrated", isSpeaking: false };
     }
-    return { emitZeroSilence: true, justActivatedAfterSpeech: false };
+    return { event: "none", isSpeaking: false };
   }
 
-  return { emitZeroSilence: false, justActivatedAfterSpeech: false };
+  // Phase 2: Non-destructive speech activity & 350ms return-to-noise-floor detector
+  const activeSpeechThreshold = aiSpeaking
+    ? Math.max(state.speechThreshold * 1.8, 0.035)
+    : state.speechThreshold;
+
+  if (rms >= activeSpeechThreshold) {
+    const wasQualified = state.hasQualifiedSpeech;
+    state.speechElapsedMs += dt;
+    state.silenceElapsedMs = 0;
+
+    if (state.speechElapsedMs >= LIVE_MIN_SPEECH_MS) {
+      state.hasQualifiedSpeech = true;
+      state.flushSentForTurn = false;
+      if (!wasQualified) {
+        return { event: "speech_start", isSpeaking: true };
+      }
+    }
+    return { event: "none", isSpeaking: state.hasQualifiedSpeech };
+  }
+
+  if (state.hasQualifiedSpeech) {
+    if (rms <= state.silenceThreshold) {
+      state.silenceElapsedMs += dt;
+      if (
+        state.silenceElapsedMs >= LIVE_SPEECH_END_SILENCE_MS &&
+        !state.flushSentForTurn
+      ) {
+        state.flushSentForTurn = true;
+        state.hasQualifiedSpeech = false;
+        state.speechElapsedMs = 0;
+        state.silenceElapsedMs = 0;
+        return { event: "speech_end", isSpeaking: false };
+      }
+    } else {
+      // Mid-level vocal tail — keep holding without resetting qualified speech
+      state.silenceElapsedMs = 0;
+    }
+    return { event: "none", isSpeaking: true };
+  }
+
+  // Idle below speech threshold (not yet >= 100ms qualified speech)
+  state.speechElapsedMs = 0;
+  state.silenceElapsedMs = 0;
+  if (!aiSpeaking) {
+    const nextFloor = state.noiseFloor * 0.992 + rms * 0.008;
+    const thresholds = computeThresholdsFromNoiseFloor(nextFloor);
+    state.noiseFloor = thresholds.noiseFloor;
+    state.speechThreshold = thresholds.speechThreshold;
+    state.silenceThreshold = thresholds.silenceThreshold;
+  }
+  return { event: "none", isSpeaking: false };
 }
 
 /**
@@ -103,14 +222,15 @@ export function buildLiveVoiceSystemInstruction(
     "- Jika diminta membuat catatan/tabel di chat, panggil `create_chat_note`; jika diminta membuat Google Docs, panggil `create_google_doc`, lalu konfirmasi singkat dalam 1 kalimat.",
   ];
 
+  // Lightweight initial context summary only (never re-inject long formula history)
   const cleanContext =
     typeof recentContext === "string"
-      ? recentContext.replace(/\s+/g, " ").trim().slice(0, 380)
+      ? recentContext.replace(/\s+/g, " ").trim().slice(0, 220)
       : "";
 
   if (cleanContext) {
     lines.push(
-      `Konteks obrolan terakhir (gunakan hanya bila relevan): "${cleanContext}"`
+      `Ringkasan singkat konteks terakhir (pakai hanya jika relevan): "${cleanContext}"`
     );
   }
 
