@@ -718,11 +718,14 @@ interface LiveSessionConfigResponse {
   systemInstruction?: string;
   tools?: unknown[];
   wsUrl?: string;
+  lockedConfig?: boolean;
+  searchMode?: "hybrid" | "function_tool" | "none";
+  remainingCandidatesCount?: number;
   reason?: string;
 }
 
 const LIVE_TRANSCRIPT_THROTTLE_MS = 120;
-const LIVE_FALLBACK_LOOKAHEAD_SEC = 0.16;
+const LIVE_FALLBACK_LOOKAHEAD_SEC = 0.1;
 
 /**
  * Off-main-thread 16kHz Int16 PCM Mic Capture AudioWorklet:
@@ -808,8 +811,8 @@ class FormylabPcmRingPlayerProcessor extends AudioWorkletProcessor {
     this._writeIdx = 0;
     this._available = 0;
 
-    this._prebufferSamples = Math.round(sampleRate * 0.18); // 180ms adaptive jitter pre-buffer
-    this._rebufferSamples = Math.round(sampleRate * 0.14);  // 140ms recovery pre-buffer
+    this._prebufferSamples = Math.round(sampleRate * 0.1);  // 100ms low-latency jitter pre-buffer
+    this._rebufferSamples = Math.round(sampleRate * 0.12);  // 120ms recovery pre-buffer
     this._fadeSamples = Math.max(16, Math.round(sampleRate * 0.005)); // 5ms soft ramp
 
     this._isPlaying = false;
@@ -3024,6 +3027,7 @@ export function InteractiveVoiceCallOverlay({
           isMicMutedRef.current ||
           liveWsRef.current !== ws ||
           ws.readyState !== WebSocket.OPEN ||
+          ws.bufferedAmount > 64 * 1024 ||
           int16.length === 0
         ) {
           return;
@@ -3074,6 +3078,14 @@ export function InteractiveVoiceCallOverlay({
             liveWsRef.current !== ws ||
             inputCtx.state === "closed"
           ) {
+            try {
+              URL.revokeObjectURL(workletUrl);
+            } catch {
+              // ignore
+            }
+            if (liveWorkletUrlRef.current === workletUrl) {
+              liveWorkletUrlRef.current = null;
+            }
             return;
           }
 
@@ -3145,31 +3157,45 @@ export function InteractiveVoiceCallOverlay({
     setMicPermissionError("");
     updatePhase("listening");
 
-    // 1. Fetch short-lived Gemini Live ephemeral token & config from server
-    let sessionConfig: LiveSessionConfigResponse | null = null;
-    try {
-      const res = await fetch("/api/live-session", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          recentContext: recentContextRef.current,
-        }),
-      });
-      if (res.ok) {
-        sessionConfig = (await res.json()) as LiveSessionConfigResponse;
+    // Helper: request short-lived Gemini Live ephemeral token from server
+    const requestLiveSessionConfig = async (opts?: {
+      excludeModels?: string[];
+      preferSimpleTools?: boolean;
+      preferNoTools?: boolean;
+    }): Promise<LiveSessionConfigResponse | null> => {
+      try {
+        const res = await fetch("/api/live-session", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            recentContext: recentContextRef.current,
+            ...(opts?.excludeModels && opts.excludeModels.length > 0
+              ? { excludeModels: opts.excludeModels }
+              : {}),
+            ...(opts?.preferSimpleTools ? { preferSimpleTools: true } : {}),
+            ...(opts?.preferNoTools ? { preferNoTools: true } : {}),
+          }),
+        });
+        if (res.ok) {
+          return (await res.json()) as LiveSessionConfigResponse;
+        }
+      } catch {
+        return { fallbackMode: true };
       }
-    } catch {
-      sessionConfig = { fallbackMode: true };
-    }
+      return { fallbackMode: true };
+    };
+
+    // 1. Fetch initial short-lived Gemini Live ephemeral token & config from server
+    const initialConfig = await requestLiveSessionConfig();
 
     if (!isMountedRef.current || !callActiveRef.current || !isOpen) return;
 
     // Automatic fast-path HTTP voice fallback when Live ephemeral token isn't available
     if (
-      !sessionConfig ||
-      sessionConfig.fallbackMode ||
-      !sessionConfig.wsUrl ||
-      !sessionConfig.token ||
+      !initialConfig ||
+      initialConfig.fallbackMode ||
+      !initialConfig.wsUrl ||
+      !initialConfig.token ||
       typeof WebSocket === "undefined"
     ) {
       isLiveModeRef.current = false;
@@ -3178,7 +3204,7 @@ export function InteractiveVoiceCallOverlay({
       return;
     }
 
-    // 2. Request microphone stream with echo cancellation & noise suppression
+    // 2. Request microphone stream with echo cancellation & noise suppression (once per call)
     if (
       typeof navigator === "undefined" ||
       !navigator.mediaDevices ||
@@ -3254,7 +3280,7 @@ export function InteractiveVoiceCallOverlay({
     liveNextPlayTimeRef.current = 0;
     liveTurnCompleteRef.current = true;
 
-    // Attach 24kHz Ring Buffer AudioWorklet Player (180ms jitter pre-buffer + 5ms soft cross-fade)
+    // Attach 24kHz Ring Buffer AudioWorklet Player (100ms jitter pre-buffer + 5ms soft cross-fade)
     if (
       typeof AudioWorkletNode !== "undefined" &&
       outCtx.audioWorklet &&
@@ -3286,6 +3312,16 @@ export function InteractiveVoiceCallOverlay({
             }
           };
           livePlaybackWorkletNodeRef.current = playerNode;
+        } else {
+          try {
+            URL.revokeObjectURL(playerUrl);
+          } catch {
+            // ignore
+          }
+          if (livePlaybackWorkletUrlRef.current === playerUrl) {
+            livePlaybackWorkletUrlRef.current = null;
+          }
+          return;
         }
       } catch {
         // Cleanly falls back to lookahead AudioBufferSourceNode scheduler
@@ -3300,7 +3336,7 @@ export function InteractiveVoiceCallOverlay({
       }
     }
 
-    // 4. Open Native WebSocket to Gemini Live BidiGenerateContentConstrained
+    // 4. Open Native WebSocket to Gemini Live BidiGenerateContentConstrained with automatic multi-model failover
     const fallbackToFastHttpVoice = () => {
       if (!isMountedRef.current || !callActiveRef.current || !isOpen) return;
       cleanupLiveSessionResources();
@@ -3308,397 +3344,501 @@ export function InteractiveVoiceCallOverlay({
       startListeningRef.current();
     };
 
-    try {
+    const excludedModels: string[] = [];
+    let attemptCount = 0;
+    const MAX_LIVE_WS_ATTEMPTS = 4;
+
+    const connectLiveWebSocketWithConfig = (
+      sessionConfig: LiveSessionConfigResponse
+    ) => {
+      if (
+        !isMountedRef.current ||
+        !callActiveRef.current ||
+        !isOpen ||
+        !sessionConfig.wsUrl ||
+        !sessionConfig.token
+      ) {
+        fallbackToFastHttpVoice();
+        return;
+      }
+
+      attemptCount += 1;
       isLiveModeRef.current = true;
       liveSetupReadyRef.current = false;
 
-      const ws = new WebSocket(sessionConfig.wsUrl);
-      liveWsRef.current = ws;
+      let socketSettled = false;
 
-      // Safety watchdog: if Live handshake doesn't finish in 7s, gracefully switch to fast fallback
-      liveConnectTimerRef.current = setTimeout(() => {
-        if (
-          callActiveRef.current &&
-          liveWsRef.current === ws &&
-          !liveSetupReadyRef.current
-        ) {
-          fallbackToFastHttpVoice();
+      const handlePreSetupFailure = async (closeCode?: number) => {
+        if (socketSettled) return;
+        socketSettled = true;
+
+        if (liveConnectTimerRef.current) {
+          clearTimeout(liveConnectTimerRef.current);
+          liveConnectTimerRef.current = null;
         }
-      }, 7000);
 
-      const liveModelPath = (sessionConfig.model || "gemini-3.8-live").startsWith(
-        "models/"
-      )
-        ? sessionConfig.model!
-        : `models/${sessionConfig.model || "gemini-3.8-live"}`;
+        if (!isMountedRef.current || !callActiveRef.current || !isOpen) return;
 
-      ws.onopen = () => {
-        if (!callActiveRef.current || liveWsRef.current !== ws) return;
-        const setupPayload = {
-          setup: {
-            model: liveModelPath,
-            generationConfig: {
-              responseModalities: ["AUDIO"],
-              speechConfig: {
-                voiceConfig: {
-                  prebuiltVoiceConfig: {
-                    voiceName: sessionConfig?.voiceName || "Aoede",
+        // If connection already finished setup and later closed, fall back cleanly
+        if (liveSetupReadyRef.current || attemptCount >= MAX_LIVE_WS_ATTEMPTS) {
+          fallbackToFastHttpVoice();
+          return;
+        }
+
+        const failedModel = sessionConfig.model;
+        const isConfigRejection =
+          closeCode === 1007 || closeCode === 1008 || closeCode === 1003;
+
+        // If hybrid googleSearch + functionDeclarations was rejected on setup, retry same model with simple tools
+        if (
+          isConfigRejection &&
+          sessionConfig.searchMode === "hybrid" &&
+          failedModel
+        ) {
+          const nextCfg = await requestLiveSessionConfig({
+            excludeModels: excludedModels,
+            preferSimpleTools: true,
+          });
+          if (
+            isMountedRef.current &&
+            callActiveRef.current &&
+            isOpen &&
+            nextCfg &&
+            !nextCfg.fallbackMode &&
+            nextCfg.wsUrl &&
+            nextCfg.token
+          ) {
+            connectLiveWebSocketWithConfig(nextCfg);
+            return;
+          }
+        }
+
+        // Otherwise move to next Live Audio candidate model without re-requesting mic permission
+        if (failedModel && !excludedModels.includes(failedModel)) {
+          excludedModels.push(failedModel);
+        }
+
+        if ((sessionConfig.remainingCandidatesCount ?? 0) > 0) {
+          const nextCfg = await requestLiveSessionConfig({
+            excludeModels: excludedModels,
+          });
+          if (
+            isMountedRef.current &&
+            callActiveRef.current &&
+            isOpen &&
+            nextCfg &&
+            !nextCfg.fallbackMode &&
+            nextCfg.wsUrl &&
+            nextCfg.token
+          ) {
+            connectLiveWebSocketWithConfig(nextCfg);
+            return;
+          }
+        }
+
+        fallbackToFastHttpVoice();
+      };
+
+      try {
+        const ws = new WebSocket(sessionConfig.wsUrl);
+        liveWsRef.current = ws;
+
+        // Safety watchdog: if Live handshake doesn't finish in 5s, fail over cleanly
+        liveConnectTimerRef.current = setTimeout(() => {
+          if (
+            callActiveRef.current &&
+            liveWsRef.current === ws &&
+            !liveSetupReadyRef.current
+          ) {
+            try {
+              ws.onopen = null;
+              ws.onmessage = null;
+              ws.onerror = null;
+              ws.onclose = null;
+              ws.close(1000, "Live handshake timeout");
+            } catch {
+              // ignore
+            }
+            void handlePreSetupFailure(1006);
+          }
+        }, 5000);
+
+        const liveModelPath = (sessionConfig.model || "gemini-3.8-live").startsWith(
+          "models/"
+        )
+          ? sessionConfig.model!
+          : `models/${sessionConfig.model || "gemini-3.8-live"}`;
+
+        ws.onopen = () => {
+          if (!callActiveRef.current || liveWsRef.current !== ws) return;
+          const setupPayload = {
+            setup: {
+              model: liveModelPath,
+              generationConfig: {
+                responseModalities: ["AUDIO"],
+                speechConfig: {
+                  voiceConfig: {
+                    prebuiltVoiceConfig: {
+                      voiceName: sessionConfig?.voiceName || "Aoede",
+                    },
                   },
                 },
               },
+              ...(sessionConfig?.systemInstruction
+                ? {
+                    systemInstruction: {
+                      parts: [{ text: sessionConfig.systemInstruction }],
+                    },
+                  }
+                : {}),
+              ...(Array.isArray(sessionConfig?.tools) &&
+              sessionConfig.tools.length > 0
+                ? { tools: sessionConfig.tools }
+                : {}),
+              inputAudioTranscription: {},
+              outputAudioTranscription: {},
             },
-            ...(sessionConfig?.systemInstruction
-              ? {
-                  systemInstruction: {
-                    parts: [{ text: sessionConfig.systemInstruction }],
-                  },
-                }
-              : {}),
-            ...(Array.isArray(sessionConfig?.tools) &&
-            sessionConfig.tools.length > 0
-              ? { tools: sessionConfig.tools }
-              : {}),
-            inputAudioTranscription: {},
-            outputAudioTranscription: {},
-          },
-        };
-        try {
-          ws.send(JSON.stringify(setupPayload));
-        } catch {
-          fallbackToFastHttpVoice();
-        }
-      };
-
-      ws.onmessage = async (event: MessageEvent) => {
-        if (!callActiveRef.current || liveWsRef.current !== ws) return;
-
-        let rawText = "";
-        try {
-          if (typeof event.data === "string") {
-            rawText = event.data;
-          } else if (event.data instanceof Blob) {
-            rawText = await event.data.text();
-          } else if (event.data instanceof ArrayBuffer) {
-            rawText = new TextDecoder().decode(event.data);
-          }
-        } catch {
-          return;
-        }
-        if (!rawText) return;
-
-        let msg: {
-          setupComplete?: unknown;
-          toolCall?: {
-            functionCalls?: Array<{
-              id?: string;
-              name?: string;
-              args?: Record<string, unknown>;
-            }>;
           };
-          serverContent?: {
-            interrupted?: boolean;
-            turnComplete?: boolean;
-            inputTranscription?: { text?: string };
-            outputTranscription?: { text?: string };
-            groundingMetadata?: unknown;
-            modelTurn?: {
-              parts?: Array<{
-                text?: string;
-                inlineData?: { data?: string; mimeType?: string };
+          try {
+            ws.send(JSON.stringify(setupPayload));
+          } catch {
+            void handlePreSetupFailure(1006);
+          }
+        };
+
+        ws.onmessage = async (event: MessageEvent) => {
+          if (!callActiveRef.current || liveWsRef.current !== ws) return;
+
+          let rawText = "";
+          try {
+            if (typeof event.data === "string") {
+              rawText = event.data;
+            } else if (event.data instanceof Blob) {
+              rawText = await event.data.text();
+            } else if (event.data instanceof ArrayBuffer) {
+              rawText = new TextDecoder().decode(event.data);
+            }
+          } catch {
+            return;
+          }
+          if (!rawText) return;
+
+          let msg: {
+            setupComplete?: unknown;
+            toolCall?: {
+              functionCalls?: Array<{
+                id?: string;
+                name?: string;
+                args?: Record<string, unknown>;
               }>;
             };
+            serverContent?: {
+              interrupted?: boolean;
+              turnComplete?: boolean;
+              inputTranscription?: { text?: string };
+              outputTranscription?: { text?: string };
+              groundingMetadata?: unknown;
+              modelTurn?: {
+                parts?: Array<{
+                  text?: string;
+                  inlineData?: { data?: string; mimeType?: string };
+                }>;
+              };
+            };
           };
-        };
-        try {
-          msg = JSON.parse(rawText);
-        } catch {
-          return;
-        }
-
-        // Handshake complete -> begin continuous 16kHz PCM mic stream
-        if (msg.setupComplete !== undefined) {
-          if (liveConnectTimerRef.current) {
-            clearTimeout(liveConnectTimerRef.current);
-            liveConnectTimerRef.current = null;
+          try {
+            msg = JSON.parse(rawText);
+          } catch {
+            return;
           }
-          liveSetupReadyRef.current = true;
-          updatePhase("listening");
-          await startLiveMicStreaming(ws, micStream);
-          return;
-        }
 
-        // Real Gemini Live Tool Execution (`create_chat_note`, `create_google_doc`, `web_search`)
-        if (
-          msg.toolCall?.functionCalls &&
-          Array.isArray(msg.toolCall.functionCalls) &&
-          msg.toolCall.functionCalls.length > 0
-        ) {
-          commitLiveUserTurnIfPending();
-          const functionResponses: Array<{
-            id: string;
-            name: string;
-            response: Record<string, unknown>;
-          }> = [];
+          // Handshake complete -> begin continuous 16kHz PCM mic stream
+          if (msg.setupComplete !== undefined) {
+            if (liveConnectTimerRef.current) {
+              clearTimeout(liveConnectTimerRef.current);
+              liveConnectTimerRef.current = null;
+            }
+            liveSetupReadyRef.current = true;
+            updatePhase("listening");
+            await startLiveMicStreaming(ws, micStream);
+            return;
+          }
 
-          for (const call of msg.toolCall.functionCalls) {
-            const callId = call.id || `tool-${Date.now()}`;
-            const callName = call.name || "unknown";
-            if (callName === "create_chat_note") {
-              const normalized = normalizeChatNoteArtifact(call.args);
-              if (normalized) {
-                onCreateChatNoteRef.current?.(normalized);
-                functionResponses.push({
-                  id: callId,
-                  name: callName,
-                  response: {
-                    status: "success",
-                    title: normalized.title,
-                    format: normalized.format,
-                    message: "Catatan sudah ditampilkan langsung di room chat.",
-                  },
-                });
-              } else {
-                functionResponses.push({
-                  id: callId,
-                  name: callName,
-                  response: {
-                    status: "error",
-                    message: "Isi catatan kosong.",
-                  },
-                });
-              }
-            } else if (callName === "create_google_doc") {
-              const normalized = normalizeGoogleDocArtifact(call.args);
-              if (normalized) {
-                onCreateGoogleDocRef.current?.(normalized);
-                functionResponses.push({
-                  id: callId,
-                  name: callName,
-                  response: {
-                    status: "success",
-                    title: normalized.title,
-                    message:
-                      "Kartu Google Docs sudah ditampilkan langsung di room chat dan siap disimpan ke Google Drive.",
-                  },
-                });
-              } else {
-                functionResponses.push({
-                  id: callId,
-                  name: callName,
-                  response: {
-                    status: "error",
-                    message: "Isi dokumen Google Docs kosong.",
-                  },
-                });
-              }
-            } else if (callName === "web_search") {
-              const query = String(
-                (call.args as Record<string, unknown> | undefined)?.query ?? ""
-              ).trim();
-              if (!query) {
-                functionResponses.push({
-                  id: callId,
-                  name: callName,
-                  response: {
-                    status: "error",
-                    message: "Kata kunci pencarian kosong.",
-                  },
-                });
-              } else {
-                updatePhase("thinking");
-                try {
-                  const searchRes = await fetch("/api/web-search", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ query }),
+          // Real Gemini Live Tool Execution (`create_chat_note`, `create_google_doc`, `web_search`)
+          if (
+            msg.toolCall?.functionCalls &&
+            Array.isArray(msg.toolCall.functionCalls) &&
+            msg.toolCall.functionCalls.length > 0
+          ) {
+            commitLiveUserTurnIfPending();
+            const functionResponses: Array<{
+              id: string;
+              name: string;
+              response: Record<string, unknown>;
+            }> = [];
+
+            for (const call of msg.toolCall.functionCalls) {
+              const callId = call.id || `tool-${Date.now()}`;
+              const callName = call.name || "unknown";
+              if (callName === "create_chat_note") {
+                const normalized = normalizeChatNoteArtifact(call.args);
+                if (normalized) {
+                  onCreateChatNoteRef.current?.(normalized);
+                  functionResponses.push({
+                    id: callId,
+                    name: callName,
+                    response: {
+                      status: "success",
+                      title: normalized.title,
+                      format: normalized.format,
+                      message: "Catatan sudah ditampilkan langsung di room chat.",
+                    },
                   });
-                  const searchData = await searchRes.json().catch(() => ({}));
-                  const extractedSources: WebSourceCitation[] = Array.isArray(
-                    searchData?.sources
-                  )
-                    ? (searchData.sources as unknown[])
-                        .map((item) => normalizeWebSourceCitation(item))
-                        .filter(
-                          (item): item is WebSourceCitation => item !== null
-                        )
-                    : [];
-
-                  if (extractedSources.length > 0) {
-                    livePendingSourcesRef.current = mergeUniqueWebSources(
-                      livePendingSourcesRef.current,
-                      extractedSources
-                    );
-                    if (liveAssistantTurnIdRef.current) {
-                      emitPendingLiveWebSources(liveAssistantTurnIdRef.current);
-                    }
-                  }
-
-                  if (searchData?.success && searchData?.summary) {
-                    functionResponses.push({
-                      id: callId,
-                      name: callName,
-                      response: {
-                        status: "success",
-                        query,
-                        summary: searchData.summary,
-                        sources: extractedSources.map((s) => ({
-                          domain: s.domain,
-                          title: s.title,
-                          url: s.url,
-                        })),
-                      },
+                } else {
+                  functionResponses.push({
+                    id: callId,
+                    name: callName,
+                    response: {
+                      status: "error",
+                      message: "Isi catatan kosong.",
+                    },
+                  });
+                }
+              } else if (callName === "create_google_doc") {
+                const normalized = normalizeGoogleDocArtifact(call.args);
+                if (normalized) {
+                  onCreateGoogleDocRef.current?.(normalized);
+                  functionResponses.push({
+                    id: callId,
+                    name: callName,
+                    response: {
+                      status: "success",
+                      title: normalized.title,
+                      message:
+                        "Kartu Google Docs sudah ditampilkan langsung di room chat dan siap disimpan ke Google Drive.",
+                    },
+                  });
+                } else {
+                  functionResponses.push({
+                    id: callId,
+                    name: callName,
+                    response: {
+                      status: "error",
+                      message: "Isi dokumen Google Docs kosong.",
+                    },
+                  });
+                }
+              } else if (callName === "web_search") {
+                const query = String(
+                  (call.args as Record<string, unknown> | undefined)?.query ?? ""
+                ).trim();
+                if (!query) {
+                  functionResponses.push({
+                    id: callId,
+                    name: callName,
+                    response: {
+                      status: "error",
+                      message: "Kata kunci pencarian kosong.",
+                    },
+                  });
+                } else {
+                  updatePhase("thinking");
+                  try {
+                    const searchRes = await fetch("/api/web-search", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ query }),
                     });
-                  } else {
+                    const searchData = await searchRes.json().catch(() => ({}));
+                    const extractedSources: WebSourceCitation[] = Array.isArray(
+                      searchData?.sources
+                    )
+                      ? (searchData.sources as unknown[])
+                          .map((item) => normalizeWebSourceCitation(item))
+                          .filter(
+                            (item): item is WebSourceCitation => item !== null
+                          )
+                      : [];
+
+                    if (extractedSources.length > 0) {
+                      livePendingSourcesRef.current = mergeUniqueWebSources(
+                        livePendingSourcesRef.current,
+                        extractedSources
+                      );
+                      if (liveAssistantTurnIdRef.current) {
+                        emitPendingLiveWebSources(liveAssistantTurnIdRef.current);
+                      }
+                    }
+
+                    if (searchData?.success && searchData?.summary) {
+                      functionResponses.push({
+                        id: callId,
+                        name: callName,
+                        response: {
+                          status: "success",
+                          query,
+                          summary: searchData.summary,
+                          sources: extractedSources.map((s) => ({
+                            domain: s.domain,
+                            title: s.title,
+                            url: s.url,
+                          })),
+                        },
+                      });
+                    } else {
+                      functionResponses.push({
+                        id: callId,
+                        name: callName,
+                        response: {
+                          status: "error",
+                          query,
+                          message:
+                            searchData?.error ||
+                            "Pencarian internet belum menemukan hasil pasti.",
+                        },
+                      });
+                    }
+                  } catch {
                     functionResponses.push({
                       id: callId,
                       name: callName,
                       response: {
                         status: "error",
                         query,
-                        message:
-                          searchData?.error ||
-                          "Pencarian internet belum menemukan hasil pasti.",
+                        message: "Gagal menghubungi layanan pencarian internet.",
                       },
                     });
                   }
-                } catch {
-                  functionResponses.push({
-                    id: callId,
-                    name: callName,
-                    response: {
-                      status: "error",
-                      query,
-                      message: "Gagal menghubungi layanan pencarian internet.",
-                    },
-                  });
                 }
-              }
-            } else {
-              functionResponses.push({
-                id: callId,
-                name: callName,
-                response: {
-                  status: "error",
-                  message: `Tool ${callName} tidak tersedia.`,
-                },
-              });
-            }
-          }
-
-          if (ws.readyState === WebSocket.OPEN && functionResponses.length > 0) {
-            try {
-              ws.send(
-                JSON.stringify({
-                  toolResponse: {
-                    functionResponses,
+              } else {
+                functionResponses.push({
+                  id: callId,
+                  name: callName,
+                  response: {
+                    status: "error",
+                    message: `Tool ${callName} tidak tersedia.`,
                   },
-                })
-              );
-            } catch {
-              // ignore send error on closing socket
+                });
+              }
             }
+
+            if (ws.readyState === WebSocket.OPEN && functionResponses.length > 0) {
+              try {
+                ws.send(
+                  JSON.stringify({
+                    toolResponse: {
+                      functionResponses,
+                    },
+                  })
+                );
+              } catch {
+                // ignore send error on closing socket
+              }
+            }
+            return;
           }
-          return;
-        }
 
-        const content = msg.serverContent;
-        if (!content) return;
+          const content = msg.serverContent;
+          if (!content) return;
 
-        // Native Gemini Live Google Search grounding metadata (when hybrid mode is active)
-        if (content.groundingMetadata) {
-          const nativeSources = extractWebSourcesFromGroundingMetadata(
-            content.groundingMetadata,
-            6
-          );
-          if (nativeSources.length > 0) {
-            livePendingSourcesRef.current = mergeUniqueWebSources(
-              livePendingSourcesRef.current,
-              nativeSources
+          // Native Gemini Live Google Search grounding metadata (when hybrid mode is active)
+          if (content.groundingMetadata) {
+            const nativeSources = extractWebSourcesFromGroundingMetadata(
+              content.groundingMetadata,
+              6
             );
-            if (liveAssistantTurnIdRef.current) {
-              emitPendingLiveWebSources(liveAssistantTurnIdRef.current);
-            }
-          }
-        }
-
-        // True server-side Barge-In: user spoke over AI -> flush AudioWorklet ring buffer immediately
-        if (content.interrupted) {
-          interruptLivePlayback();
-          flushLiveTurnTranscripts();
-          updatePhase("listening");
-          return;
-        }
-
-        // Real-time user speech transcription -> accumulated & committed cleanly to right-side bubble
-        if (content.inputTranscription?.text) {
-          if (liveUserCommittedRef.current) {
-            liveUserCommittedRef.current = false;
-            liveInputTurnTextRef.current = "";
-          }
-          liveInputTurnTextRef.current += content.inputTranscription.text;
-          speechPulseRef.current = 0.55;
-        }
-
-        // Real-time AI speech transcription -> throttled max every 120ms so React never janks audio
-        if (content.outputTranscription?.text) {
-          commitLiveUserTurnIfPending();
-          liveOutputTurnTextRef.current += content.outputTranscription.text;
-          ensureLiveAssistantTurnId();
-          scheduleThrottledAssistantTranscriptFlush();
-        }
-
-        // Real-time 24kHz PCM audio output chunks -> AudioWorklet Ring Buffer Player
-        const parts = content.modelTurn?.parts;
-        if (Array.isArray(parts)) {
-          let hasAudioChunk = false;
-          for (const part of parts) {
-            if (part.inlineData?.data) {
-              hasAudioChunk = true;
-              scheduleLivePcmOutputChunk(
-                part.inlineData.data,
-                part.inlineData.mimeType
+            if (nativeSources.length > 0) {
+              livePendingSourcesRef.current = mergeUniqueWebSources(
+                livePendingSourcesRef.current,
+                nativeSources
               );
+              if (liveAssistantTurnIdRef.current) {
+                emitPendingLiveWebSources(liveAssistantTurnIdRef.current);
+              }
             }
           }
-          if (hasAudioChunk) {
-            commitLiveUserTurnIfPending();
-          }
-        }
 
-        // Turn complete -> finalize live chat bubble & signal worklet to drain remaining ring buffer
-        if (content.turnComplete) {
-          liveTurnCompleteRef.current = true;
-          flushLiveTurnTranscripts();
-          if (livePlaybackWorkletNodeRef.current) {
-            try {
-              livePlaybackWorkletNodeRef.current.port.postMessage({
-                type: "turnComplete",
-              });
-            } catch {
-              // ignore
-            }
-          } else if (liveScheduledSourcesRef.current.size === 0) {
-            liveNextPlayTimeRef.current = 0;
-            activeAnalyserRef.current = liveMicAnalyserRef.current;
+          // True server-side Barge-In: user spoke over AI -> flush AudioWorklet ring buffer immediately
+          if (content.interrupted) {
+            interruptLivePlayback();
+            flushLiveTurnTranscripts();
             updatePhase("listening");
+            return;
           }
-        }
-      };
 
-      ws.onerror = () => {
-        if (callActiveRef.current && liveWsRef.current === ws) {
-          fallbackToFastHttpVoice();
-        }
-      };
+          // Real-time user speech transcription -> accumulated & committed cleanly to right-side bubble
+          if (content.inputTranscription?.text) {
+            if (liveUserCommittedRef.current) {
+              liveUserCommittedRef.current = false;
+              liveInputTurnTextRef.current = "";
+            }
+            liveInputTurnTextRef.current += content.inputTranscription.text;
+            speechPulseRef.current = 0.55;
+          }
 
-      ws.onclose = () => {
-        if (callActiveRef.current && liveWsRef.current === ws) {
-          fallbackToFastHttpVoice();
-        }
-      };
-    } catch {
-      fallbackToFastHttpVoice();
-    }
+          // Real-time AI speech transcription -> throttled max every 120ms so React never janks audio
+          if (content.outputTranscription?.text) {
+            commitLiveUserTurnIfPending();
+            liveOutputTurnTextRef.current += content.outputTranscription.text;
+            ensureLiveAssistantTurnId();
+            scheduleThrottledAssistantTranscriptFlush();
+          }
+
+          // Real-time 24kHz PCM audio output chunks -> AudioWorklet Ring Buffer Player
+          const parts = content.modelTurn?.parts;
+          if (Array.isArray(parts)) {
+            let hasAudioChunk = false;
+            for (const part of parts) {
+              if (part.inlineData?.data) {
+                hasAudioChunk = true;
+                scheduleLivePcmOutputChunk(
+                  part.inlineData.data,
+                  part.inlineData.mimeType
+                );
+              }
+            }
+            if (hasAudioChunk) {
+              commitLiveUserTurnIfPending();
+            }
+          }
+
+          // Turn complete -> finalize live chat bubble & signal worklet to drain remaining ring buffer
+          if (content.turnComplete) {
+            liveTurnCompleteRef.current = true;
+            flushLiveTurnTranscripts();
+            if (livePlaybackWorkletNodeRef.current) {
+              try {
+                livePlaybackWorkletNodeRef.current.port.postMessage({
+                  type: "turnComplete",
+                });
+              } catch {
+                // ignore
+              }
+            } else if (liveScheduledSourcesRef.current.size === 0) {
+              liveNextPlayTimeRef.current = 0;
+              activeAnalyserRef.current = liveMicAnalyserRef.current;
+              updatePhase("listening");
+            }
+          }
+        };
+
+        ws.onerror = () => {
+          if (callActiveRef.current && liveWsRef.current === ws) {
+            void handlePreSetupFailure(1006);
+          }
+        };
+
+        ws.onclose = (closeEvent) => {
+          if (callActiveRef.current && liveWsRef.current === ws) {
+            void handlePreSetupFailure(closeEvent?.code);
+          }
+        };
+      } catch {
+        void handlePreSetupFailure(1006);
+      }
+    };
+
+    connectLiveWebSocketWithConfig(initialConfig);
   }, [
     cleanupLiveSessionResources,
     commitLiveUserTurnIfPending,

@@ -561,6 +561,8 @@ async function generateVoiceCallFastReply(params: {
           }
         : undefined;
 
+    const voiceMaxOutputTokens = wantsArtifactTool ? undefined : 320;
+
     // 1. On Gemini 3/4 models, attempt hybrid mode (googleSearch + functionDeclarations with includeServerSideToolInvocations)
     if (isGemini3Or4) {
       try {
@@ -571,6 +573,9 @@ async function generateVoiceCallFastReply(params: {
             systemInstruction: params.systemInstruction,
             tools: [{ googleSearch: {} }, ...SDK_CREATE_CHAT_NOTE_TOOLS],
             toolConfig: { includeServerSideToolInvocations: true },
+            ...(voiceMaxOutputTokens
+              ? { maxOutputTokens: voiceMaxOutputTokens }
+              : {}),
             ...(fastThinkingConfig ? { thinkingConfig: fastThinkingConfig } : {}),
           },
         });
@@ -613,6 +618,9 @@ async function generateVoiceCallFastReply(params: {
           config: {
             systemInstruction: params.systemInstruction,
             tools: [{ googleSearch: {} }],
+            ...(voiceMaxOutputTokens
+              ? { maxOutputTokens: voiceMaxOutputTokens }
+              : {}),
             ...(fastThinkingConfig ? { thinkingConfig: fastThinkingConfig } : {}),
           },
         });
@@ -646,6 +654,9 @@ async function generateVoiceCallFastReply(params: {
         config: {
           systemInstruction: params.systemInstruction,
           tools: SDK_CREATE_CHAT_NOTE_TOOLS,
+          ...(voiceMaxOutputTokens
+            ? { maxOutputTokens: voiceMaxOutputTokens }
+            : {}),
           ...(fastThinkingConfig ? { thinkingConfig: fastThinkingConfig } : {}),
         },
       });
@@ -937,6 +948,7 @@ async function synthesizeVoiceCallNativeAudio(
   const ttsText = cleanText.length > 1400 ? `${cleanText.slice(0, 1400).trim()}.` : cleanText;
 
   const ttsCandidates: Array<{ model: string; voiceName: string }> = [
+    { model: "gemini-3.8-flash-lite-tts", voiceName: "Aoede" },
     { model: "gemini-2.5-flash-preview-tts", voiceName: "Aoede" },
     { model: "gemini-3.8-flash-lite-tts", voiceName: "Kore" },
     { model: "gemini-2.5-flash-preview-tts", voiceName: "Kore" },

@@ -168,13 +168,46 @@ export async function POST(req: NextRequest) {
     }
 
     let recentContext = "";
+    let excludeModelSet = new Set<string>();
+    let preferSimpleTools = false;
+    let preferNoTools = false;
     try {
       const body = await req.json();
       if (typeof body?.recentContext === "string") {
         recentContext = body.recentContext;
       }
+      if (Array.isArray(body?.excludeModels)) {
+        const validKnownModels = new Set<string>(LIVE_AUDIO_MODELS);
+        excludeModelSet = new Set(
+          body.excludeModels
+            .slice(0, 10)
+            .filter(
+              (item: unknown): item is string =>
+                typeof item === "string" && validKnownModels.has(item)
+            )
+        );
+      }
+      if (body?.preferSimpleTools === true) {
+        preferSimpleTools = true;
+      }
+      if (body?.preferNoTools === true) {
+        preferNoTools = true;
+      }
     } catch {
       // Empty body is valid
+    }
+
+    const candidateModels = LIVE_AUDIO_MODELS.filter(
+      (modelId) => !excludeModelSet.has(modelId)
+    );
+    if (candidateModels.length === 0) {
+      return NextResponse.json({
+        success: false,
+        fallbackMode: true,
+        remainingCandidatesCount: 0,
+        reason:
+          "Seluruh kandidat model Gemini Live Audio telah dicoba pada sesi ini.",
+      });
     }
 
     const systemInstruction = buildLiveVoiceSystemInstruction(recentContext);
@@ -193,6 +226,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({
         success: false,
         fallbackMode: true,
+        remainingCandidatesCount: 0,
         reason: "SDK authTokens.create tidak tersedia pada versi saat ini.",
       });
     }
@@ -202,105 +236,114 @@ export async function POST(req: NextRequest) {
     const newSessionExpireTime = new Date(nowMs + 90 * 1000).toISOString();
     const attemptErrors: string[] = [];
 
-    for (const modelId of LIVE_AUDIO_MODELS) {
+    for (let idx = 0; idx < candidateModels.length; idx++) {
+      const modelId = candidateModels[idx];
+      const remainingCandidatesCount = candidateModels.length - idx - 1;
+
       for (const voiceName of PREFERRED_LIVE_VOICES) {
         // Attempt 1A: Try constrained ephemeral token with hybrid tools (native googleSearch + functionDeclarations)
-        try {
-          const tokenRes = await ai.authTokens.create({
-            config: {
-              uses: 1,
-              expireTime,
-              newSessionExpireTime,
-              liveConnectConstraints: {
-                model: modelId,
-                config: {
-                  responseModalities: [Modality.AUDIO],
-                  speechConfig: {
-                    voiceConfig: {
-                      prebuiltVoiceConfig: {
-                        voiceName,
+        if (!preferSimpleTools && !preferNoTools) {
+          try {
+            const tokenRes = await ai.authTokens.create({
+              config: {
+                uses: 1,
+                expireTime,
+                newSessionExpireTime,
+                liveConnectConstraints: {
+                  model: modelId,
+                  config: {
+                    responseModalities: [Modality.AUDIO],
+                    speechConfig: {
+                      voiceConfig: {
+                        prebuiltVoiceConfig: {
+                          voiceName,
+                        },
                       },
                     },
+                    systemInstruction,
+                    tools: SDK_LIVE_HYBRID_TOOLS,
+                    inputAudioTranscription: {},
+                    outputAudioTranscription: {},
                   },
-                  systemInstruction,
-                  tools: SDK_LIVE_HYBRID_TOOLS,
-                  inputAudioTranscription: {},
-                  outputAudioTranscription: {},
                 },
               },
-            },
-          });
-
-          if (tokenRes?.name) {
-            return NextResponse.json({
-              success: true,
-              fallbackMode: false,
-              token: tokenRes.name,
-              model: modelId,
-              voiceName,
-              systemInstruction,
-              tools: WS_LIVE_HYBRID_TOOLS,
-              wsUrl: buildLiveWsUrl(tokenRes.name),
-              expireTime,
-              lockedConfig: true,
-              searchMode: "hybrid",
             });
+
+            if (tokenRes?.name) {
+              return NextResponse.json({
+                success: true,
+                fallbackMode: false,
+                token: tokenRes.name,
+                model: modelId,
+                voiceName,
+                systemInstruction,
+                tools: WS_LIVE_HYBRID_TOOLS,
+                wsUrl: buildLiveWsUrl(tokenRes.name),
+                expireTime,
+                lockedConfig: true,
+                searchMode: "hybrid",
+                remainingCandidatesCount,
+              });
+            }
+          } catch (hybridErr: unknown) {
+            const msg =
+              hybridErr instanceof Error ? hybridErr.message : String(hybridErr);
+            attemptErrors.push(`[${modelId}/${voiceName}:hybrid] ${msg}`);
           }
-        } catch (hybridErr: unknown) {
-          const msg =
-            hybridErr instanceof Error ? hybridErr.message : String(hybridErr);
-          attemptErrors.push(`[${modelId}/${voiceName}:hybrid] ${msg}`);
         }
 
         // Attempt 1B: Safe compatibility fallback -> functionDeclarations only (includes `web_search` backed by Gemini googleSearch)
-        try {
-          const tokenRes = await ai.authTokens.create({
-            config: {
-              uses: 1,
-              expireTime,
-              newSessionExpireTime,
-              liveConnectConstraints: {
-                model: modelId,
-                config: {
-                  responseModalities: [Modality.AUDIO],
-                  speechConfig: {
-                    voiceConfig: {
-                      prebuiltVoiceConfig: {
-                        voiceName,
+        if (!preferNoTools) {
+          try {
+            const tokenRes = await ai.authTokens.create({
+              config: {
+                uses: 1,
+                expireTime,
+                newSessionExpireTime,
+                liveConnectConstraints: {
+                  model: modelId,
+                  config: {
+                    responseModalities: [Modality.AUDIO],
+                    speechConfig: {
+                      voiceConfig: {
+                        prebuiltVoiceConfig: {
+                          voiceName,
+                        },
                       },
                     },
+                    systemInstruction,
+                    tools: SDK_LIVE_FUNCTION_TOOLS,
+                    inputAudioTranscription: {},
+                    outputAudioTranscription: {},
                   },
-                  systemInstruction,
-                  tools: SDK_LIVE_FUNCTION_TOOLS,
-                  inputAudioTranscription: {},
-                  outputAudioTranscription: {},
                 },
               },
-            },
-          });
-
-          if (tokenRes?.name) {
-            return NextResponse.json({
-              success: true,
-              fallbackMode: false,
-              token: tokenRes.name,
-              model: modelId,
-              voiceName,
-              systemInstruction,
-              tools: WS_LIVE_FUNCTION_TOOLS,
-              wsUrl: buildLiveWsUrl(tokenRes.name),
-              expireTime,
-              lockedConfig: true,
-              searchMode: "function_tool",
             });
+
+            if (tokenRes?.name) {
+              return NextResponse.json({
+                success: true,
+                fallbackMode: false,
+                token: tokenRes.name,
+                model: modelId,
+                voiceName,
+                systemInstruction,
+                tools: WS_LIVE_FUNCTION_TOOLS,
+                wsUrl: buildLiveWsUrl(tokenRes.name),
+                expireTime,
+                lockedConfig: true,
+                searchMode: "function_tool",
+                remainingCandidatesCount,
+              });
+            }
+          } catch (lockedErr: unknown) {
+            const msg =
+              lockedErr instanceof Error ? lockedErr.message : String(lockedErr);
+            attemptErrors.push(`[${modelId}/${voiceName}:locked] ${msg}`);
           }
-        } catch (lockedErr: unknown) {
-          const msg =
-            lockedErr instanceof Error ? lockedErr.message : String(lockedErr);
-          attemptErrors.push(`[${modelId}/${voiceName}:locked] ${msg}`);
         }
 
-        // Attempt 2: Model-constrained ephemeral token (client sends safe functionDeclarations setup payload)
+        // Attempt 2: Model-constrained ephemeral token (pure audio or client-configured tools)
         try {
           const tokenRes = await ai.authTokens.create({
             config: {
@@ -321,11 +364,12 @@ export async function POST(req: NextRequest) {
               model: modelId,
               voiceName,
               systemInstruction,
-              tools: WS_LIVE_FUNCTION_TOOLS,
+              tools: preferNoTools ? [] : WS_LIVE_FUNCTION_TOOLS,
               wsUrl: buildLiveWsUrl(tokenRes.name),
               expireTime,
               lockedConfig: false,
-              searchMode: "function_tool",
+              searchMode: preferNoTools ? "none" : "function_tool",
+              remainingCandidatesCount,
             });
           }
         } catch (modelOnlyErr: unknown) {
@@ -344,6 +388,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       success: false,
       fallbackMode: true,
+      remainingCandidatesCount: 0,
       reason:
         attemptErrors[0] ||
         "Ephemeral token Gemini Live tidak dapat diterbitkan di environment ini.",
@@ -353,6 +398,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       success: false,
       fallbackMode: true,
+      remainingCandidatesCount: 0,
       reason: msg,
     });
   }
