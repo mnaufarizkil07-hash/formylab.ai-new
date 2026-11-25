@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import {
   LIVE_INPUT_CHUNK_SAMPLES,
   LIVE_STATUS_LABELS,
+  LIVE_TRANSCRIPT_THROTTLE_MS,
+  LIVE_VOICE_OPTIONS,
   base64PcmToFloat32,
   buildLiveVoiceSystemInstruction,
   classifyLiveVoicePillars,
@@ -13,16 +15,22 @@ import {
   int16PcmToBase64,
   parsePcmSampleRate,
   sanitizeLiveTranscriptText,
+  sanitizeLiveUserTranscript,
 } from "./liveVoiceHelpers";
 
-test("Live Voice constants use 40ms (640-sample) 16kHz chunks and natural GPT-Voice-style status labels without thinking", () => {
+test("Live Voice constants use 40ms (640-sample) 16kHz chunks, 100ms transcript throttle, 4 natural voices, and no thinking label", () => {
   assert.equal(LIVE_INPUT_CHUNK_SAMPLES, 640); // ~40ms @ 16kHz
+  assert.equal(LIVE_TRANSCRIPT_THROTTLE_MS, 100);
+  assert.deepEqual(
+    LIVE_VOICE_OPTIONS.map((v) => v.id),
+    ["Aoede", "Zephyr", "Kore", "Puck"]
+  );
   assert.equal(LIVE_STATUS_LABELS.listening, "Live · Mendengarkan");
   assert.equal(LIVE_STATUS_LABELS.speaking, "Live · AI Berbicara");
   assert.equal("thinking" in LIVE_STATUS_LABELS, false);
 });
 
-test("sanitizeLiveTranscriptText strips <noise> and <inaudible> tags cleanly without creating empty bubbles", () => {
+test("sanitizeLiveTranscriptText & sanitizeLiveUserTranscript strip noise tags and stray leading punctuation", () => {
   assert.equal(sanitizeLiveTranscriptText("<noise>"), "");
   assert.equal(sanitizeLiveTranscriptText("  <inaudible>  <noise> "), "");
   assert.equal(
@@ -33,6 +41,17 @@ test("sanitizeLiveTranscriptText strips <noise> and <inaudible> tags cleanly wit
     sanitizeLiveTranscriptText("  Halo   semuanya  "),
     "Halo semuanya"
   );
+
+  // Leading punctuation from VAD onset must be stripped cleanly
+  assert.equal(
+    sanitizeLiveUserTranscript(". Oke, langsung buat resepnya."),
+    "Oke, langsung buat resepnya."
+  );
+  assert.equal(
+    sanitizeLiveUserTranscript("... , !? ; :  Buatin moisturizer ringan."),
+    "Buatin moisturizer ringan."
+  );
+  assert.equal(sanitizeLiveUserTranscript("... <noise> , "), "");
 });
 
 test("classifyLiveVoicePillars classifies 0ms locally with Interactive/Generative/Analytical", () => {
@@ -93,15 +112,18 @@ test("parsePcmSampleRate extracts rate from mimeType or falls back cleanly", () 
   assert.equal(parsePcmSampleRate(undefined, 24000), 24000);
 });
 
-test("buildLiveVoiceSystemInstruction adapts cleanly for pure voice (Search OFF) and grounded mode (Search ON)", () => {
+test("buildLiveVoiceSystemInstruction enforces natural phone-call Indonesian style and opt-in Search", () => {
   const purePrompt = buildLiveVoiceSystemInstruction(
     "Diskusi moisturizer ceramide",
     false
   );
-  assert.ok(purePrompt.length < 1100);
+  assert.ok(purePrompt.length < 1300);
   assert.equal(purePrompt.includes("googleSearch"), false);
   assert.equal(purePrompt.includes("create_chat_note"), false);
   assert.equal(purePrompt.includes("create_google_doc"), false);
+  assert.ok(purePrompt.includes("telepon"));
+  assert.ok(purePrompt.includes("Oke, gampangnya gini"));
+  assert.ok(purePrompt.includes("Formulator"));
   assert.ok(purePrompt.includes("Diskusi moisturizer ceramide"));
 
   const searchPrompt = buildLiveVoiceSystemInstruction(
@@ -109,8 +131,7 @@ test("buildLiveVoiceSystemInstruction adapts cleanly for pure voice (Search OFF)
     true
   );
   assert.ok(searchPrompt.includes("HANYA gunakan tool googleSearch"));
-  assert.ok(searchPrompt.includes("JAWAB LANGSUNG"));
-  assert.ok(searchPrompt.includes("DILARANG menyebutkan simbol markdown"));
+  assert.ok(searchPrompt.includes("DILARANG membacakan tanda kurung"));
 });
 
 test("hasGoogleSearchGrounding detects search queries or grounding chunks", () => {

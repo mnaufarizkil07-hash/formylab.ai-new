@@ -34,6 +34,7 @@ import {
   LIVE_INPUT_CHUNK_SAMPLES,
   LIVE_INPUT_TARGET_SAMPLE_RATE,
   LIVE_STATUS_LABELS,
+  LIVE_TRANSCRIPT_THROTTLE_MS,
   LIVE_VOICE_OPTIONS,
   LiveConnectionStatus,
   LiveVoiceName,
@@ -45,6 +46,7 @@ import {
   int16PcmToBase64,
   parsePcmSampleRate,
   sanitizeLiveTranscriptText,
+  sanitizeLiveUserTranscript,
 } from "./liveVoiceHelpers";
 
 export interface VoiceSynthesisState {
@@ -754,11 +756,13 @@ interface LiveTokenApiResponse {
   tools?: Tool[];
   thinkingConfig?: LiveConnectConfig["thinkingConfig"];
   realtimeInputConfig?: LiveConnectConfig["realtimeInputConfig"];
+  contextWindowCompression?: LiveConnectConfig["contextWindowCompression"];
+  enableAffectiveDialog?: boolean;
   remainingCandidatesCount?: number;
   error?: string;
 }
 
-const LIVE_FIRST_CHUNK_LEAD_SEC = 0.015;
+const LIVE_FIRST_CHUNK_LEAD_SEC = 0.03;
 
 // Short-lived in-memory cooldown for models that failed WS setup (e.g., quota 1011)
 // so subsequent voice sessions connect on the first attempt without extra round-trip latency.
@@ -1687,14 +1691,20 @@ export function InteractiveVoiceCallOverlay({
   const userTurnIdRef = useRef<string | null>(null);
   const userTurnTextRef = useRef<string>("");
   const userTurnCommittedRef = useRef<boolean>(false);
+  const userFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const assistantTurnIdRef = useRef<string | null>(null);
   const assistantTurnTextRef = useRef<string>("");
+  const assistantFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null
+  );
 
   const turnPendingSourcesRef = useRef<WebSourceCitation[]>([]);
   const turnUsedGoogleSearchRef = useRef<boolean>(false);
 
-  // Per-turn diagnostic log flags
+  // Per-turn diagnostic log & multi-turn counter refs
+  const turnCounterRef = useRef<number>(0);
+  const activeTurnNumberRef = useRef<number>(0);
   const loggedAiAudioStartedForTurnRef = useRef<boolean>(false);
 
   const startLiveSessionRef = useRef<() => Promise<void>>(async () => {});
@@ -1702,6 +1712,25 @@ export function InteractiveVoiceCallOverlay({
   const updateLiveStatus = useCallback((next: LiveConnectionStatus) => {
     liveStatusRef.current = next;
     setLiveStatus(next);
+  }, []);
+
+  const ensureActiveTurnNumber = useCallback((): number => {
+    if (activeTurnNumberRef.current === 0) {
+      turnCounterRef.current += 1;
+      activeTurnNumberRef.current = turnCounterRef.current;
+    }
+    return activeTurnNumberRef.current;
+  }, []);
+
+  const clearTranscriptThrottleTimers = useCallback(() => {
+    if (userFlushTimerRef.current !== null) {
+      clearTimeout(userFlushTimerRef.current);
+      userFlushTimerRef.current = null;
+    }
+    if (assistantFlushTimerRef.current !== null) {
+      clearTimeout(assistantFlushTimerRef.current);
+      assistantFlushTimerRef.current = null;
+    }
   }, []);
 
   const ensureUserTurnId = useCallback((): string => {
@@ -1723,13 +1752,21 @@ export function InteractiveVoiceCallOverlay({
   }, []);
 
   const flushUserTranscriptNow = useCallback(() => {
-    const clean = sanitizeLiveTranscriptText(userTurnTextRef.current);
+    const clean = sanitizeLiveUserTranscript(userTurnTextRef.current);
     if (!clean) return;
     const turnId = ensureUserTurnId();
     queueMicrotask(() => {
       onLiveUserStreamRef.current?.(turnId, clean);
     });
   }, [ensureUserTurnId]);
+
+  const scheduleUserTranscriptFlush = useCallback(() => {
+    if (userFlushTimerRef.current !== null) return;
+    userFlushTimerRef.current = setTimeout(() => {
+      userFlushTimerRef.current = null;
+      flushUserTranscriptNow();
+    }, LIVE_TRANSCRIPT_THROTTLE_MS);
+  }, [flushUserTranscriptNow]);
 
   const emitPendingSourcesAsync = useCallback((turnId: string) => {
     if (turnPendingSourcesRef.current.length === 0) return;
@@ -1749,17 +1786,31 @@ export function InteractiveVoiceCallOverlay({
     emitPendingSourcesAsync(turnId);
   }, [emitPendingSourcesAsync, ensureAssistantTurnId]);
 
+  const scheduleAssistantTranscriptFlush = useCallback(() => {
+    if (assistantFlushTimerRef.current !== null) return;
+    assistantFlushTimerRef.current = setTimeout(() => {
+      assistantFlushTimerRef.current = null;
+      flushAssistantTranscriptNow();
+    }, LIVE_TRANSCRIPT_THROTTLE_MS);
+  }, [flushAssistantTranscriptNow]);
+
   const commitUserTurnIfPending = useCallback(() => {
     if (userTurnCommittedRef.current) return;
-    const clean = sanitizeLiveTranscriptText(userTurnTextRef.current);
+    if (userFlushTimerRef.current !== null) {
+      clearTimeout(userFlushTimerRef.current);
+      userFlushTimerRef.current = null;
+    }
+    const clean = sanitizeLiveUserTranscript(userTurnTextRef.current);
     if (!clean) return;
     userTurnCommittedRef.current = true;
     flushUserTranscriptNow();
   }, [flushUserTranscriptNow]);
 
   const finalizeCurrentTurnAsync = useCallback(() => {
+    clearTranscriptThrottleTimers();
+
     const existingUserId = userTurnIdRef.current;
-    const finalUserText = sanitizeLiveTranscriptText(userTurnTextRef.current);
+    const finalUserText = sanitizeLiveUserTranscript(userTurnTextRef.current);
     const finalUserId = finalUserText ? ensureUserTurnId() : undefined;
 
     const finalAiText = sanitizeLiveTranscriptText(assistantTurnTextRef.current);
@@ -1778,6 +1829,7 @@ export function InteractiveVoiceCallOverlay({
     turnPendingSourcesRef.current = [];
     turnUsedGoogleSearchRef.current = false;
     loggedAiAudioStartedForTurnRef.current = false;
+    activeTurnNumberRef.current = 0;
 
     if (!finalUserText && existingUserId) {
       queueMicrotask(() => {
@@ -1787,7 +1839,7 @@ export function InteractiveVoiceCallOverlay({
 
     if (!finalUserText && !finalAiText) return;
 
-    // 100% asynchronous UI & localStorage persistence (runs only on turnComplete; 0 ms audio impact)
+    // 100% asynchronous UI & localStorage persistence (runs only on turnComplete/interrupted; 0 ms audio impact)
     queueMicrotask(() => {
       if (finalUserId && finalUserText) {
         onLiveUserStreamRef.current?.(finalUserId, finalUserText);
@@ -1812,12 +1864,12 @@ export function InteractiveVoiceCallOverlay({
         usedGoogleSearch,
       });
     });
-  }, [ensureAssistantTurnId, ensureUserTurnId]);
+  }, [clearTranscriptThrottleTimers, ensureAssistantTurnId, ensureUserTurnId]);
 
   /**
    * Instant Barge-In:
    * Immediately stops every scheduled/playing AudioBufferSourceNode, clears the queue,
-   * and resets `nextPlayTime = audioContext.currentTime` with 0ms delay.
+   * and resets `nextPlayTime = 0` with 0ms delay so the next turn starts cleanly.
    */
   const interruptLiveAudioPlayback = useCallback(() => {
     liveScheduledSourcesRef.current.forEach((node) => {
@@ -1831,9 +1883,7 @@ export function InteractiveVoiceCallOverlay({
     });
     liveScheduledSourcesRef.current.clear();
 
-    const outCtx = liveOutputCtxRef.current;
-    liveNextPlayTimeRef.current =
-      outCtx && outCtx.state !== "closed" ? outCtx.currentTime : 0;
+    liveNextPlayTimeRef.current = 0;
     liveTurnCompleteRef.current = true;
 
     if (liveMicAnalyserRef.current) {
@@ -1843,8 +1893,8 @@ export function InteractiveVoiceCallOverlay({
 
   /**
    * Zero-Wait 24kHz PCM Streaming Playback:
-   * Decodes each incoming Int16 LE PCM chunk immediately and schedules it on the
-   * 24kHz AudioContext timeline (`Math.max(currentTime + 0.02, nextPlayTime)`).
+   * Decodes each incoming Int16 LE PCM chunk accurately (`sample / 32768.0`) and schedules
+   * it on the 24kHz AudioContext timeline with a 0.03s initial jitter buffer.
    */
   const enqueueLivePcmChunk = useCallback(
     (base64Pcm: string, mimeType?: string) => {
@@ -1889,7 +1939,7 @@ export function InteractiveVoiceCallOverlay({
             isMountedRef.current &&
             callActiveRef.current
           ) {
-            liveNextPlayTimeRef.current = outCtx.currentTime;
+            liveNextPlayTimeRef.current = 0;
             activeAnalyserRef.current = liveMicAnalyserRef.current;
             if (liveStatusRef.current !== "error") {
               updateLiveStatus("listening");
@@ -1909,8 +1959,11 @@ export function InteractiveVoiceCallOverlay({
     (options?: { keepMicAndAudioCtx?: boolean }) => {
       const keepAudio = options?.keepMicAndAudioCtx === true;
 
+      clearTranscriptThrottleTimers();
       interruptLiveAudioPlayback();
       finalizeCurrentTurnAsync();
+      turnCounterRef.current = 0;
+      activeTurnNumberRef.current = 0;
 
       if (sessionRef.current) {
         const s = sessionRef.current;
@@ -2008,7 +2061,7 @@ export function InteractiveVoiceCallOverlay({
       liveOutputAnalyserRef.current = null;
       activeAnalyserRef.current = null;
     },
-    [finalizeCurrentTurnAsync, interruptLiveAudioPlayback]
+    [clearTranscriptThrottleTimers, finalizeCurrentTurnAsync, interruptLiveAudioPlayback]
   );
 
   /**
@@ -2249,8 +2302,10 @@ export function InteractiveVoiceCallOverlay({
     outAnalyser.smoothingTimeConstant = 0.78;
     outAnalyser.connect(outCtx.destination);
     liveOutputAnalyserRef.current = outAnalyser;
-    liveNextPlayTimeRef.current = outCtx.currentTime;
+    liveNextPlayTimeRef.current = 0;
     liveTurnCompleteRef.current = true;
+    turnCounterRef.current = 0;
+    activeTurnNumberRef.current = 0;
 
     // 3. Attach 16kHz AudioWorklet mic pipeline so AnalyserNode & PCM packets are ready immediately
     try {
@@ -2280,6 +2335,8 @@ export function InteractiveVoiceCallOverlay({
       excludeModels?: string[];
       disableThinkingConfig?: boolean;
       disableCustomVad?: boolean;
+      disableContextCompression?: boolean;
+      disableAffectiveDialog?: boolean;
     }): Promise<LiveTokenApiResponse> => {
       const res = await fetch("/api/live-token", {
         method: "POST",
@@ -2293,6 +2350,12 @@ export function InteractiveVoiceCallOverlay({
             : {}),
           ...(opts?.disableThinkingConfig ? { disableThinkingConfig: true } : {}),
           ...(opts?.disableCustomVad ? { disableCustomVad: true } : {}),
+          ...(opts?.disableContextCompression
+            ? { disableContextCompression: true }
+            : {}),
+          ...(opts?.disableAffectiveDialog
+            ? { disableAffectiveDialog: true }
+            : {}),
         }),
       });
       const data = (await res.json().catch(() => ({}))) as LiveTokenApiResponse;
@@ -2312,8 +2375,10 @@ export function InteractiveVoiceCallOverlay({
     let lastCloseCode: number | undefined = undefined;
     let disableThinkingConfig = false;
     let disableCustomVad = false;
+    let disableContextCompression = false;
+    let disableAffectiveDialog = false;
 
-    const MAX_LIVE_ATTEMPTS = 6;
+    const MAX_LIVE_ATTEMPTS = 8;
 
     for (let attempt = 0; attempt < MAX_LIVE_ATTEMPTS; attempt++) {
       if (
@@ -2331,6 +2396,8 @@ export function InteractiveVoiceCallOverlay({
           excludeModels: excludedModels,
           disableThinkingConfig,
           disableCustomVad,
+          disableContextCompression,
+          disableAffectiveDialog,
         });
       } catch (err: unknown) {
         lastErrorReason = err instanceof Error ? err.message : String(err);
@@ -2370,6 +2437,12 @@ export function InteractiveVoiceCallOverlay({
           : {}),
         ...(tokenCfg.realtimeInputConfig
           ? { realtimeInputConfig: tokenCfg.realtimeInputConfig }
+          : {}),
+        ...(tokenCfg.contextWindowCompression
+          ? { contextWindowCompression: tokenCfg.contextWindowCompression }
+          : {}),
+        ...(tokenCfg.enableAffectiveDialog
+          ? { enableAffectiveDialog: true }
           : {}),
         inputAudioTranscription: {},
         outputAudioTranscription: {},
@@ -2505,7 +2578,8 @@ export function InteractiveVoiceCallOverlay({
                     );
                     if (!loggedAiAudioStartedForTurnRef.current) {
                       loggedAiAudioStartedForTurnRef.current = true;
-                      console.log("[VOICE] AI audio started");
+                      const turnNum = ensureActiveTurnNumber();
+                      console.log(`[VOICE] Turn #${turnNum} -> AI audio started`);
                     }
                   }
                 }
@@ -2534,7 +2608,7 @@ export function InteractiveVoiceCallOverlay({
                 }
               }
 
-              // 5. Live Streaming User Speech Transcription (strip <noise>/<inaudible>; never create empty bubbles)
+              // 5. Live Streaming User Speech Transcription (strip <noise> + stray leading punctuation; 100ms throttled)
               if (content.inputTranscription?.text) {
                 if (userTurnCommittedRef.current) {
                   userTurnCommittedRef.current = false;
@@ -2542,17 +2616,17 @@ export function InteractiveVoiceCallOverlay({
                   userTurnTextRef.current = "";
                 }
                 userTurnTextRef.current += content.inputTranscription.text;
-                const cleanedInput = sanitizeLiveTranscriptText(
+                const cleanedInput = sanitizeLiveUserTranscript(
                   userTurnTextRef.current
                 );
                 if (cleanedInput.length > 0) {
-                  console.log(`[VOICE] Input transcript: ${cleanedInput}`);
+                  ensureActiveTurnNumber();
                   speechPulseRef.current = 0.6;
-                  flushUserTranscriptNow();
+                  scheduleUserTranscriptFlush();
                 }
               }
 
-              // 6. Live Streaming AI Speech Transcription -> instant async bubble update (`Auto · Suara`)
+              // 6. Live Streaming AI Speech Transcription -> 100ms throttled async bubble update (`Auto · Suara`)
               if (content.outputTranscription?.text) {
                 commitUserTurnIfPending();
                 assistantTurnTextRef.current += content.outputTranscription.text;
@@ -2560,20 +2634,20 @@ export function InteractiveVoiceCallOverlay({
                   sanitizeLiveTranscriptText(assistantTurnTextRef.current)
                     .length > 0
                 ) {
+                  ensureActiveTurnNumber();
                   ensureAssistantTurnId();
-                  flushAssistantTranscriptNow();
+                  scheduleAssistantTranscriptFlush();
                 }
               }
 
-              // 7. Turn Complete -> finalize room chat + persist localStorage
+              // 7. Turn Complete -> finalize room chat + persist localStorage + reset audio queue cleanly
               if (content.turnComplete) {
-                console.log("[VOICE] Turn complete");
+                const turnNum = ensureActiveTurnNumber();
+                console.log(`[VOICE] Turn #${turnNum} complete`);
                 liveTurnCompleteRef.current = true;
                 finalizeCurrentTurnAsync();
                 if (liveScheduledSourcesRef.current.size === 0) {
-                  const ctx = liveOutputCtxRef.current;
-                  liveNextPlayTimeRef.current =
-                    ctx && ctx.state !== "closed" ? ctx.currentTime : 0;
+                  liveNextPlayTimeRef.current = 0;
                   activeAnalyserRef.current = liveMicAnalyserRef.current;
                   updateLiveStatus("listening");
                 }
@@ -2640,8 +2714,13 @@ export function InteractiveVoiceCallOverlay({
         sessionRef.current = connectedSession;
         setLiveError("");
         updateLiveStatus("listening");
+        const activeVoice = tokenCfg.voiceName || selectedVoiceRef.current;
+        const compressionStatus = tokenCfg.contextWindowCompression
+          ? "ON"
+          : "OFF";
+        const affectiveStatus = tokenCfg.enableAffectiveDialog ? "ON" : "OFF";
         console.log(
-          `[VOICE] Live connected (16kHz pure stream, Search: ${searchEnabledRef.current ? "ON" : "OFF"})`
+          `[VOICE] Live connected (compression ${compressionStatus}, affective ${affectiveStatus}, voice: ${activeVoice})`
         );
         return;
       } catch (connectErr: unknown) {
@@ -2659,16 +2738,58 @@ export function InteractiveVoiceCallOverlay({
         const isConfigRejection =
           parsedCode === 1007 ||
           parsedCode === 1008 ||
-          /invalid argument|unsupported|not supported|thinking|activity/i.test(
+          /invalid argument|unsupported|not supported|thinking|activity|affective|compression|sliding/i.test(
             lastErrorReason
           );
 
         // Clean progressive parameter adjustment on SAME Live model before switching models
-        if (isConfigRejection && !disableThinkingConfig && tokenCfg.thinkingConfig) {
+        if (
+          isConfigRejection &&
+          !disableAffectiveDialog &&
+          tokenCfg.enableAffectiveDialog &&
+          /affective/i.test(lastErrorReason)
+        ) {
+          disableAffectiveDialog = true;
+          continue;
+        }
+        if (
+          isConfigRejection &&
+          !disableContextCompression &&
+          tokenCfg.contextWindowCompression &&
+          /compression|sliding|trigger/i.test(lastErrorReason)
+        ) {
+          disableContextCompression = true;
+          continue;
+        }
+        if (
+          isConfigRejection &&
+          !disableAffectiveDialog &&
+          tokenCfg.enableAffectiveDialog
+        ) {
+          disableAffectiveDialog = true;
+          continue;
+        }
+        if (
+          isConfigRejection &&
+          !disableContextCompression &&
+          tokenCfg.contextWindowCompression
+        ) {
+          disableContextCompression = true;
+          continue;
+        }
+        if (
+          isConfigRejection &&
+          !disableThinkingConfig &&
+          tokenCfg.thinkingConfig
+        ) {
           disableThinkingConfig = true;
           continue;
         }
-        if (isConfigRejection && !disableCustomVad && tokenCfg.realtimeInputConfig) {
+        if (
+          isConfigRejection &&
+          !disableCustomVad &&
+          tokenCfg.realtimeInputConfig
+        ) {
           disableCustomVad = true;
           continue;
         }
@@ -2682,6 +2803,8 @@ export function InteractiveVoiceCallOverlay({
         }
         disableThinkingConfig = false;
         disableCustomVad = false;
+        disableContextCompression = false;
+        disableAffectiveDialog = false;
       }
     }
 
@@ -2701,12 +2824,13 @@ export function InteractiveVoiceCallOverlay({
     commitUserTurnIfPending,
     emitPendingSourcesAsync,
     enqueueLivePcmChunk,
+    ensureActiveTurnNumber,
     ensureAssistantTurnId,
     finalizeCurrentTurnAsync,
-    flushAssistantTranscriptNow,
-    flushUserTranscriptNow,
     interruptLiveAudioPlayback,
     isOpen,
+    scheduleAssistantTranscriptFlush,
+    scheduleUserTranscriptFlush,
     updateLiveStatus,
   ]);
 
@@ -2836,7 +2960,7 @@ export function InteractiveVoiceCallOverlay({
         />
       </button>
 
-      {/* Compact Live Connection Status + Voice Switcher (Aoede / Zephyr) + Google Search Toggle */}
+      {/* Compact Live Connection Status + Voice Switcher (Aoede / Zephyr / Kore / Puck) + Google Search Toggle */}
       <div className="pointer-events-auto flex items-center gap-1.5 flex-wrap justify-center">
         <div
           role="status"
@@ -2872,7 +2996,7 @@ export function InteractiveVoiceCallOverlay({
           <span className="whitespace-nowrap">{statusText}</span>
         </div>
 
-        {/* Minimal Voice Switcher (Aoede / Zephyr) */}
+        {/* Minimal Voice Switcher (Aoede / Zephyr / Kore / Puck) */}
         <div
           className="inline-flex items-center rounded-full bg-white/88 backdrop-blur-md border border-[#0B2B26]/12 p-0.5"
           role="group"

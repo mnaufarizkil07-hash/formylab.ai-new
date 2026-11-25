@@ -14,9 +14,9 @@ import {
 
 /**
  * Native Audio Live models ordered for instant Vercel-compatible browser connections:
- * Gemini 2.5 Flash Native Audio models support Ephemeral Tokens, responsive Native Server VAD,
- * `thinkingConfig: { thinkingBudget: 0 }`, and optional Google Search grounding.
- * `gemini-3.8-live` is included as a live audio fallback (without `thinkingConfig`).
+ * Gemini 2.5 Flash Native Audio models support Ephemeral Tokens, Native Server VAD,
+ * `thinkingConfig: { thinkingBudget: 0 }`, `contextWindowCompression` sliding window,
+ * `enableAffectiveDialog`, and optional Google Search grounding.
  */
 const LIVE_NATIVE_AUDIO_MODELS = [
   "gemini-2.5-flash-native-audio-preview-12-2025",
@@ -24,9 +24,14 @@ const LIVE_NATIVE_AUDIO_MODELS = [
   "gemini-3.8-live",
 ] as const;
 
-const ALLOWED_VOICES = new Set<LiveVoiceName>(["Aoede", "Zephyr"]);
+const ALLOWED_VOICES = new Set<LiveVoiceName>([
+  "Aoede",
+  "Zephyr",
+  "Kore",
+  "Puck",
+]);
 
-// 100% Pure Native Server VAD (NO manual audioStreamEnd / activityStart / activityEnd)
+// 100% Pure Native Server VAD
 const SDK_SERVER_VAD_CONFIG = {
   automaticActivityDetection: {
     disabled: false,
@@ -47,6 +52,14 @@ const WS_SERVER_VAD_CONFIG = {
     silenceDurationMs: 250,
   },
   activityHandling: "START_OF_ACTIVITY_INTERRUPTS",
+};
+
+// Sliding-window context compression keeps multi-turn audio latency fast on turn #2, #3, #N
+const CONTEXT_WINDOW_COMPRESSION_CONFIG = {
+  triggerTokens: "12000",
+  slidingWindow: {
+    targetTokens: "6000",
+  },
 };
 
 // ONLY attached when the user explicitly toggles Search ON (zero custom function declarations!)
@@ -73,6 +86,8 @@ export async function POST(req: NextRequest) {
     let excludeModelSet = new Set<string>();
     let disableThinkingConfig = false;
     let disableCustomVad = false;
+    let disableContextCompression = false;
+    let disableAffectiveDialog = false;
 
     try {
       const body = await req.json();
@@ -100,6 +115,12 @@ export async function POST(req: NextRequest) {
       }
       if (body?.disableThinkingConfig === true) disableThinkingConfig = true;
       if (body?.disableCustomVad === true) disableCustomVad = true;
+      if (body?.disableContextCompression === true) {
+        disableContextCompression = true;
+      }
+      if (body?.disableAffectiveDialog === true) {
+        disableAffectiveDialog = true;
+      }
     } catch {
       // Empty JSON body is allowed
     }
@@ -162,10 +183,16 @@ export async function POST(req: NextRequest) {
       const vadPatch = disableCustomVad
         ? {}
         : { realtimeInputConfig: SDK_SERVER_VAD_CONFIG };
+      const compressionPatch = disableContextCompression
+        ? {}
+        : { contextWindowCompression: CONTEXT_WINDOW_COMPRESSION_CONFIG };
+      const affectivePatch = disableAffectiveDialog
+        ? {}
+        : { enableAffectiveDialog: true };
       const sdkToolsPatch = enableSearch ? { tools: SDK_SEARCH_ONLY_TOOLS } : {};
       const wsTools = enableSearch ? WS_SEARCH_ONLY_TOOLS : undefined;
 
-      // Tier 1: Constrained Ephemeral Token with Pure Voice (default) or Google Search (when Search toggle ON)
+      // Tier 1: Constrained Ephemeral Token with Context Compression + Affective Dialog + Pure Voice / Search
       try {
         const tokenRes = await ai.authTokens.create({
           config: {
@@ -189,6 +216,8 @@ export async function POST(req: NextRequest) {
                 ...sdkToolsPatch,
                 ...thinkingPatch,
                 ...vadPatch,
+                ...compressionPatch,
+                ...affectivePatch,
               },
             },
           },
@@ -209,6 +238,10 @@ export async function POST(req: NextRequest) {
             realtimeInputConfig: disableCustomVad
               ? undefined
               : WS_SERVER_VAD_CONFIG,
+            contextWindowCompression: disableContextCompression
+              ? undefined
+              : CONTEXT_WINDOW_COMPRESSION_CONFIG,
+            enableAffectiveDialog: !disableAffectiveDialog,
             expireTime,
             remainingCandidatesCount,
           });
@@ -247,6 +280,10 @@ export async function POST(req: NextRequest) {
             realtimeInputConfig: disableCustomVad
               ? undefined
               : WS_SERVER_VAD_CONFIG,
+            contextWindowCompression: disableContextCompression
+              ? undefined
+              : CONTEXT_WINDOW_COMPRESSION_CONFIG,
+            enableAffectiveDialog: !disableAffectiveDialog,
             expireTime,
             remainingCandidatesCount,
           });

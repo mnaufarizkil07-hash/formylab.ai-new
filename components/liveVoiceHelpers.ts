@@ -1,4 +1,4 @@
-export type LiveVoiceName = "Aoede" | "Zephyr";
+export type LiveVoiceName = "Aoede" | "Zephyr" | "Kore" | "Puck";
 
 export type LiveConnectionStatus =
   | "connecting"
@@ -11,8 +11,10 @@ export const LIVE_VOICE_OPTIONS: ReadonlyArray<{
   label: string;
   hint: string;
 }> = [
-  { id: "Aoede", label: "Aoede", hint: "Hangat & natural" },
-  { id: "Zephyr", label: "Zephyr", hint: "Jernih & ekspresif" },
+  { id: "Aoede", label: "Aoede", hint: "Hangat & luwes" },
+  { id: "Zephyr", label: "Zephyr", hint: "Cerah & ramah" },
+  { id: "Kore", label: "Kore", hint: "Tegas & jernih" },
+  { id: "Puck", label: "Puck", hint: "Santai & ekspresif" },
 ];
 
 export const LIVE_STATUS_LABELS: Record<LiveConnectionStatus, string> = {
@@ -24,6 +26,7 @@ export const LIVE_STATUS_LABELS: Record<LiveConnectionStatus, string> = {
 
 export const LIVE_INPUT_TARGET_SAMPLE_RATE = 16000;
 export const LIVE_INPUT_CHUNK_SAMPLES = 640; // ~40ms @ 16kHz
+export const LIVE_TRANSCRIPT_THROTTLE_MS = 100;
 
 /**
  * Strips system/noise tags such as `<noise>` or `<inaudible>` from Gemini Live
@@ -35,32 +38,40 @@ export function sanitizeLiveTranscriptText(raw: string): string {
 }
 
 /**
- * Concise, human-like Bahasa Indonesia voice system instruction engineered for
- * minimal Time-To-First-Audio (TTFA) on Gemini Live Native Audio.
+ * Cleans user speech transcription by stripping `<noise>`/`<inaudible>` tags AND
+ * stray leading punctuation (e.g. `". Oke, langsung buat resepnya."` -> `"Oke, langsung buat resepnya."`).
+ */
+export function sanitizeLiveUserTranscript(raw: string): string {
+  const withoutTags = sanitizeLiveTranscriptText(raw);
+  if (!withoutTags) return "";
+  return withoutTags.replace(/^[.,!?;:\s]+/, "").trim();
+}
+
+/**
+ * Ultra-natural, expressive Bahasa Indonesia phone-conversation system instruction
+ * engineered for GPT-Voice-grade realism and fast multi-turn dialogue on Gemini Live.
  */
 export function buildLiveVoiceSystemInstruction(
   recentContext?: string,
   enableSearch = false
 ): string {
   const lines = [
-    "Kamu adalah asisten suara AI Formylab.ai berperan sebagai Senior Cosmetic R&D Chemist.",
-    "Berbicaralah dalam Bahasa Indonesia yang santai, sopan, hangat, dan alami layaknya rekan kerja R&D sungguhan di telepon.",
-    "Aturan wajib mode suara:",
-    "- Langsung jawab ke inti dengan cepat, padat, dan jelas (sekitar 2 hingga 4 kalimat lisan yang mengalir, termasuk saat diminta saran atau resep formulasi), kecuali pengguna meminta penjelasan langkah demi langkah yang lebih panjang.",
-    "- DILARANG menyebutkan simbol markdown (bintang, pagar, garis miring, atau daftar bernomor panjang); ucapkan angka dan satuan secara lisan (misalnya 'lima persen', 'pH lima koma lima').",
+    "Kamu adalah partner R&D kosmetik Formylab.ai yang sedang mengobrol langsung lewat telepon dengan pengguna.",
+    "Gaya bicara wajib seperti rekan kerja manusia di telepon, BUKAN membacakan artikel atau buku teks:",
+    "- Pakai Bahasa Indonesia lisan sehari-hari yang hangat, santai, luwes, tapi tetap tajam dan profesional.",
+    "- Gunakan penanda percakapan alami yang singkat di awal bila pas, seperti 'Oke, gampangnya gini...', 'Nah, kalau buat kulit sensitif...', atau 'Boleh banget, jadi...', dengan koma sebagai jeda napas yang natural.",
+    "- Jawab langsung ke inti dalam 1 sampai 3 kalimat padat dan enak didengar per giliran supaya obrolan terasa hidup, cepat, dan dua arah.",
+    "- DILARANG membacakan tanda kurung, simbol markdown, atau deretan angka dan persentase panjang sekaligus dalam satu giliran bicara. Ucapkan satuan secara lisan dan santai.",
+    "- Kalau pengguna minta resep atau formula lewat suara, rangkum inti komposisinya secara singkat dan ringan dalam 2 sampai 3 kalimat saja, lalu tawarkan apakah mau dibacakan detail persennya atau langsung dimasukkan ke Formulator.",
   ];
 
   if (enableSearch) {
     lines.push(
-      "- HANYA gunakan tool googleSearch jika pengguna menanyakan berita terkini, harga terbaru, tanggal/kejadian aktual, atau fakta eksternal yang berubah-ubah. Untuk sapaan, diskusi umum, dan resep formulasi kosmetik standar, JAWAB LANGSUNG dengan suara secepat mungkin tanpa memanggil search."
-    );
-  } else {
-    lines.push(
-      "- Jawab seluruh pertanyaan dan permintaan formulasi langsung secara lisan tanpa jeda."
+      "- HANYA gunakan tool googleSearch kalau pengguna menanyakan berita terkini, harga terbaru, tanggal atau kejadian aktual, atau fakta eksternal yang berubah-ubah. Untuk sapaan, diskusi umum, dan ide formulasi, jawab langsung tanpa memanggil search."
     );
   }
 
-  // Lightweight initial context summary only (never re-inject long formula history)
+  // Lightweight initial context summary only at session setup (never re-injected mid-conversation)
   const cleanContext =
     typeof recentContext === "string"
       ? recentContext.replace(/\s+/g, " ").trim().slice(0, 220)
@@ -68,7 +79,7 @@ export function buildLiveVoiceSystemInstruction(
 
   if (cleanContext) {
     lines.push(
-      `Ringkasan singkat konteks terakhir (pakai hanya jika relevan): "${cleanContext}"`
+      `Konteks singkat obrolan sebelumnya (pakai hanya jika nyambung): "${cleanContext}"`
     );
   }
 
