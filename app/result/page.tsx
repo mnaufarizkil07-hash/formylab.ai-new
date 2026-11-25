@@ -19,6 +19,7 @@ import {
   BookOpen,
 } from "lucide-react";
 import WorkspaceNavbar from "../../components/WorkspaceNavbar";
+import AmbientBioluminescence from "../../components/AmbientBioluminescence";
 import LivingLabBackground from "../../components/LivingLabBackground";
 import Molecule3DViewer from "../../components/Molecule3DViewer";
 import { getIngredientProfile, getProductTypeSpec } from "../../lib/cosmeticChemistryData";
@@ -97,8 +98,8 @@ const LAB_OUTCOME_DIAGNOSES: Record<
   }
 > = {
   berhasil: {
-    label: "Berhasil — Emulsi Stabil, pH & Viskositas Sesuai Target",
-    statusBadge: "LULUS QC AWAL -> LANJUT TAHAP 9 (DOKUMENTASI BPOM & HALAL)",
+    label: "Berhasil: Emulsi Stabil, pH & Viskositas Sesuai Target",
+    statusBadge: "LULUS QC AWAL · LANJUT TAHAP 9 (DOKUMENTASI BPOM & HALAL)",
     rootCause:
       "Keseimbangan HLB emulgator, urutan pencampuran fase air/minyak (70–75°C), dan suhu cool-down (<40°C) sudah optimal.",
     nextBatchFix:
@@ -107,7 +108,7 @@ const LAB_OUTCOME_DIAGNOSES: Record<
       "Kombinasi bahan aktif dan sistem polimer ini tervalidasi stabil untuk scale-up pilot batch.",
   },
   pecah_emulsi: {
-    label: "Gagal — Pecah Emulsi / Pemisahan Fase Minyak-Air (Creaming/Coalescence)",
+    label: "Gagal: Pecah Emulsi / Pemisahan Fase Minyak-Air (Creaming/Coalescence)",
     statusBadge: "PERLU REFORMULASI BATCH BERIKUTNYA (TAHAP 8 LEARNING LOOP)",
     rootCause:
       "Ketidakcocokan Required HLB fase minyak dengan sistem emulgator atau kecepatan homogenizer kurang tinggi saat penggabungan fase 75°C.",
@@ -117,7 +118,7 @@ const LAB_OUTCOME_DIAGNOSES: Record<
       "Catat ke Knowledge Base Maklon: Emulsi sistem ini wajib didampingi polymeric rheology modifier min. 0.3% agar tahan suhu 45°C.",
   },
   warna_berubah: {
-    label: "Gagal — Perubahan Warna / Menguning (Oksidasi Bahan Aktif)",
+    label: "Gagal: Perubahan Warna / Menguning (Oksidasi Bahan Aktif)",
     statusBadge: "PERLU STABILISASI ANTIOKSIDAN (TAHAP 8 LEARNING LOOP)",
     rootCause:
       "Oksidasi bahan aktif polifenol/vitamin akibat paparan oksigen, ion logam bebas, atau penambahan bahan sensitif saat suhu batch masih >45°C.",
@@ -127,7 +128,7 @@ const LAB_OUTCOME_DIAGNOSES: Record<
       "Catat ke Knowledge Base Maklon: Bahan aktif pencerah/antioksidan wajib dikombinasikan dengan sistem kelasi 0.1% dan kemasan airless opaque.",
   },
   tekstur_encer: {
-    label: "Gagal — Viskositas Terlalu Encer / Drop Saat Penambahan Aktif",
+    label: "Gagal: Viskositas Terlalu Encer / Drop Saat Penambahan Aktif",
     statusBadge: "PERLU KOREKSI REOLOGI POLIMER (TAHAP 8 LEARNING LOOP)",
     rootCause:
       "Muatan elektrolit dari bahan aktif/ekstrak memutus ikatan hidrogen jaringan gel Carbomer/Acrylates sehingga viskositas turun drastis.",
@@ -137,7 +138,7 @@ const LAB_OUTCOME_DIAGNOSES: Record<
       "Catat ke Knowledge Base Maklon: Bila total bahan aktif larut air >5%, gunakan polimer toleran elektrolit dibanding Carbomer standar.",
   },
   ph_drift: {
-    label: "Gagal — pH Bergeser (Drift) Di Luar Rentang Spesifikasi",
+    label: "Gagal: pH Bergeser (Drift) Di Luar Rentang Spesifikasi",
     statusBadge: "PERLU SISTEM BUFFER ASAM-BASA (TAHAP 8 LEARNING LOOP)",
     rootCause:
       "Kurangnya kapasitas dapar (buffer) pada fase air sehingga hidrolisis bahan aktif menggeser pH selama penyimpanan.",
@@ -240,11 +241,11 @@ export default function ResultPage() {
 
   if (!formData) {
     return (
-      <div className="min-h-screen relative flex items-center justify-center font-sans text-slate-800">
+      <div className="min-h-screen relative flex items-center justify-center bg-[#f8fdfb] text-[#0B2B26] overflow-x-clip">
         <LivingLabBackground variant="mint" />
-        <div className="relative z-10 bg-white/95 p-10 rounded-3xl shadow-lg border border-emerald-900/10 text-center">
-          <FlaskConical className="w-10 h-10 text-[#0f766e] animate-pulse mx-auto mb-3" />
-          <p className="text-lg font-extrabold text-slate-900">
+        <div className="relative z-10 bg-white p-10 rounded-[16px] border border-[#0B2B26]/10 text-center">
+          <FlaskConical className="w-10 h-10 text-[#0E807E] animate-pulse mx-auto mb-3" aria-hidden="true" />
+          <p className="text-lg font-medium text-[#0B2B26]">
             Loading AI Formulation Study &amp; 3D Molecular Data...
           </p>
         </div>
@@ -344,13 +345,13 @@ export default function ResultPage() {
       : "";
 
     return [
-      `FORMYLAB.AI — R&D COSMETIC FORMULATION STUDY REPORT`,
+      `FORMYLAB.AI : R&D COSMETIC FORMULATION STUDY REPORT`,
       `Product System: ${formData.productType} (${spec.systemType})`,
       `Primary Skin Target: ${formData.skinTarget}`,
       `Batch Size: ${batchGrams} g | Target pH: ${formData.targetPh} | Target Viscosity: ${formData.targetViscosity}`,
       `Scientific Reference: ${spec.referenceSource} (${spec.evidenceDoi})`,
       top
-        ? `\nSelected Lead Formula (${top.title} — ${top.badge}):\nCalibrated pH: ${top.ph} | Viscosity: ${top.viscosity} | Est. BOM: ${top.estCost}\n\nComposition Breakdown:\n${ingLines}`
+        ? `\nSelected Lead Formula (${top.title} · ${top.badge}):\nCalibrated pH: ${top.ph} | Viscosity: ${top.viscosity} | Est. BOM: ${top.estCost}\n\nComposition Breakdown:\n${ingLines}`
         : "",
     ].join("\n");
   };
@@ -401,190 +402,192 @@ export default function ResultPage() {
   const activeDiagnosis = LAB_OUTCOME_DIAGNOSES[selectedLabOutcome];
 
   return (
-    <div className="min-h-screen relative font-sans text-slate-800 pb-24">
+    <div className="min-h-screen relative bg-[#f8fdfb] text-[#0B2B26] pb-24 overflow-x-clip">
       <LivingLabBackground variant="mint" />
 
       <div className="print:hidden">
         <WorkspaceNavbar backHref="/formulate" backLabel="Back to Formulator" />
       </div>
 
-      <main className="relative z-10 max-w-7xl mx-auto px-4 sm:px-6 pt-4">
+      <main className="relative z-10 max-w-7xl mx-auto px-4 sm:px-6 pt-6">
         {/* Top Action & Study Report Toolbar */}
-        <div className="bg-white rounded-[2rem] p-6 sm:p-8 shadow-[0_20px_50px_-15px_rgba(16,68,56,0.15)] border border-emerald-900/10 mb-8">
-          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-6">
-            <div>
-              <div className="flex flex-wrap items-center gap-2 text-xs font-mono text-[#0f766e] font-bold mb-2">
-                <CheckCircle2 className="w-4 h-4" />
-                <span>TAHAP 4, 5, 6, 7, 8 &amp; 9 · OUTPUT FORMULA BERLAPIS, TRIAL PLANNER &amp; DOKUMENTASI</span>
-                <span aria-hidden="true">·</span>
-                <span>{spec.systemType}</span>
-                <span aria-hidden="true">·</span>
-                <span>Batch: {batchGrams}g</span>
-              </div>
-
-              <h1 className="text-2xl sm:text-3xl font-extrabold text-slate-900 tracking-tight">
-                {formData.productType} — Formulation Study Report
-              </h1>
-
-              <p className="text-xs sm:text-sm text-slate-600 mt-1.5 max-w-3xl leading-relaxed">
-                <strong>Definisi Halaman Hasil:</strong> Menampilkan hasil{" "}
-                <strong>Pengecekan Berlapis 5 Filter</strong> (Regulasi BPOM/ASEAN, Kompatibilitas
-                &amp; Stabilitas, Halal, Stok Gudang, Biaya HPP),{" "}
-                <strong>3 Opsi Formula Berlapis (Formula A Ideal, Formula B Hemat/Halal, Formula C Stok Tersedia)</strong>{" "}
-                beserta Catatan Trade-off, <strong>Rencana Percobaan Lab</strong>,{" "}
-                <strong>Input Hasil Racikan &amp; Learning Loop</strong>, serta{" "}
-                <strong>Dokumentasi BPOM &amp; Halal</strong>.
-              </p>
-
-              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-600 mt-2.5">
-                <span>
-                  Skin Target: <strong className="text-slate-900">{formData.skinTarget}</strong>
-                </span>
-                <span aria-hidden="true">·</span>
-                <span>
-                  Tekstur:{" "}
-                  <strong className="text-slate-900">
-                    {formData.desiredTexture || "Light Gel-Cream"}
-                  </strong>
-                </span>
-                <span aria-hidden="true">·</span>
-                <span className="font-mono tabular-nums">
-                  Target pH: <strong className="text-slate-900">{formData.targetPh}</strong>
-                </span>
-                <span aria-hidden="true">·</span>
-                <span className="font-mono tabular-nums">
-                  Target Viscosity:{" "}
-                  <strong className="text-slate-900">{formData.targetViscosity}</strong>
-                </span>
-              </div>
-
-              {/* 4 Brief Specification Summary Pills */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 mt-4">
-                <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200/80 text-xs">
-                  <span className="text-[10px] font-mono uppercase text-slate-400 block">
-                    1. Target Kulit &amp; Tekstur
-                  </span>
-                  <span className="font-bold text-slate-900 truncate block">
-                    {formData.skinTarget} · {(formData.desiredTexture || "Gel-Cream").split("(")[0].trim()}
-                  </span>
-                </div>
-                <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200/80 text-xs">
-                  <span className="text-[10px] font-mono uppercase text-slate-400 block">
-                    2. Target HPP &amp; Trial Budget
-                  </span>
-                  <span className="font-mono font-bold text-[#0f766e] truncate block tabular-nums">
-                    HPP Rp {Number(formData.targetHppPerUnit || 12500).toLocaleString("id-ID")} · Trial Rp{" "}
-                    {Number(formData.trialBudgetRp || 300000).toLocaleString("id-ID")}
-                  </span>
-                </div>
-                <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200/80 text-xs">
-                  <span className="text-[10px] font-mono uppercase text-slate-400 block">
-                    3. Status Kehalalan
-                  </span>
-                  <span className="font-bold text-[#0f766e] truncate block">
-                    {formData.halalRequirement || "Wajib Halal (LPPOM MUI / BPJPH)"}
-                  </span>
-                </div>
-                <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200/80 text-xs">
-                  <span className="text-[10px] font-mono uppercase text-slate-400 block">
-                    4. Deadline &amp; MOQ
-                  </span>
-                  <span className="font-mono font-bold text-slate-900 truncate block tabular-nums">
-                    {(formData.projectDeadline || "8 Minggu").split("(")[0].trim()} · MOQ{" "}
-                    {Number(formData.targetMoq || 1000).toLocaleString("id-ID")} pcs
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            {/* Study Report Export & Share Actions (Feature B) */}
-            <div className="flex flex-wrap items-center gap-2.5 print:hidden shrink-0">
-              <button
-                type="button"
-                onClick={handleExportCSV}
-                className="px-4 py-2.5 rounded-full bg-[#12382f] hover:bg-[#0f766e] text-white text-xs font-bold transition flex items-center gap-2 cursor-pointer shadow-xs whitespace-nowrap"
-              >
-                <FileSpreadsheet className="w-4 h-4" />
-                <span>Export CSV BOM</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={handlePrintStudyReport}
-                className="px-4 py-2.5 rounded-full bg-emerald-50 hover:bg-emerald-100 text-[#12382f] border border-emerald-200 text-xs font-bold transition flex items-center gap-2 cursor-pointer whitespace-nowrap"
-              >
-                <Printer className="w-4 h-4 text-[#0f766e]" />
-                <span>Print / Save PDF Report</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setShareModalOpen(true)}
-                className="px-4 py-2.5 rounded-full bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-200 text-xs font-bold transition flex items-center gap-2 cursor-pointer whitespace-nowrap"
-              >
-                <Share2 className="w-4 h-4 text-[#0f766e]" />
-                <span>Share Study</span>
-              </button>
-            </div>
+        <div className="relative overflow-hidden rounded-[20px] bg-white border border-[#0B2B26]/10 mb-8">
+          <div className="print:hidden">
+            <AmbientBioluminescence variant="section" />
           </div>
+          <div className="relative z-10 card-glass-optical card-glass-static !border-0 !rounded-[20px] p-6 sm:p-8">
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-6">
+              <div>
+                <div className="flex flex-wrap items-center gap-2 text-xs font-mono text-[#0E807E] font-medium mb-2 tabular-nums">
+                  <CheckCircle2 className="w-4 h-4 text-[#0E807E]" aria-hidden="true" />
+                  <span>TAHAP 4–9 · OUTPUT FORMULA BERLAPIS, TRIAL PLANNER &amp; DOKUMENTASI</span>
+                  <span aria-hidden="true">·</span>
+                  <span>{spec.systemType}</span>
+                  <span aria-hidden="true">·</span>
+                  <span>Batch: {batchGrams}g</span>
+                </div>
 
-          {/* TAHAP 4: 5 PENGECEKAN BERLAPIS (INTI NILAI JUAL AI) */}
-          <div className="mt-6 pt-5 border-t border-slate-100">
+                <h1 className="text-2xl sm:text-3xl font-medium text-[#0B2B26] tracking-[-0.03em]">
+                  {formData.productType} : Formulation Study Report
+                </h1>
+
+                <p className="text-xs sm:text-sm text-[#2E524C] mt-1.5 max-w-3xl leading-relaxed">
+                  Laporan hasil skrining{" "}
+                  <span className="font-medium text-[#0B2B26]">5 Gerbang Evaluasi R&amp;D</span> (Regulasi BPOM/ASEAN, Kompatibilitas
+                  pH &amp; HLB, Status Halal, Stok Gudang, dan Kalkulasi HPP), dilengkapi{" "}
+                  <span className="font-medium text-[#0B2B26]">3 Kandidat Formula Berlapis (Formula A, B, dan C)</span>{" "}
+                  beserta analisis trade-off, jadwal trial laboratorium, serta draf berkas notifikasi BPOM &amp; Halal.
+                </p>
+
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[#2E524C] mt-2.5 tabular-nums">
+                  <span>
+                    Skin Target: <span className="font-medium text-[#0B2B26]">{formData.skinTarget}</span>
+                  </span>
+                  <span aria-hidden="true">·</span>
+                  <span>
+                    Tekstur:{" "}
+                    <span className="font-medium text-[#0B2B26]">
+                      {formData.desiredTexture || "Light Gel-Cream"}
+                    </span>
+                  </span>
+                  <span aria-hidden="true">·</span>
+                  <span>
+                    Target pH: <span className="font-mono font-medium text-[#0B2B26] tabular-nums">{formData.targetPh}</span>
+                  </span>
+                  <span aria-hidden="true">·</span>
+                  <span>
+                    Target Viscosity:{" "}
+                    <span className="font-mono font-medium text-[#0B2B26] tabular-nums">{formData.targetViscosity}</span>
+                  </span>
+                </div>
+
+                {/* 4 Brief Specification Summary Items — No nested backdrop-blur inside card-glass-optical */}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 mt-4">
+                  <div className="p-3 rounded-[12px] bg-white/90 border border-[#0B2B26]/10 text-xs">
+                    <span className="text-[10px] font-mono uppercase tracking-[0.06em] text-[#2E524C] block">
+                      1. Target Kulit &amp; Tekstur
+                    </span>
+                    <span className="font-medium text-[#0B2B26] truncate block mt-0.5">
+                      {formData.skinTarget} · {(formData.desiredTexture || "Gel-Cream").split("(")[0].trim()}
+                    </span>
+                  </div>
+                  <div className="p-3 rounded-[12px] bg-white/90 border border-[#0B2B26]/10 text-xs">
+                    <span className="text-[10px] font-mono uppercase tracking-[0.06em] text-[#2E524C] block">
+                      2. Target HPP &amp; Trial Budget
+                    </span>
+                    <span className="font-mono font-medium text-[#0E807E] truncate block mt-0.5 tabular-nums">
+                      HPP Rp {Number(formData.targetHppPerUnit || 12500).toLocaleString("id-ID")} · Trial Rp{" "}
+                      {Number(formData.trialBudgetRp || 300000).toLocaleString("id-ID")}
+                    </span>
+                  </div>
+                  <div className="p-3 rounded-[12px] bg-white/90 border border-[#0B2B26]/10 text-xs">
+                    <span className="text-[10px] font-mono uppercase tracking-[0.06em] text-[#2E524C] block">
+                      3. Status Kehalalan
+                    </span>
+                    <span className="font-medium text-[#146c43] truncate block mt-0.5">
+                      {formData.halalRequirement || "Wajib Halal (LPPOM MUI / BPJPH)"}
+                    </span>
+                  </div>
+                  <div className="p-3 rounded-[12px] bg-white/90 border border-[#0B2B26]/10 text-xs">
+                    <span className="text-[10px] font-mono uppercase tracking-[0.06em] text-[#2E524C] block">
+                      4. Deadline &amp; MOQ
+                    </span>
+                    <span className="font-mono font-medium text-[#0B2B26] truncate block mt-0.5 tabular-nums">
+                      {(formData.projectDeadline || "8 Minggu").split("(")[0].trim()} · MOQ{" "}
+                      {Number(formData.targetMoq || 1000).toLocaleString("id-ID")} pcs
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Study Report Export & Share Actions — Optical Glass Pills */}
+              <div className="flex flex-wrap items-center gap-2.5 print:hidden shrink-0">
+                <button
+                  type="button"
+                  onClick={handleExportCSV}
+                  className="btn-glass-primary min-h-[44px] px-5 py-2.5 text-xs flex items-center gap-2 cursor-pointer whitespace-nowrap"
+                >
+                  <FileSpreadsheet className="w-4 h-4 text-[#0E807E]" aria-hidden="true" />
+                  <span>Export CSV BOM</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handlePrintStudyReport}
+                  className="btn-glass-secondary min-h-[44px] px-4 py-2.5 text-xs flex items-center gap-2 cursor-pointer whitespace-nowrap"
+                >
+                  <Printer className="w-4 h-4 text-[#0E807E]" aria-hidden="true" />
+                  <span>Print / Save PDF</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setShareModalOpen(true)}
+                  className="btn-glass-secondary min-h-[44px] px-4 py-2.5 text-xs flex items-center gap-2 cursor-pointer whitespace-nowrap"
+                >
+                  <Share2 className="w-4 h-4 text-[#0E807E]" aria-hidden="true" />
+                  <span>Share Study</span>
+                </button>
+              </div>
+            </div>
+
+          {/* TAHAP 4: 5 PENGECEKAN BERLAPIS */}
+          <div className="mt-6 pt-5 border-t border-[#0B2B26]/10">
             <div className="flex items-center justify-between gap-2 mb-3">
-              <span className="text-xs font-extrabold uppercase tracking-wider text-[#0f766e]">
-                Tahap 4 · Hasil Pengecekan Berlapis (5 Filter Inti Nilai Jual AI)
+              <span className="text-xs font-medium uppercase tracking-[0.12em] text-[#0E807E]">
+                Tahap 4 · Hasil Pengecekan Berlapis (5 Gerbang Evaluasi R&amp;D)
               </span>
-              <span className="text-[11px] font-mono text-emerald-700 font-bold">
+              <span className="px-2.5 py-0.5 rounded-full bg-[#eaf9f0] text-[#146c43] text-[11px] font-mono font-medium tabular-nums">
                 ✓ 5/5 Filter Terverifikasi
               </span>
             </div>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2.5">
-              <div className="p-3 rounded-xl bg-emerald-50/70 border border-emerald-200/80 text-xs">
-                <span className="font-mono text-[10px] font-bold text-[#0f766e] uppercase block">
-                  1. Filter Regulasi
+              <div className="p-3.5 rounded-[12px] bg-[#f8fdfb] border border-[#0B2B26]/10 text-xs">
+                <span className="text-[11px] font-mono font-medium text-[#0E807E] uppercase block tabular-nums">
+                  01 · Filter Regulasi
                 </span>
-                <p className="font-extrabold text-slate-900 mt-0.5">BPOM &amp; ASEAN Compliant</p>
-                <p className="text-[11px] text-slate-600 mt-0.5">
+                <p className="font-medium text-[#0B2B26] mt-0.5">BPOM &amp; ASEAN Compliant</p>
+                <p className="text-[11px] text-[#2E524C] mt-0.5">
                   Bebas bahan terlarang, konsentrasi sesuai lampiran BPOM &amp; klaim kosmetik aman.
                 </p>
               </div>
-              <div className="p-3 rounded-xl bg-emerald-50/70 border border-emerald-200/80 text-xs">
-                <span className="font-mono text-[10px] font-bold text-[#0f766e] uppercase block">
-                  2. Filter Kompatibilitas
+              <div className="p-3.5 rounded-[12px] bg-[#f8fdfb] border border-[#0B2B26]/10 text-xs">
+                <span className="text-[11px] font-mono font-medium text-[#0E807E] uppercase block tabular-nums">
+                  02 · Filter Kompatibilitas
                 </span>
-                <p className="font-extrabold text-slate-900 mt-0.5">
+                <p className="font-mono font-medium text-[#0B2B26] mt-0.5 tabular-nums">
                   pH {formData.targetPh} &amp; HLB {spec.requiredHlb}
                 </p>
-                <p className="text-[11px] text-slate-600 mt-0.5">
+                <p className="text-[11px] text-[#2E524C] mt-0.5">
                   Interaksi bahan aktif, suhu cool-down &lt;40°C &amp; risiko pecah emulsi terkendali.
                 </p>
               </div>
-              <div className="p-3 rounded-xl bg-emerald-50/70 border border-emerald-200/80 text-xs">
-                <span className="font-mono text-[10px] font-bold text-[#0f766e] uppercase block">
-                  3. Filter Halal
+              <div className="p-3.5 rounded-[12px] bg-[#f8fdfb] border border-[#0B2B26]/10 text-xs">
+                <span className="text-[11px] font-mono font-medium text-[#0E807E] uppercase block tabular-nums">
+                  03 · Filter Halal
                 </span>
-                <p className="font-extrabold text-slate-900 mt-0.5">LPPOM MUI / BPJPH Ready</p>
-                <p className="text-[11px] text-slate-600 mt-0.5">
+                <p className="font-medium text-[#146c43] mt-0.5">LPPOM MUI / BPJPH Ready</p>
+                <p className="text-[11px] text-[#2E524C] mt-0.5">
                   Seluruh bahan utama memiliki CoA Halal atau opsi substitusi nabati.
                 </p>
               </div>
-              <div className="p-3 rounded-xl bg-emerald-50/70 border border-emerald-200/80 text-xs">
-                <span className="font-mono text-[10px] font-bold text-[#0f766e] uppercase block">
-                  4. Filter Stok Gudang
+              <div className="p-3.5 rounded-[12px] bg-[#f8fdfb] border border-[#0B2B26]/10 text-xs">
+                <span className="text-[11px] font-mono font-medium text-[#0E807E] uppercase block tabular-nums">
+                  04 · Filter Stok Gudang
                 </span>
-                <p className="font-extrabold text-slate-900 mt-0.5">Ready Stock + Lead Time</p>
-                <p className="text-[11px] text-slate-600 mt-0.5">
+                <p className="font-medium text-[#0B2B26] mt-0.5">Ready Stock + Lead Time</p>
+                <p className="text-[11px] text-[#2E524C] mt-0.5">
                   Formula C siap diracik hari ini dari stok gudang internal maklon (lead time 2–5 hari).
                 </p>
               </div>
-              <div className="p-3 rounded-xl bg-emerald-50/70 border border-emerald-200/80 text-xs">
-                <span className="font-mono text-[10px] font-bold text-[#0f766e] uppercase block">
-                  5. Filter Biaya &amp; HPP
+              <div className="p-3.5 rounded-[12px] bg-[#f8fdfb] border border-[#0B2B26]/10 text-xs">
+                <span className="text-[11px] font-mono font-medium text-[#0E807E] uppercase block tabular-nums">
+                  05 · Filter Biaya &amp; HPP
                 </span>
-                <p className="font-extrabold text-slate-900 mt-0.5">
+                <p className="font-mono font-medium text-[#0E807E] mt-0.5 tabular-nums">
                   Sesuai Target Rp {Number(formData.targetHppPerUnit || 12500).toLocaleString("id-ID")}
                 </p>
-                <p className="text-[11px] text-slate-600 mt-0.5">
+                <p className="text-[11px] text-[#2E524C] mt-0.5">
                   Kalkulasi BOM/batch &amp; alokasi budget trial Rp{" "}
                   {Number(formData.trialBudgetRp || 300000).toLocaleString("id-ID")}.
                 </p>
@@ -593,46 +596,47 @@ export default function ResultPage() {
           </div>
 
           {/* Compounding Protocol Strip (Tahap 3) */}
-          <div className="mt-5 pt-4 border-t border-slate-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-slate-600">
+          <div className="mt-5 pt-4 border-t border-[#0B2B26]/10 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-[#2E524C]">
             <div>
-              <strong className="text-slate-800">
+              <span className="font-medium text-[#0B2B26]">
                 Tahap 3 · Urutan &amp; Metode Pembuatan Lab:{" "}
-              </strong>
-              <span>{spec.processingNotes}</span>
+              </span>
+              <span>{spec.processingNotes.replace(/\s*—\s*/g, ", ")}</span>
             </div>
             <div className="flex items-center gap-3 shrink-0 print:hidden">
               <button
                 type="button"
                 onClick={() => router.push("/dashboard")}
-                className="text-xs font-bold text-slate-600 hover:text-[#0f766e] flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                className="min-h-[44px] px-2 text-xs font-medium text-[#2E524C] hover:text-[#0B2B26] flex items-center gap-1 cursor-pointer whitespace-nowrap transition-colors"
               >
-                <ArrowLeft className="w-3.5 h-3.5" />
+                <ArrowLeft className="w-3.5 h-3.5" aria-hidden="true" />
                 <span>Dashboard Home</span>
               </button>
               <span aria-hidden="true">·</span>
               <button
                 type="button"
                 onClick={() => router.push("/library")}
-                className="text-xs font-bold text-[#0f766e] hover:underline flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                className="min-h-[44px] px-2 text-xs font-medium text-[#0E807E] hover:underline flex items-center gap-1 cursor-pointer whitespace-nowrap"
               >
-                <BookOpen className="w-3.5 h-3.5" />
+                <BookOpen className="w-3.5 h-3.5" aria-hidden="true" />
                 <span>3D Ingredient Library</span>
               </button>
             </div>
           </div>
+          </div>
         </div>
 
-        {/* TAHAP 5: OUTPUT BERLAPIS — FORMULA A (IDEAL), FORMULA B (HEMAT/HALAL), FORMULA C (STOK TERSEDIA) */}
+        {/* TAHAP 5: OUTPUT BERLAPIS : FORMULA A, B, C */}
         <div className="mb-4 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
           <div>
-            <span className="text-xs font-mono font-extrabold text-[#0f766e] uppercase tracking-wider">
-              Tahap 5 · Output Formula Berlapis &amp; Catatan Trade-off Substitusi
+            <span className="block text-[11px] font-medium text-[#0E807E] uppercase tracking-[0.14em]">
+              Output Formula Berlapis &amp; Catatan Trade-off Substitusi
             </span>
-            <h2 className="text-xl sm:text-2xl font-extrabold text-slate-900">
+            <h2 className="text-xl sm:text-2xl font-medium text-[#0B2B26] tracking-[-0.02em]">
               Perbandingan {candidates.length} Opsi Formula Siap Uji Lab
             </h2>
           </div>
-          <span className="text-xs text-slate-500">
+          <span className="text-xs text-[#2E524C]">
             Klik baris bahan baku mana pun untuk membuka 3D Konformer Molekul &amp; Sertifikat Halal
           </span>
         </div>
@@ -641,87 +645,87 @@ export default function ResultPage() {
           {candidates.map((cand) => (
             <div
               key={cand.id}
-              className="bg-white p-6 sm:p-7 rounded-[2rem] shadow-[0_22px_55px_-15px_rgba(16,68,56,0.15)] border border-emerald-900/10 flex flex-col justify-between"
+              className="bg-white p-6 sm:p-7 rounded-[16px] border border-[#0B2B26]/10 flex flex-col justify-between"
             >
               <div>
                 {/* Candidate Header */}
                 <div className="flex justify-between items-start gap-3 mb-3">
                   <div>
-                    <p className="text-[11px] font-mono font-bold text-[#0f766e] uppercase">
-                      {cand.badge}
+                    <p className="text-[11px] font-mono font-medium text-[#0E807E] uppercase tracking-[0.06em]">
+                      {cand.badge.replace(/\s*—\s*/g, " · ")}
                     </p>
-                    <h3 className="text-xl font-extrabold text-slate-900 mt-0.5">{cand.title}</h3>
+                    <h3 className="text-xl font-medium text-[#0B2B26] mt-0.5">{cand.title.replace(/\s*—\s*/g, ": ")}</h3>
                   </div>
-                  <div className="text-right font-mono text-[11px] text-slate-500">
+                  <div className="text-right font-mono text-[11px] text-[#2E524C]">
                     <span>{cand.systemType || spec.systemType}</span>
                   </div>
                 </div>
 
                 {cand.optionSummary && (
-                  <p className="text-xs text-slate-600 leading-relaxed mb-3">
-                    {cand.optionSummary}
+                  <p className="text-xs text-[#2E524C] leading-relaxed mb-3">
+                    {cand.optionSummary.replace(/\s*—\s*/g, ", ")}
                   </p>
                 )}
 
                 {cand.tradeOffNote && (
-                  <div className="p-3 rounded-xl bg-amber-50/80 border border-amber-200/80 text-[11px] text-amber-950 leading-relaxed mb-4">
-                    <strong className="font-extrabold text-amber-900 block mb-0.5">
+                  <div className="p-3.5 rounded-[12px] bg-[#fef9e7] border border-[#f5d078]/60 text-[11px] text-[#2E524C] leading-relaxed mb-4">
+                    <span className="font-medium text-[#9a6700] block mb-0.5">
                       Catatan Trade-off &amp; Substitusi (Tahap 5):
-                    </strong>
-                    <span>{cand.tradeOffNote}</span>
+                    </span>
+                    <span>{cand.tradeOffNote.replace(/\s*—\s*/g, ", ")}</span>
                   </div>
                 )}
 
                 {/* Key Rheology, pH & BOM Metrics */}
-                <div className="grid grid-cols-3 gap-2 bg-slate-50 p-3.5 rounded-2xl mb-4 border border-slate-200/80 text-center">
+                <div className="grid grid-cols-3 gap-2 bg-[#f4fbf8] p-3.5 rounded-[12px] mb-4 border border-[#0B2B26]/10 text-center">
                   <div>
-                    <p className="text-[10px] text-slate-400 font-mono uppercase mb-0.5">
+                    <p className="text-[10px] text-[#2E524C] font-sans uppercase mb-0.5">
                       Viscosity
                     </p>
-                    <p className="font-mono font-extrabold text-slate-900 text-xs sm:text-sm tabular-nums">
+                    <p className="font-mono font-medium text-[#0B2B26] text-xs sm:text-sm tabular-nums">
                       {cand.viscosity}
                     </p>
                   </div>
-                  <div className="border-x border-slate-200/80 px-1.5">
-                    <p className="text-[10px] text-slate-400 font-mono uppercase mb-0.5">
+                  <div className="border-x border-[#0B2B26]/10 px-1.5">
+                    <p className="text-[10px] text-[#2E524C] font-sans uppercase mb-0.5">
                       Calibrated pH
                     </p>
-                    <p className="font-mono font-extrabold text-[#0f766e] text-xs sm:text-sm tabular-nums">
+                    <p className="font-mono font-medium text-[#0E807E] text-xs sm:text-sm tabular-nums">
                       {cand.ph}
                     </p>
                   </div>
                   <div>
-                    <p className="text-[10px] text-slate-400 font-mono uppercase mb-0.5">
+                    <p className="text-[10px] text-[#2E524C] font-sans uppercase mb-0.5">
                       BOM ({batchGrams}g)
                     </p>
-                    <p className="font-mono font-extrabold text-slate-900 text-xs tabular-nums">
+                    <p className="font-mono font-medium text-[#0B2B26] text-xs tabular-nums">
                       {formData.viewCost ? cand.estCost : "Hidden"}
                     </p>
                   </div>
                 </div>
 
                 {/* Safety & Observation Box */}
-                <div className="bg-emerald-50/75 border border-emerald-200/80 p-3.5 rounded-2xl mb-5">
+                <div className="bg-[#f8fdfb] border border-[#0B2B26]/10 p-3.5 rounded-[12px] mb-5">
                   <div className="flex items-center justify-between gap-2 mb-1">
-                    <span className="text-xs font-extrabold text-[#12382f] flex items-center gap-1.5">
-                      <ShieldCheck className="w-4 h-4 text-[#0f766e]" />
+                    <span className="text-xs font-medium text-[#0E807E] flex items-center gap-1.5">
+                      <ShieldCheck className="w-4 h-4 text-[#0E807E]" aria-hidden="true" />
                       <span>Stabilitas &amp; Regulasi ({cand.overallRisk} Risk)</span>
                     </span>
                   </div>
-                  <p className="text-xs text-slate-700 leading-relaxed mb-1.5">
-                    {cand.riskSummaryText}
+                  <p className="text-xs text-[#0B2B26] leading-relaxed mb-1.5">
+                    {cand.riskSummaryText.replace(/\s*—\s*/g, ", ")}
                   </p>
-                  <p className="text-[11px] text-slate-600 pt-1.5 border-t border-emerald-200/60">
-                    {cand.observationText}
+                  <p className="text-[11px] text-[#2E524C] pt-1.5 border-t border-[#0B2B26]/8">
+                    {cand.observationText.replace(/\s*—\s*/g, ", ")}
                   </p>
                 </div>
 
-                {/* Ingredients Composition Breakdown with 3D Molecule Inspector Trigger */}
+                {/* Ingredients Composition Breakdown */}
                 <div className="flex items-center justify-between mb-2.5">
-                  <h4 className="text-xs font-extrabold text-slate-900 uppercase tracking-wider">
+                  <h4 className="text-xs font-medium text-[#0B2B26] uppercase tracking-wider">
                     Komposisi ({cand.ingredients.length} Bahan)
                   </h4>
-                  <span className="text-[10px] font-semibold text-[#0f766e] print:hidden">
+                  <span className="text-[10px] font-medium text-[#0E807E] print:hidden">
                     Klik bahan untuk 3D &amp; CoA
                   </span>
                 </div>
@@ -742,58 +746,58 @@ export default function ResultPage() {
                             setInspectedIngredient(ing.name);
                           }
                         }}
-                        className="group p-3 rounded-xl bg-slate-50/90 hover:bg-emerald-50/60 border border-slate-200/80 hover:border-[#14b8a6] transition cursor-pointer flex flex-col gap-1.5"
+                        className="group p-3 rounded-[12px] bg-[#f8fdfb] hover:bg-[#eefbf7] border border-[#0B2B26]/10 hover:border-[#0E807E]/40 transition cursor-pointer flex flex-col gap-1.5"
                       >
                         <div className="flex items-start justify-between gap-2">
                           <div>
                             <div className="flex items-center gap-1.5 flex-wrap">
-                              <span className="font-bold text-slate-900 text-xs sm:text-sm group-hover:text-[#0f766e] transition-colors">
+                              <span className="font-medium text-[#0B2B26] text-xs sm:text-sm group-hover:text-[#0E807E] transition-colors">
                                 {ing.name}
                               </span>
-                              <span className="text-[10px] font-mono text-slate-400">
+                              <span className="text-[10px] font-mono text-[#2E524C]">
                                 {ing.molecularFormula || prof.molecularFormula}
                               </span>
                             </div>
-                            <p className="text-[11px] text-slate-500">
-                              {ing.category} · {ing.riskNote}
+                            <p className="text-[11px] text-[#2E524C]">
+                              {ing.category} · {ing.riskNote.replace(/\s*—\s*/g, ", ")}
                             </p>
                           </div>
 
                           <div className="text-right font-mono shrink-0 tabular-nums">
-                            <span className="text-xs sm:text-sm font-extrabold text-slate-900">
+                            <span className="text-xs sm:text-sm font-medium text-[#0E807E]">
                               {ing.conc}
                             </span>
-                            <span className="text-[10px] text-slate-500 block">
+                            <span className="text-[10px] text-[#2E524C] block">
                               {weightG} g
                             </span>
                           </div>
                         </div>
 
                         {/* Supplier, Halal & Compatibility Row */}
-                        <div className="pt-1.5 border-t border-slate-200/60 flex flex-wrap items-center justify-between gap-1.5 text-[10px]">
-                          <div className="flex items-center gap-1 text-slate-600">
-                            <Building2 className="w-3 h-3 text-[#0f766e] shrink-0" />
-                            <span className="font-semibold text-slate-800">{ing.supplier}</span>
+                        <div className="pt-1.5 border-t border-[#0B2B26]/8 flex flex-wrap items-center justify-between gap-1.5 text-[10px]">
+                          <div className="flex items-center gap-1 text-[#2E524C]">
+                            <Building2 className="w-3 h-3 text-[#0E807E] shrink-0" aria-hidden="true" />
+                            <span className="font-medium text-[#0B2B26]">{ing.supplier}</span>
                             <span aria-hidden="true">·</span>
                             {ing.isHalal ? (
-                              <span className="text-[#0f766e] font-bold flex items-center gap-0.5">
-                                <CheckCircle2 className="w-3 h-3" />
+                              <span className="text-[#146c43] font-medium flex items-center gap-0.5">
+                                <CheckCircle2 className="w-3 h-3" aria-hidden="true" />
                                 <span>{ing.halalBody || "Halal"}</span>
                               </span>
                             ) : (
-                              <span className="text-amber-600 font-semibold flex items-center gap-0.5">
-                                <AlertTriangle className="w-3 h-3" />
+                              <span className="text-[#9a6700] font-medium flex items-center gap-0.5">
+                                <AlertTriangle className="w-3 h-3" aria-hidden="true" />
                                 <span>CoA</span>
                               </span>
                             )}
                           </div>
 
-                          <div className="flex items-center gap-1.5 font-mono">
-                            <span className="text-slate-600">
-                              Compat: <strong className="text-[#0f766e]">{compat}%</strong>
+                          <div className="flex items-center gap-1.5 font-mono tabular-nums">
+                            <span className="text-[#2E524C]">
+                              Compat: <span className="font-medium text-[#0E807E]">{compat}%</span>
                             </span>
-                            <span className="inline-flex items-center gap-0.5 text-[#0f766e] font-sans font-bold group-hover:underline print:hidden">
-                              <Atom className="w-3 h-3" />
+                            <span className="inline-flex items-center gap-0.5 text-[#0E807E] font-medium group-hover:underline print:hidden">
+                              <Atom className="w-3 h-3" aria-hidden="true" />
                               <span>3D</span>
                             </span>
                           </div>
@@ -807,38 +811,38 @@ export default function ResultPage() {
           ))}
         </div>
 
-        {/* TAHAP 6, 7, 8 & 9: RENCANA PERCOBAAN (TRIAL PLANNER), LEARNING LOOP & DOKUMENTASI BPOM/HALAL */}
+        {/* TAHAP 6, 7, 8 & 9: TRIAL PLANNER, LEARNING LOOP & DOKUMENTASI */}
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-          {/* TAHAP 6: RENCANA PERCOBAAN LAB (TRIAL PLANNER) */}
-          <div className="lg:col-span-4 bg-white p-6 sm:p-7 rounded-[2rem] shadow-sm border border-emerald-900/10">
-            <span className="text-[11px] font-mono font-extrabold text-[#0f766e] uppercase">
+          {/* TAHAP 6: RENCANA PERCOBAAN LAB */}
+          <div className="lg:col-span-4 bg-white p-6 sm:p-7 rounded-[16px] border border-[#0B2B26]/10">
+            <span className="text-[11px] font-medium text-[#0E807E] uppercase tracking-[0.12em]">
               TAHAP 6 · TRIAL PLANNER
             </span>
-            <h3 className="text-lg font-extrabold text-slate-900 mt-0.5 mb-2">
+            <h3 className="text-lg font-medium text-[#0B2B26] mt-0.5 mb-2">
               Rencana Percobaan Lab Efisien
             </h3>
-            <p className="text-xs text-slate-600 leading-relaxed mb-4">
+            <p className="text-xs text-[#2E524C] leading-relaxed mb-4">
               AI menyusun jadwal percobaan lab agar tim R&amp;D maklon tidak buang bahan dan waktu:
             </p>
             <div className="space-y-2.5 text-xs">
-              <div className="p-3 rounded-xl bg-slate-50 border border-slate-200/80">
-                <strong className="text-slate-900 block">
+              <div className="p-3.5 rounded-[12px] bg-[#f4fbf8] border border-[#0B2B26]/10">
+                <span className="font-medium text-[#0B2B26] block mb-1">
                   1. Jumlah Batch &amp; Variabel Prioritas
-                </strong>
-                <span className="text-slate-600">
+                </span>
+                <span className="text-[#2E524C]">
                   3 Lab Trial @ {batchGrams}g: Batch 1 (Formula C Stok Gudang), Batch 2 (Formula B
                   Optimasi HPP/Halal), Batch 3 (Formula A Performa Maksimal). Variasikan rasio
                   pengental ±0.15% terlebih dahulu.
                 </span>
               </div>
-              <div className="p-3 rounded-xl bg-slate-50 border border-slate-200/80">
-                <strong className="text-slate-900 block">
+              <div className="p-3.5 rounded-[12px] bg-[#f4fbf8] border border-[#0B2B26]/10">
+                <span className="font-medium text-[#0B2B26] block mb-1">
                   2. Parameter Uji Wajib Laboratorium
-                </strong>
-                <ul className="mt-1 space-y-1 text-slate-600 list-disc list-inside">
+                </span>
+                <ul className="mt-1 space-y-1 text-[#2E524C] list-disc list-inside">
                   <li>Organoleptik: Warna, bau, tekstur &amp; after-feel di kulit</li>
-                  <li>pH Terkalibrasi: Target {formData.targetPh} (25°C)</li>
-                  <li>Viskositas Brookfield: Target {formData.targetViscosity}</li>
+                  <li>pH Terkalibrasi: Target <span className="font-mono tabular-nums">{formData.targetPh}</span> (25°C)</li>
+                  <li>Viskositas Brookfield: Target <span className="font-mono tabular-nums">{formData.targetViscosity}</span></li>
                   <li>Stabilitas Dipercepat: Oven 45°C (28 hari) &amp; 3 siklus Freeze-Thaw</li>
                   <li>Uji Cemaran Mikroba &amp; Efektivitas Pengawet (ALT/AKK BPOM)</li>
                 </ul>
@@ -847,15 +851,15 @@ export default function ResultPage() {
           </div>
 
           {/* TAHAP 7 & 8: INPUT HASIL RACIKAN LAB & AI LEARNING LOOP */}
-          <div className="lg:col-span-5 bg-white p-6 sm:p-7 rounded-[2rem] shadow-sm border border-emerald-900/10 flex flex-col justify-between">
+          <div className="lg:col-span-5 bg-white p-6 sm:p-7 rounded-[16px] border border-[#0B2B26]/10 flex flex-col justify-between">
             <div>
-              <span className="text-[11px] font-mono font-extrabold text-[#0f766e] uppercase">
+              <span className="text-[11px] font-medium text-[#0E807E] uppercase tracking-[0.12em]">
                 TAHAP 7 &amp; 8 · TIM R&amp;D MERACIK &amp; LEARNING LOOP
               </span>
-              <h3 className="text-lg font-extrabold text-slate-900 mt-0.5 mb-2">
+              <h3 className="text-lg font-medium text-[#0B2B26] mt-0.5 mb-2">
                 Catat Hasil Lab &amp; Diagnosis Perbaikan AI
               </h3>
-              <p className="text-xs text-slate-600 leading-relaxed mb-3">
+              <p className="text-xs text-[#2E524C] leading-relaxed mb-3">
                 Pilih hasil pengamatan fisik setelah diracik di lab. Bila terjadi kendala (pecah
                 emulsi, warna berubah, tekstur encer), AI menganalisis penyebab dan menyimpan
                 pelajaran ke <em>Knowledge Base</em> maklon:
@@ -863,7 +867,7 @@ export default function ResultPage() {
 
               <label
                 htmlFor="lab-outcome-select"
-                className="block text-[11px] font-extrabold uppercase text-slate-700 mb-1"
+                className="block text-[11px] font-medium uppercase tracking-[0.1em] text-[#0E807E] mb-1.5"
               >
                 Status Hasil Percobaan Batch Lab (Tahap 7):
               </label>
@@ -874,7 +878,7 @@ export default function ResultPage() {
                   setSelectedLabOutcome(e.target.value as LabOutcomeType);
                   setSavedKnowledgeMsg("");
                 }}
-                className="w-full p-2.5 rounded-xl border border-slate-200 bg-slate-50 text-xs font-bold text-slate-900 mb-3 focus:outline-none focus:ring-2 focus:ring-[#14b8a6]"
+                className="w-full min-h-[44px] p-2.5 rounded-[12px] border border-[#0B2B26]/15 bg-[#f8fdfb] text-xs font-medium text-[#0B2B26] mb-3 focus:outline-none focus:border-[#0E807E]"
               >
                 {Object.entries(LAB_OUTCOME_DIAGNOSES).map(([key, item]) => (
                   <option key={key} value={key}>
@@ -888,25 +892,25 @@ export default function ResultPage() {
                 value={customLabNotes}
                 onChange={(e) => setCustomLabNotes(e.target.value)}
                 placeholder="Catatan tambahan R&D (opsional, misal: homogenizer 3000 rpm, pH aktual 5.3)..."
-                className="w-full p-2.5 rounded-xl border border-slate-200 bg-white text-xs text-slate-800 mb-3 focus:outline-none focus:ring-2 focus:ring-[#14b8a6]"
+                className="w-full min-h-[44px] p-2.5 rounded-[12px] border border-[#0B2B26]/15 bg-[#f8fdfb] text-xs text-[#0B2B26] placeholder:text-[#2E524C]/50 mb-3 focus:outline-none focus:border-[#0E807E]"
               />
 
-              <div className="p-3.5 rounded-2xl bg-emerald-50/80 border border-emerald-200/80 text-xs space-y-1.5 mb-3">
-                <div className="font-mono text-[10px] font-extrabold text-[#0f766e]">
+              <div className="p-3.5 rounded-[12px] bg-[#f4fbf8] border border-[#0B2B26]/10 text-xs space-y-1.5 mb-3">
+                <div className="text-[11px] font-mono font-medium text-[#0E807E]">
                   {activeDiagnosis.statusBadge}
                 </div>
                 <div>
-                  <strong className="text-slate-900">Analisis Penyebab (Root Cause): </strong>
-                  <span className="text-slate-700">{activeDiagnosis.rootCause}</span>
+                  <span className="font-medium text-[#0B2B26]">Analisis Penyebab (Root Cause): </span>
+                  <span className="text-[#2E524C]">{activeDiagnosis.rootCause}</span>
                 </div>
                 <div>
-                  <strong className="text-slate-900">Rekomendasi Batch Berikutnya: </strong>
-                  <span className="text-slate-700">{activeDiagnosis.nextBatchFix}</span>
+                  <span className="font-medium text-[#0B2B26]">Rekomendasi Batch Berikutnya: </span>
+                  <span className="text-[#2E524C]">{activeDiagnosis.nextBatchFix}</span>
                 </div>
               </div>
 
               {savedKnowledgeMsg && (
-                <div className="p-2.5 rounded-xl bg-[#12382f] text-emerald-100 text-[11px] font-medium mb-3">
+                <div className="p-3 rounded-[12px] bg-[#eaf9f0] border border-[#0E807E]/35 text-[#146c43] text-[11px] font-medium mb-3">
                   ✓ {savedKnowledgeMsg}
                 </div>
               )}
@@ -916,52 +920,52 @@ export default function ResultPage() {
               <button
                 type="button"
                 onClick={handleSaveLearningLoop}
-                className="px-4 py-2 rounded-full bg-[#0f766e] hover:bg-[#12382f] text-white text-xs font-bold transition cursor-pointer"
+                className="btn-glass-primary min-h-[44px] px-4 py-2.5 text-xs cursor-pointer"
               >
-                Simpan ke Knowledge Base Maklon
+                <span>Simpan ke Knowledge Base Maklon</span>
               </button>
               <button
                 type="button"
                 onClick={handleConsultAiOnFailure}
-                className="px-4 py-2 rounded-full bg-slate-100 hover:bg-emerald-50 text-[#12382f] border border-slate-200 text-xs font-bold transition cursor-pointer"
+                className="btn-glass-secondary min-h-[44px] px-4 py-2.5 text-xs cursor-pointer"
               >
-                Diskusikan Revisi di AI Consultant →
+                <span>Diskusikan Revisi di AI Consultant →</span>
               </button>
             </div>
           </div>
 
-          {/* TAHAP 9: DOKUMENTASI FINAL (FORMULA SHEET, NOTIFIKASI BPOM & HALAL) */}
-          <div className="lg:col-span-3 bg-white p-6 sm:p-7 rounded-[2rem] shadow-sm border border-emerald-900/10 flex flex-col justify-between">
+          {/* TAHAP 9: DOKUMENTASI FINAL */}
+          <div className="lg:col-span-3 bg-white p-6 sm:p-7 rounded-[16px] border border-[#0B2B26]/10 flex flex-col justify-between">
             <div>
-              <span className="text-[11px] font-mono font-extrabold text-[#0f766e] uppercase">
+              <span className="text-[11px] font-medium text-[#0E807E] uppercase tracking-[0.12em]">
                 TAHAP 9 · DOKUMENTASI FINAL
               </span>
-              <h3 className="text-lg font-extrabold text-slate-900 mt-0.5 mb-2">
+              <h3 className="text-lg font-medium text-[#0B2B26] mt-0.5 mb-2">
                 Paket Dokumen BPOM &amp; Halal
               </h3>
-              <p className="text-xs text-slate-600 leading-relaxed mb-3">
+              <p className="text-xs text-[#2E524C] leading-relaxed mb-3">
                 Setelah formula disetujui, AI menyiapkan draf kelengkapan dokumen produksi &amp;
                 registrasi:
               </p>
-              <ul className="space-y-2 text-xs text-slate-700 mb-4">
+              <ul className="space-y-2 text-xs text-[#2E524C] mb-4">
                 <li className="flex items-start gap-2">
-                  <CheckCircle2 className="w-4 h-4 text-[#0f766e] shrink-0 mt-0.5" />
+                  <CheckCircle2 className="w-4 h-4 text-[#0E807E] shrink-0 mt-0.5" aria-hidden="true" />
                   <span>
-                    <strong>Draft Formula Sheet:</strong> Komposisi % w/w, gramasi per batch{" "}
+                    <span className="font-medium text-[#0B2B26]">Draft Formula Sheet:</span> Komposisi % w/w, gramasi per batch{" "}
                     {batchGrams}g, INCI &amp; nomor CAS lengkap.
                   </span>
                 </li>
                 <li className="flex items-start gap-2">
-                  <CheckCircle2 className="w-4 h-4 text-[#0f766e] shrink-0 mt-0.5" />
+                  <CheckCircle2 className="w-4 h-4 text-[#0E807E] shrink-0 mt-0.5" aria-hidden="true" />
                   <span>
-                    <strong>Ringkasan Data Notifikasi BPOM:</strong> Draf Dokumen Informasi Produk
+                    <span className="font-medium text-[#0B2B26]">Ringkasan Data Notifikasi BPOM:</span> Draf Dokumen Informasi Produk
                     (DIP) Bagian I–IV &amp; klaim kosmetik.
                   </span>
                 </li>
                 <li className="flex items-start gap-2">
-                  <CheckCircle2 className="w-4 h-4 text-[#0f766e] shrink-0 mt-0.5" />
+                  <CheckCircle2 className="w-4 h-4 text-[#0E807E] shrink-0 mt-0.5" aria-hidden="true" />
                   <span>
-                    <strong>Checklist Dokumen Halal:</strong> Matriks bahan baku SJPH BPJPH / LPPOM
+                    <span className="font-medium text-[#0B2B26]">Checklist Dokumen Halal:</span> Matriks bahan baku SJPH BPJPH / LPPOM
                     MUI &amp; CoA supplier.
                   </span>
                 </li>
@@ -972,17 +976,17 @@ export default function ResultPage() {
               <button
                 type="button"
                 onClick={handleExportCSV}
-                className="w-full py-2.5 px-4 rounded-full bg-[#12382f] hover:bg-[#0f766e] text-white text-xs font-bold transition flex items-center justify-center gap-2 cursor-pointer"
+                className="btn-glass-primary min-h-[44px] w-full py-2.5 px-4 text-xs flex items-center justify-center gap-2 cursor-pointer"
               >
-                <FileSpreadsheet className="w-4 h-4" />
+                <FileSpreadsheet className="w-4 h-4 text-[#0E807E]" aria-hidden="true" />
                 <span>Unduh Draft Formula Sheet (CSV)</span>
               </button>
               <button
                 type="button"
                 onClick={handlePrintStudyReport}
-                className="w-full py-2.5 px-4 rounded-full bg-emerald-50 hover:bg-emerald-100 text-[#12382f] border border-emerald-200 text-xs font-bold transition flex items-center justify-center gap-2 cursor-pointer"
+                className="btn-glass-secondary min-h-[44px] w-full py-2.5 px-4 text-xs flex items-center justify-center gap-2 cursor-pointer"
               >
-                <Printer className="w-4 h-4 text-[#0f766e]" />
+                <Printer className="w-4 h-4 text-[#0E807E]" aria-hidden="true" />
                 <span>Cetak Dossier BPOM &amp; Halal (PDF)</span>
               </button>
             </div>
@@ -990,33 +994,33 @@ export default function ResultPage() {
         </div>
       </main>
 
-      {/* MODAL 1: 3D WEBGL MOLECULE & INGREDIENT DETAIL INSPECTOR (Features C & D) */}
+      {/* MODAL 1: 3D WEBGL MOLECULE & INGREDIENT DETAIL INSPECTOR */}
       {inspectedIngredient && inspectedProf && (
         <div
-          className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-xs flex items-center justify-center p-4"
+          className="fixed inset-0 z-50 bg-[#eaf8f3]/55 backdrop-blur-md flex items-center justify-center p-4"
           role="dialog"
           aria-modal="true"
           aria-label={`3D Molecular Inspector for ${inspectedProf.inciName}`}
         >
-          <div className="bg-white rounded-[2rem] max-w-2xl w-full p-6 sm:p-8 shadow-2xl border border-emerald-900/15 max-h-[90vh] overflow-y-auto">
+          <div className="card-glass-optical card-glass-static max-w-2xl w-full p-6 sm:p-8 max-h-[90vh] overflow-y-auto text-[#0B2B26]">
             <div className="flex items-start justify-between gap-4 mb-4">
               <div>
-                <p className="text-xs font-mono text-[#0f766e] font-bold">
+                <p className="text-xs font-mono text-[#0E807E] font-medium tabular-nums">
                   CAS {inspectedProf.casNumber} · {inspectedProf.molecularFormula} ·{" "}
                   {inspectedProf.molecularWeight}
                 </p>
-                <h2 className="text-2xl font-extrabold text-slate-900 mt-0.5">
+                <h2 className="text-2xl font-medium text-[#0B2B26] mt-0.5">
                   {inspectedProf.inciName}
                 </h2>
-                <p className="text-xs text-slate-500">{inspectedProf.functionalCategory}</p>
+                <p className="text-xs text-[#2E524C]">{inspectedProf.functionalCategory}</p>
               </div>
               <button
                 type="button"
                 onClick={() => setInspectedIngredient(null)}
                 aria-label="Close 3D Molecule Inspector"
-                className="p-2 rounded-full bg-slate-100 hover:bg-slate-200 text-slate-700 cursor-pointer"
+                className="btn-glass-compact min-h-[44px] min-w-[44px] flex items-center justify-center p-2 cursor-pointer"
               >
-                <X className="w-5 h-5" />
+                <X className="w-5 h-5 text-[#0B2B26]" aria-hidden="true" />
               </button>
             </div>
 
@@ -1028,44 +1032,44 @@ export default function ResultPage() {
             </div>
 
             <div className="grid grid-cols-3 gap-3 mb-4">
-              <div className="bg-slate-50 p-3 rounded-xl border border-slate-200">
-                <span className="text-[10px] font-mono uppercase text-slate-400 block">
+              <div className="bg-[#f4fbf8] p-3 rounded-[12px] border border-[#0B2B26]/10">
+                <span className="text-[10px] font-sans uppercase tracking-[0.06em] text-[#2E524C] block">
                   Compatibility Score
                 </span>
-                <span className="text-lg font-mono font-extrabold text-[#0f766e] tabular-nums">
+                <span className="text-lg font-mono font-medium text-[#0E807E] tabular-nums">
                   {inspectedProf.compatibilityScore}%
                 </span>
               </div>
-              <div className="bg-slate-50 p-3 rounded-xl border border-slate-200">
-                <span className="text-[10px] font-mono uppercase text-slate-400 block">
+              <div className="bg-[#f4fbf8] p-3 rounded-[12px] border border-[#0B2B26]/10">
+                <span className="text-[10px] font-sans uppercase tracking-[0.06em] text-[#2E524C] block">
                   Optimal pH
                 </span>
-                <span className="text-xs font-mono font-bold text-slate-900 tabular-nums">
+                <span className="text-xs font-mono font-medium text-[#0B2B26] tabular-nums">
                   {inspectedProf.optimalPhRange}
                 </span>
               </div>
-              <div className="bg-slate-50 p-3 rounded-xl border border-slate-200">
-                <span className="text-[10px] font-mono uppercase text-slate-400 block">
+              <div className="bg-[#f4fbf8] p-3 rounded-[12px] border border-[#0B2B26]/10">
+                <span className="text-[10px] font-sans uppercase tracking-[0.06em] text-[#2E524C] block">
                   Usage Rate
                 </span>
-                <span className="text-xs font-mono font-bold text-slate-900 tabular-nums">
+                <span className="text-xs font-mono font-medium text-[#0B2B26] tabular-nums">
                   {inspectedProf.typicalUsageRate}
                 </span>
               </div>
             </div>
 
-            <p className="text-xs text-slate-600 leading-relaxed mb-4">
-              {inspectedProf.mechanismOfAction}
+            <p className="text-xs text-[#2E524C] leading-relaxed mb-4">
+              {inspectedProf.mechanismOfAction.replace(/\s*—\s*/g, ", ")}
             </p>
 
-            <div className="text-xs text-slate-600 space-y-1.5 bg-emerald-50/60 p-4 rounded-xl border border-emerald-200/70">
+            <div className="text-xs text-[#2E524C] space-y-1.5 bg-[#f4fbf8] p-4 rounded-[12px] border border-[#0B2B26]/10">
               <div>
-                <strong className="text-slate-900">Synergistic With: </strong>
+                <span className="font-medium text-[#0B2B26]">Synergistic With: </span>
                 <span>{inspectedProf.synergisticWith.join(" · ")}</span>
               </div>
               <div>
-                <strong className="text-slate-900">Certifications: </strong>
-                <span className="text-[#0f766e] font-bold">
+                <span className="font-medium text-[#0B2B26]">Certifications: </span>
+                <span className="text-[#0E807E] font-medium">
                   {inspectedProf.certifications.join(" · ")}
                 </span>
               </div>
@@ -1074,21 +1078,21 @@ export default function ResultPage() {
         </div>
       )}
 
-      {/* MODAL 2: SHAREABLE STUDY REPORT MODAL (Feature B) */}
+      {/* MODAL 2: SHAREABLE STUDY REPORT MODAL */}
       {shareModalOpen && (
         <div
-          className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-xs flex items-center justify-center p-4"
+          className="fixed inset-0 z-50 bg-[#eaf8f3]/55 backdrop-blur-md flex items-center justify-center p-4"
           role="dialog"
           aria-modal="true"
           aria-label="Share Formulation Study Report"
         >
-          <div className="bg-white rounded-[2rem] max-w-xl w-full p-6 sm:p-8 shadow-2xl border border-emerald-900/15">
+          <div className="card-glass-optical card-glass-static max-w-xl w-full p-6 sm:p-8 text-[#0B2B26]">
             <div className="flex items-start justify-between gap-4 mb-4">
               <div>
-                <p className="text-xs font-mono text-[#0f766e] font-bold uppercase">
+                <p className="text-[11px] font-sans text-[#0E807E] font-medium uppercase tracking-[0.12em]">
                   SHAREABLE R&amp;D DOSSIER
                 </p>
-                <h2 className="text-xl font-extrabold text-slate-900 mt-0.5">
+                <h2 className="text-xl font-medium text-[#0B2B26] mt-0.5">
                   Share Formulation Study Report
                 </h2>
               </div>
@@ -1096,13 +1100,13 @@ export default function ResultPage() {
                 type="button"
                 onClick={() => setShareModalOpen(false)}
                 aria-label="Close Share Modal"
-                className="p-2 rounded-full bg-slate-100 hover:bg-slate-200 text-slate-700 cursor-pointer"
+                className="btn-glass-compact min-h-[44px] min-w-[44px] flex items-center justify-center p-2 cursor-pointer"
               >
-                <X className="w-5 h-5" />
+                <X className="w-5 h-5 text-[#0B2B26]" aria-hidden="true" />
               </button>
             </div>
 
-            <pre className="w-full bg-slate-900 text-emerald-100 p-4 rounded-2xl text-xs font-mono overflow-x-auto max-h-72 whitespace-pre-wrap leading-relaxed mb-5">
+            <pre className="w-full bg-white/88 text-[#0B2B26] p-4 rounded-[12px] border border-[#0B2B26]/10 text-xs font-sans overflow-x-auto max-h-72 whitespace-pre-wrap leading-relaxed mb-5">
               {buildShareableSummary()}
             </pre>
 
@@ -1110,24 +1114,24 @@ export default function ResultPage() {
               <button
                 type="button"
                 onClick={handleExportCSV}
-                className="px-4 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-bold transition flex items-center gap-1.5 cursor-pointer"
+                className="btn-glass-secondary min-h-[44px] px-4 py-2.5 text-xs flex items-center gap-1.5 cursor-pointer"
               >
-                <FileSpreadsheet className="w-4 h-4" />
+                <FileSpreadsheet className="w-4 h-4 text-[#0E807E]" aria-hidden="true" />
                 <span>Download CSV</span>
               </button>
               <button
                 type="button"
                 onClick={handleCopyShareReport}
-                className="px-5 py-2.5 rounded-xl bg-[#0f766e] hover:bg-[#12382f] text-white text-xs font-bold transition flex items-center gap-1.5 cursor-pointer"
+                className="btn-glass-primary min-h-[44px] px-5 py-2.5 text-xs flex items-center gap-1.5 cursor-pointer"
               >
                 {copiedShare ? (
                   <>
-                    <Check className="w-4 h-4" />
+                    <Check className="w-4 h-4 text-[#0E807E]" aria-hidden="true" />
                     <span>Copied Study Summary!</span>
                   </>
                 ) : (
                   <>
-                    <Copy className="w-4 h-4" />
+                    <Copy className="w-4 h-4 text-[#0E807E]" aria-hidden="true" />
                     <span>Copy Study Report</span>
                   </>
                 )}

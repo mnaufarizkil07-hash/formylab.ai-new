@@ -64,7 +64,7 @@ export function cleanComputerArtifacts(raw: string): string {
       // Remove stray LaTeX spacing commands
       .replace(/\\[,;!]\s*/g, " ")
       .replace(/\\quad\b|\\qquad\b/g, " ")
-      // Strip search engine breadcrumb trails вместе with any wrapping Markdown (**...**, __...__) and trailing dash (—)
+      // Strip search engine breadcrumb trails together with any wrapping Markdown (**...**, __...__) and trailing dash (—)
       .replace(
         /(?:\*\*|__|\*|_)?\s*(?:https?:\/\/|www\.)?[a-z0-9.-]+\.[a-z]{2,}(?:\s*(?:>|›|»)\s*[^\s\n|*]+)+\s*(?:\*\*|__|\*|_)?\s*(?:[—–:-]\s*)?/gi,
         " "
@@ -78,7 +78,7 @@ export function cleanComputerArtifacts(raw: string): string {
         /\b(?:Sanggahan|Disclaimer|Terjemahkan\s+halaman\s+ini|Lihat\s+hasil\s+untuk|Hasil\s+pencarian\s+web)\s*:?[^\n]*/gi,
         ""
       )
-      // Strip web snippet publication dates embedded in narrative sentences (e.g. "(Fri, 13 Nov 2026)", "(Diterbitkan 12 Mei 2024)", "12 Mei 2024 — ")
+      // Strip web snippet publication dates embedded in narrative sentences
       .replace(
         /[([][\s]*(?:(?:diterbitkan|dipublikasikan|diperbarui|updated|published)\s*(?:pada)?\s*)?(?:(?:Sen|Sel|Rab|Kam|Jum|Sab|Min|Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\s*,?\s*)?\d{1,2}\s+(?:Jan(?:uari|uary)?|Feb(?:ruari|ruary)?|Mar(?:et|ch)?|Apr(?:il)?|Mei|May|Jun(?:i|e)?|Jul(?:i|y)?|Agu(?:stus)?|Aug(?:ust)?|Sep(?:tember)?|Okt(?:ober)?|Oct(?:ober)?|Nov(?:ember)?|Des(?:ember)?|Dec(?:ember)?)\s+\d{4}[^)\]\n]*[)\]]/gi,
         ""
@@ -104,19 +104,15 @@ export function cleanComputerArtifacts(raw: string): string {
 export function stripOrphanAsterisksInLine(line: string): string {
   if (!line || !line.includes("*")) return line;
 
-  // Abaikan baris separator horizontal (***) atau baris tabel (| ... |)
   const trimmed = line.trim();
   if (/^\*{3,}$/.test(trimmed)) return line;
 
-  // Pisahkan prefix bullet/numbering jika ada (mis. "- ", "* ", "• ", "1. ")
   const listPrefixMatch = line.match(/^(\s*(?:[-*•]|\d+\.)\s+)(.*)$/);
   const prefix = listPrefixMatch ? listPrefixMatch[1] : "";
   let body = listPrefixMatch ? listPrefixMatch[2] : line;
 
-  // Bersihkan tanda * atau ** yatim yang menggantung sendirian tepat di awal isi bullet (mis. "- * Teks" atau "- ** Teks")
   body = body.replace(/^(?:\*\*|\*)\s+(?=[A-Za-z0-9([])/, "");
 
-  // 1. Lindungi semua pasangan **bold** yang valid pada baris yang sama dengan placeholder sementara
   const boldPlaceholders: string[] = [];
   let working = body.replace(/\*\*([^*\n]+?)\*\*/g, (fullMatch) => {
     const idx = boldPlaceholders.length;
@@ -124,19 +120,15 @@ export function stripOrphanAsterisksInLine(line: string): string {
     return `\u0000BOLD_${idx}\u0000`;
   });
 
-  // Hapus sisa ** yatim (yang tidak memiliki pasangan di baris yang sama, seperti "Komposisi Teoretis (w/w %):**" atau "**Teks tanpa penutup")
   working = working
     .replace(/:\s*\*\*+(?=\s|$|[.,;!?—–-])/g, ":")
     .replace(/\*\*+/g, "");
 
-  // 2. Sebelum memasangkan *italic*, cek apakah ada pola "Label:*" di mana tidak ada "*" pembuka sebelum ":"
-  // Dalam Markdown, ":*" yang diikuti spasi atau akhir baris hanya bisa menjadi penutup; jika tidak ada "*" sebelumnya, maka itu yatim (seperti "Fase Air:*").
   working = working.replace(
     /^([^*\n:]+):\*(?=\s|$|[.,;!?—–-])/g,
     "$1:"
   );
 
-  // Lindungi semua pasangan *italic* yang valid pada baris yang sama (tidak diawali/diakhiri spasi di dalam *)
   const italicPlaceholders: string[] = [];
   working = working.replace(
     /\*([^\s*\n][^*\n]*?[^\s*\n]|[^\s*\n])\*/g,
@@ -147,8 +139,6 @@ export function stripOrphanAsterisksInLine(line: string): string {
     }
   );
 
-  // Hapus sisa * yatim yang menggantung setelah titik dua (:*), di awal baris/kata, atau di ujung baris
-  // (Tetap pertahankan perkalian matematika seperti "2 * 3")
   working = working
     .replace(/:\s*\*(?=\s|$|[.,;!?—–-])/g, ":")
     .replace(/(?:^|\s)\*(?=\s|$)/g, " ")
@@ -156,7 +146,6 @@ export function stripOrphanAsterisksInLine(line: string): string {
     .replace(/([^\d\s])\*(?=\s|$)/g, "$1")
     .replace(/(?:^|\s)\*(?=[^\d\s])/g, (m) => (m.startsWith(" ") ? " " : ""));
 
-  // Kembalikan placeholder *italic* dan **bold**
   working = working.replace(
     /\u0000ITALIC_(\d+)\u0000/g,
     (_, idx) => italicPlaceholders[Number(idx)] || ""
@@ -177,10 +166,8 @@ export function stripDanglingMarkdownAndLeadingSymbols(input: string): string {
   if (!input) return "";
 
   const withoutEmptyWrappers = input
-    // Remove empty bold/italic/underline combinations like "**__", "__**", "****", "** **", "** — **", "()"
     .replace(/(?:\*\*|__){1,3}\s*(?:[—–:-]\s*)?(?:\*\*|__){1,3}/g, " ")
     .replace(/\(\s*\)|\[\s*\]/g, " ")
-    // Remove standalone "**", "__" followed by whitespace, dash, or end of line
     .replace(/(?:^|\s)(?:\*\*|__)+(?=\s|$|[—–:.,;!?-])/gm, " ");
 
   const lines = withoutEmptyWrappers.split("\n");
@@ -188,18 +175,15 @@ export function stripDanglingMarkdownAndLeadingSymbols(input: string): string {
     const trimmed = line.trim();
     if (!trimmed) return "";
 
-    // Keep Markdown table rows intact (clean orphan asterisks inside each cell on render)
     if (trimmed.startsWith("|")) {
       return line;
     }
 
-    // Preserve Markdown headings (#, ##, ###, ####) while cleaning orphan asterisks inside the heading text
     const headingMatch = line.match(/^(\s*#{1,6}\s+)(.*)$/);
     if (headingMatch) {
       return `${headingMatch[1]}${stripOrphanAsterisksInLine(headingMatch[2]).trim()}`;
     }
 
-    // Keep valid bullet list items (e.g. "- **Point**: ..." or "- Text") intact, cleaning dangling/orphan symbols after the bullet
     const bulletMatch = line.match(/^(\s*[-*•]\s+)(.*)$/);
     if (bulletMatch) {
       const rest = stripOrphanAsterisksInLine(
@@ -213,19 +197,14 @@ export function stripDanglingMarkdownAndLeadingSymbols(input: string): string {
       return rest ? `${bulletMatch[1]}${rest}` : "";
     }
 
-    // For regular prose paragraphs:
-    // 1. Strip any leading dangling/unpaired Markdown symbols (*, _, #, -, —, (, ), >, ›) hanging alone with spaces/dashes
     const cleanedLine = line
       .replace(/^\s*(?:[*_#~—–:()[\]>›»-]+\s+)+/, "")
       .replace(/^\s*(?:\*\*|__)+(?:\s*[—–:-]\s*)?(?=\s|$)/, "")
-      // 2. Strip mixed empty markers like "**__Hasil" or "__**Hasil" or "** — Hasil" at the start of a paragraph
       .replace(/^\s*(?:\*\*__|__\*\*|\*_|_\*)+[\s*_#~—–:()[\]>›»-]*/, "")
-      // 3. Strip unpaired "**" or "__" or "*" or "_" at the start of the line when there is no matching closing marker on that line
       .replace(
         /^\s*(?:\*\*|__|\*|_)+(?![^\n]*?(?:\*\*|__|\*|_))[\s*_#~—–:()[\]>›»-]*/,
         ""
       )
-      // 4. Strip any leftover leading dash/colon/bracket separator before the first letter
       .replace(/^\s*[—–:;()[\]>›»#]+\s*/, "");
 
     return stripOrphanAsterisksInLine(cleanedLine);
@@ -234,7 +213,6 @@ export function stripDanglingMarkdownAndLeadingSymbols(input: string): string {
   return cleanedLines
     .join("\n")
     .replace(/^\s*(?:[*_#~—–:()[\]>›»-]+\s*)+(?=[A-Za-z0-9])/, (match) => {
-      // Preserve a valid opening "**Word**" or "*Word*" if it is a clean marker
       if (/^\s*\*\*$/.test(match)) return "**";
       if (/^\s*\*$/.test(match)) return "*";
       return "";
@@ -242,12 +220,17 @@ export function stripDanglingMarkdownAndLeadingSymbols(input: string): string {
     .trim();
 }
 
-function renderInlineMarkdown(text: string): React.ReactNode[] {
+type FormattedTone = "light" | "on-dark";
+
+function renderInlineMarkdown(
+  text: string,
+  tone: FormattedTone = "light"
+): React.ReactNode[] {
   const cleaned = stripOrphanAsterisksInLine(text).trim();
   if (!cleaned) return [];
 
+  const isOnDark = tone === "on-dark";
   const parts: React.ReactNode[] = [];
-  // Tokenize **bold**, *italic*, `code`, and [link](url)
   const regex =
     /(\*\*[^*]+\*\*|\*[^*\n]+\*|`[^`\n]+`|\[[^\]]+\]\(https?:\/\/[^\s)]+\))/g;
   let lastIndex = 0;
@@ -261,13 +244,23 @@ function renderInlineMarkdown(text: string): React.ReactNode[] {
     const token = match[0];
     if (token.startsWith("**") && token.endsWith("**")) {
       parts.push(
-        <strong key={`b-${keyIdx++}`} className="font-semibold text-current">
+        <strong
+          key={`b-${keyIdx++}`}
+          className={
+            isOnDark ? "font-medium text-white" : "font-medium text-[#0B2B26]"
+          }
+        >
           {token.slice(2, -2)}
         </strong>
       );
     } else if (token.startsWith("*") && token.endsWith("*")) {
       parts.push(
-        <em key={`i-${keyIdx++}`} className="italic">
+        <em
+          key={`i-${keyIdx++}`}
+          className={
+            isOnDark ? "italic text-white/95" : "italic text-[#2E524C]"
+          }
+        >
           {token.slice(1, -1)}
         </em>
       );
@@ -275,7 +268,11 @@ function renderInlineMarkdown(text: string): React.ReactNode[] {
       parts.push(
         <code
           key={`c-${keyIdx++}`}
-          className="px-1.5 py-0.5 rounded-md bg-emerald-950/8 text-[#12382f] font-mono text-[0.88em] font-medium"
+          className={
+            isOnDark
+              ? "px-1.5 py-0.5 rounded-[6px] bg-white/14 text-[#D9ED91] border border-white/15 font-mono text-[0.88em] font-medium"
+              : "px-1.5 py-0.5 rounded-[6px] bg-[#eaf8f5] text-[#0E807E] border border-[#0B2B26]/10 font-mono text-[0.88em] font-medium"
+          }
         >
           {token.slice(1, -1)}
         </code>
@@ -290,7 +287,11 @@ function renderInlineMarkdown(text: string): React.ReactNode[] {
           href={url}
           target="_blank"
           rel="noopener noreferrer"
-          className="text-emerald-700 underline hover:text-emerald-900 font-medium break-all"
+          className={
+            isOnDark
+              ? "text-[#D9ED91] underline underline-offset-2 hover:text-white font-medium break-all"
+              : "text-[#0E807E] underline underline-offset-2 hover:text-[#0B2B26] font-medium break-all"
+          }
         >
           {label}
         </a>
@@ -331,7 +332,6 @@ export function isTableRowLine(line: string): boolean {
   const trimmed = line.trim();
   if (!trimmed.includes("|")) return false;
   if (trimmed.startsWith("||")) return false;
-  // Either starts and ends with |, or has at least 2 pipe characters separating columns
   const pipeCount = (trimmed.match(/\|/g) || []).length;
   return (
     (trimmed.startsWith("|") && trimmed.endsWith("|") && pipeCount >= 2) ||
@@ -367,15 +367,12 @@ export function parseSegmentIntoBlocks(segment: string): ParsedBlock[] {
   while (i < rawLines.length) {
     const current = rawLines[i].trim();
 
-    // Check if a Markdown table starts at line i
-    // Case A: Line i is a table row AND line i+1 (or next non-empty line) is a table separator or another table row
     if (isTableRowLine(current)) {
       const tableLines: string[] = [];
       let j = i;
       while (j < rawLines.length) {
         const candidate = rawLines[j].trim();
         if (!candidate) {
-          // If an empty line appears between pipe rows (like in Screenshot 2!), peek at j+1
           if (
             j + 1 < rawLines.length &&
             isTableRowLine(rawLines[j + 1].trim())
@@ -400,11 +397,10 @@ export function parseSegmentIntoBlocks(segment: string): ParsedBlock[] {
         const headers = splitTableCells(nonSeparatorRows[0]);
         const rows = nonSeparatorRows.slice(1).map((r) => {
           const cells = splitTableCells(r);
-          // Pad or trim to match header count
           if (cells.length < headers.length) {
             return [
               ...cells,
-              ...Array(headers.length - cells.length).fill("—"),
+              ...Array(headers.length - cells.length).fill("-"),
             ];
           }
           return cells.slice(0, headers.length);
@@ -415,7 +411,6 @@ export function parseSegmentIntoBlocks(segment: string): ParsedBlock[] {
       }
     }
 
-    // Otherwise accumulate regular text line
     const lastBlock = blocks[blocks.length - 1];
     if (lastBlock && lastBlock.type === "lines") {
       lastBlock.lines.push(rawLines[i]);
@@ -428,16 +423,25 @@ export function parseSegmentIntoBlocks(segment: string): ParsedBlock[] {
   return blocks;
 }
 
-export default function FormattedChatText({ content }: { content: string }) {
+export default function FormattedChatText({
+  content,
+  tone = "light",
+}: {
+  content: string;
+  tone?: FormattedTone;
+}) {
   if (!content) return null;
 
+  const isOnDark = tone === "on-dark";
   const sanitizedContent = cleanComputerArtifacts(content);
-
-  // Split by fenced code blocks first
   const segments = sanitizedContent.split(/(```[\s\S]*?```)/g);
 
   return (
-    <div className="space-y-2.5 leading-relaxed text-[14.5px]">
+    <div
+      className={`space-y-2.5 leading-relaxed text-[14.5px] ${
+        isOnDark ? "text-white/95" : "text-[#2E524C]"
+      }`}
+    >
       {segments.map((segment, segIdx) => {
         if (segment.startsWith("```") && segment.endsWith("```")) {
           const codeBody = segment
@@ -447,7 +451,11 @@ export default function FormattedChatText({ content }: { content: string }) {
           return (
             <pre
               key={`code-${segIdx}`}
-              className="p-3.5 rounded-xl bg-[#111815] text-emerald-50 text-xs font-mono overflow-x-auto my-2.5 border border-emerald-900/20"
+              className={`p-3.5 rounded-[16px] text-xs font-mono overflow-x-auto my-2.5 border shadow-none ${
+                isOnDark
+                  ? "bg-white/10 text-white border-white/15"
+                  : "bg-[#f4fbf8] text-[#0B2B26] border-[#0B2B26]/12"
+              }`}
             >
               <code>{codeBody}</code>
             </pre>
@@ -463,37 +471,65 @@ export default function FormattedChatText({ content }: { content: string }) {
                 return (
                   <div
                     key={`tbl-${segIdx}-${bIdx}`}
-                    className="my-3 overflow-x-auto rounded-xl border border-emerald-900/15 bg-white shadow-2xs"
+                    className={`my-3 overflow-x-auto rounded-[16px] border shadow-none ${
+                      isOnDark
+                        ? "border-white/15 bg-white/8"
+                        : "border-[#0B2B26]/12 bg-white"
+                    }`}
                   >
                     <table className="w-full border-collapse text-left text-xs sm:text-[13.5px] tabular-nums">
                       <thead>
-                        <tr className="bg-[#12382f] text-white">
+                        <tr
+                          className={
+                            isOnDark
+                              ? "bg-white/12 text-white"
+                              : "bg-[#f2faf7] text-[#0B2B26]"
+                          }
+                        >
                           {block.headers.map((header, hIdx) => (
                             <th
                               key={`th-${hIdx}`}
-                              className="px-3.5 py-2.5 font-bold tracking-tight border-b border-emerald-950/20 first:rounded-tl-xl last:rounded-tr-xl"
+                              className={`px-3.5 py-2.5 font-medium tracking-tight border-b ${
+                                isOnDark
+                                  ? "border-white/15"
+                                  : "border-[#0B2B26]/10"
+                              }`}
                             >
-                              {renderInlineMarkdown(header)}
+                              {renderInlineMarkdown(header, tone)}
                             </th>
                           ))}
                         </tr>
                       </thead>
-                      <tbody className="divide-y divide-emerald-950/10">
+                      <tbody
+                        className={
+                          isOnDark
+                            ? "divide-y divide-white/10"
+                            : "divide-y divide-[#0B2B26]/8"
+                        }
+                      >
                         {block.rows.map((row, rIdx) => (
                           <tr
                             key={`tr-${rIdx}`}
-                            className="even:bg-emerald-50/35 hover:bg-emerald-50/75 transition-colors"
+                            className={
+                              isOnDark
+                                ? "even:bg-white/[0.04] hover:bg-white/[0.08] transition-colors"
+                                : "even:bg-[#f8fdfb] hover:bg-[#eefbf7] transition-colors"
+                            }
                           >
                             {row.map((cell, cIdx) => (
                               <td
                                 key={`td-${rIdx}-${cIdx}`}
-                                className={`px-3.5 py-2.5 align-top leading-snug text-slate-800 ${
+                                className={`px-3.5 py-2.5 align-top leading-snug ${
                                   cIdx === 0
-                                    ? "font-semibold text-[#12382f] bg-emerald-50/25"
-                                    : ""
+                                    ? isOnDark
+                                      ? "font-medium text-white"
+                                      : "font-medium text-[#0B2B26]"
+                                    : isOnDark
+                                      ? "text-white/85"
+                                      : "text-[#2E524C]"
                                 }`}
                               >
-                                {renderInlineMarkdown(cell)}
+                                {renderInlineMarkdown(cell, tone)}
                               </td>
                             ))}
                           </tr>
@@ -512,29 +548,31 @@ export default function FormattedChatText({ content }: { content: string }) {
                       return <div key={`br-${lineIdx}`} className="h-1" />;
                     }
 
-                    // Skip any stray table separator lines
                     if (isTableSeparatorLine(trimmed)) {
                       return null;
                     }
 
-                    // Horizontal rule --- or ***
                     if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
                       return (
                         <hr
                           key={`hr-${lineIdx}`}
-                          className="my-2.5 border-emerald-950/10"
+                          className={`my-2.5 ${
+                            isOnDark ? "border-white/15" : "border-[#0B2B26]/10"
+                          }`}
                         />
                       );
                     }
 
-                    // Headings #### / ### / ## / #
+                    // Headings strictly weight 500
                     if (trimmed.startsWith("#### ")) {
                       return (
                         <h5
                           key={`h4-${lineIdx}`}
-                          className="font-bold text-[#12382f] text-[14px] pt-1"
+                          className={`font-medium text-[14px] tracking-[-0.01em] pt-1 ${
+                            isOnDark ? "text-white" : "text-[#0B2B26]"
+                          }`}
                         >
-                          {renderInlineMarkdown(trimmed.slice(5))}
+                          {renderInlineMarkdown(trimmed.slice(5), tone)}
                         </h5>
                       );
                     }
@@ -542,9 +580,11 @@ export default function FormattedChatText({ content }: { content: string }) {
                       return (
                         <h4
                           key={`h3-${lineIdx}`}
-                          className="font-bold text-[#12382f] text-[15px] pt-2"
+                          className={`font-medium text-[15px] tracking-[-0.015em] pt-2 ${
+                            isOnDark ? "text-white" : "text-[#0B2B26]"
+                          }`}
                         >
-                          {renderInlineMarkdown(trimmed.slice(4))}
+                          {renderInlineMarkdown(trimmed.slice(4), tone)}
                         </h4>
                       );
                     }
@@ -556,26 +596,30 @@ export default function FormattedChatText({ content }: { content: string }) {
                       return (
                         <h3
                           key={`h2-${lineIdx}`}
-                          className="font-extrabold text-[#12382f] text-base pt-2"
+                          className={`font-medium text-base tracking-[-0.02em] pt-2 ${
+                            isOnDark ? "text-white" : "text-[#0B2B26]"
+                          }`}
                         >
-                          {renderInlineMarkdown(headingText)}
+                          {renderInlineMarkdown(headingText, tone)}
                         </h3>
                       );
                     }
 
-                    // Blockquote >
                     if (trimmed.startsWith("> ")) {
                       return (
                         <blockquote
                           key={`bq-${lineIdx}`}
-                          className="px-3.5 py-2 rounded-xl bg-emerald-50/60 border border-emerald-900/10 text-slate-700 text-[13.5px]"
+                          className={`px-3.5 py-2.5 rounded-[12px] border text-[13.5px] ${
+                            isOnDark
+                              ? "bg-white/10 border-white/15 text-white"
+                              : "bg-[#f2faf7] border-[#0B2B26]/10 text-[#0B2B26]"
+                          }`}
                         >
-                          {renderInlineMarkdown(trimmed.slice(2))}
+                          {renderInlineMarkdown(trimmed.slice(2), tone)}
                         </blockquote>
                       );
                     }
 
-                    // Bullet list item
                     if (/^[-*•]\s+/.test(trimmed)) {
                       const indent = line.search(/\S/);
                       const itemText = trimmed.replace(/^[-*•]\s+/, "");
@@ -586,17 +630,24 @@ export default function FormattedChatText({ content }: { content: string }) {
                             indent >= 2 ? "pl-4" : ""
                           }`}
                         >
-                          <span className="text-[#0f766e] font-bold mt-0.5 select-none">
+                          <span
+                            className={`font-medium mt-0.5 select-none ${
+                              isOnDark ? "text-[#D9ED91]" : "text-[#0E807E]"
+                            }`}
+                          >
                             •
                           </span>
-                          <span className="flex-1">
-                            {renderInlineMarkdown(itemText)}
+                          <span
+                            className={`flex-1 ${
+                              isOnDark ? "text-white/95" : "text-[#2E524C]"
+                            }`}
+                          >
+                            {renderInlineMarkdown(itemText, tone)}
                           </span>
                         </div>
                       );
                     }
 
-                    // Numbered list item
                     const numMatch = trimmed.match(/^(\d+\.)\s+(.*)$/);
                     if (numMatch) {
                       return (
@@ -604,19 +655,30 @@ export default function FormattedChatText({ content }: { content: string }) {
                           key={`ol-${lineIdx}`}
                           className="flex items-start gap-2"
                         >
-                          <span className="font-bold text-[#12382f] shrink-0 select-none tabular-nums">
+                          <span
+                            className={`font-mono font-medium shrink-0 select-none tabular-nums ${
+                              isOnDark ? "text-[#D9ED91]" : "text-[#0E807E]"
+                            }`}
+                          >
                             {numMatch[1]}
                           </span>
-                          <span className="flex-1">
-                            {renderInlineMarkdown(numMatch[2])}
+                          <span
+                            className={`flex-1 ${
+                              isOnDark ? "text-white/95" : "text-[#2E524C]"
+                            }`}
+                          >
+                            {renderInlineMarkdown(numMatch[2], tone)}
                           </span>
                         </div>
                       );
                     }
 
                     return (
-                      <p key={`p-${lineIdx}`}>
-                        {renderInlineMarkdown(trimmed)}
+                      <p
+                        key={`p-${lineIdx}`}
+                        className={isOnDark ? "text-white/95" : "text-[#2E524C]"}
+                      >
+                        {renderInlineMarkdown(trimmed, tone)}
                       </p>
                     );
                   })}

@@ -28,7 +28,12 @@ export default function Molecule3DViewer({
   const labelsOverlayRef = useRef<HTMLDivElement | null>(null);
   const profileRef = useRef<EnrichedIngredientProfile>(profile);
 
-  const [autoRotate, setAutoRotate] = useState(true);
+  const [autoRotate, setAutoRotate] = useState<boolean>(() => {
+    if (typeof window !== "undefined" && window.matchMedia) {
+      return !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    }
+    return true;
+  });
   const [showLabels, setShowLabels] = useState(true);
   const [renderStyle, setRenderStyle] = useState<"ball-stick" | "space-fill">("ball-stick");
 
@@ -40,6 +45,19 @@ export default function Molecule3DViewer({
   const currentRotationRef = useRef({ x: 0.32, y: 0.65 });
   const rebuildMoleculeRef = useRef<(() => void) | null>(null);
   const triggerRenderRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    if (
+      typeof window !== "undefined" &&
+      window.matchMedia &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    ) {
+      autoRotateRef.current = false;
+      queueMicrotask(() => {
+        setAutoRotate(false);
+      });
+    }
+  }, []);
 
   useEffect(() => {
     autoRotateRef.current = autoRotate;
@@ -68,8 +86,8 @@ export default function Molecule3DViewer({
 
     renderer.setPixelRatio(isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, 2));
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.12;
-    renderer.setClearColor(0x0b1714, 1);
+    renderer.toneMappingExposure = 1.15;
+    renderer.setClearColor(0xf4fbf8, 1);
 
     const width = mount.clientWidth || 480;
     const height = mount.clientHeight || 340;
@@ -78,7 +96,7 @@ export default function Molecule3DViewer({
     mount.appendChild(renderer.domElement);
 
     const scene = new THREE.Scene();
-    scene.fog = new THREE.FogExp2(0x0b1714, 0.045);
+    scene.fog = new THREE.FogExp2(0xf4fbf8, 0.025);
 
     if (!isSoftwareGl) {
       const pmrem = new THREE.PMREMGenerator(renderer);
@@ -89,14 +107,14 @@ export default function Molecule3DViewer({
     const camera = new THREE.PerspectiveCamera(42, width / height, 0.1, 100);
     camera.position.set(0, 0.6, cameraDistanceRef.current);
 
-    const hemiLight = new THREE.HemisphereLight(0xa7f3d0, 0x0f172a, 0.85);
+    const hemiLight = new THREE.HemisphereLight(0xffffff, 0xc8ece4, 1.15);
     scene.add(hemiLight);
 
-    const keyLight = new THREE.DirectionalLight(0xfffbeb, 2.2);
+    const keyLight = new THREE.DirectionalLight(0xffffff, 2.0);
     keyLight.position.set(6, 8, 7);
     scene.add(keyLight);
 
-    const rimLight = new THREE.DirectionalLight(0x2dd4bf, 1.35);
+    const rimLight = new THREE.DirectionalLight(0x3fc6c5, 1.15);
     rimLight.position.set(-6, -4, -5);
     scene.add(rimLight);
 
@@ -105,9 +123,9 @@ export default function Molecule3DViewer({
     const ringGeo = new THREE.RingGeometry(2.2, 2.26, 48);
     ringGeo.rotateX(-Math.PI / 2);
     const ringMat = new THREE.MeshBasicMaterial({
-      color: 0x10b981,
+      color: 0x3fc6c5,
       transparent: true,
-      opacity: 0.28,
+      opacity: 0.36,
       side: THREE.DoubleSide,
     });
     pedestalGroup.add(new THREE.Mesh(ringGeo, ringMat));
@@ -115,9 +133,9 @@ export default function Molecule3DViewer({
     const innerRingGeo = new THREE.RingGeometry(1.15, 1.18, 36);
     innerRingGeo.rotateX(-Math.PI / 2);
     const innerRingMat = new THREE.MeshBasicMaterial({
-      color: 0x34d399,
+      color: 0x47c4a5,
       transparent: true,
-      opacity: 0.16,
+      opacity: 0.24,
       side: THREE.DoubleSide,
     });
     pedestalGroup.add(new THREE.Mesh(innerRingGeo, innerRingMat));
@@ -147,14 +165,14 @@ export default function Molecule3DViewer({
     };
 
     const bondMatSingle = new THREE.MeshStandardMaterial({
-      color: 0x94a3b8,
-      roughness: 0.38,
-      metalness: 0.25,
+      color: 0x5c7c76,
+      roughness: 0.35,
+      metalness: 0.18,
     });
     const bondMatDouble = new THREE.MeshStandardMaterial({
-      color: 0x34d399,
+      color: 0x0f8c88,
       roughness: 0.28,
-      metalness: 0.35,
+      metalness: 0.25,
     });
 
     const buildMoleculeMeshes = () => {
@@ -443,7 +461,7 @@ export default function Molecule3DViewer({
 
   return (
     <div
-      className={`relative w-full ${heightClass} rounded-2xl overflow-hidden bg-[#0b1714] border border-emerald-900/60 select-none shadow-lg`}
+      className={`relative w-full ${heightClass} rounded-[16px] overflow-hidden bg-[#f4fbf8] border border-[#0B2B26]/10 select-none`}
       data-testid="webgl-molecule-viewer"
       data-ingredient={profile.inciName}
     >
@@ -461,7 +479,7 @@ export default function Molecule3DViewer({
             <span
               key={atom.id}
               style={{ opacity: 0 }}
-              className="absolute top-0 left-0 px-1.5 py-0.5 rounded text-[10px] font-mono font-semibold text-white bg-slate-950/85 border border-white/15 whitespace-nowrap"
+              className="absolute top-0 left-0 px-2 py-0.5 rounded-full text-[10px] font-sans font-medium text-[#0B2B26] bg-white/92 border border-[#0B2B26]/12 whitespace-nowrap tabular-nums"
             >
               {atom.label}
             </span>
@@ -471,26 +489,27 @@ export default function Molecule3DViewer({
 
       {/* Top-Left Scientific HUD Header */}
       <div className="absolute top-3 left-3.5 right-3.5 flex items-start justify-between gap-2 pointer-events-none">
-        <div className="bg-[#08120f]/90 border border-emerald-500/25 rounded-xl px-3 py-2 max-w-[72%]">
-          <div className="flex items-center gap-2 text-[11px] font-mono text-emerald-300">
-            <Atom className="w-3.5 h-3.5 shrink-0 text-emerald-400" />
+        <div className="bg-white/95 border border-[#0B2B26]/10 rounded-[12px] px-3 py-2 max-w-[72%]">
+          <div className="flex items-center gap-2 text-[11px] font-sans font-medium text-[#0E807E] tabular-nums">
+            <Atom aria-hidden="true" className="w-3.5 h-3.5 shrink-0 text-[#0E807E]" />
             <span className="truncate">{profile.molecularFormula}</span>
             <span aria-hidden="true">·</span>
-            <span className="text-emerald-200/80 truncate">CAS {profile.casNumber}</span>
+            <span className="text-[#2E524C] truncate">CAS {profile.casNumber}</span>
           </div>
           {!compact && (
-            <p className="text-[11px] text-slate-300 truncate mt-0.5">{molecule.iupacName}</p>
+            <p className="text-[11px] text-[#2E524C] truncate mt-0.5">{molecule.iupacName}</p>
           )}
         </div>
 
         {/* CPK Element Key */}
-        <div className="bg-[#08120f]/90 border border-white/10 rounded-xl px-2.5 py-1.5 flex items-center gap-2">
+        <div className="bg-white/95 border border-[#0B2B26]/10 rounded-full px-3 py-1.5 flex items-center gap-2">
           {uniqueElements.map((el) => {
             const cpk = ELEMENT_CPK_COLORS[el];
             return (
-              <div key={el} className="flex items-center gap-1 text-[10px] font-mono text-slate-200">
+              <div key={el} className="flex items-center gap-1 text-[10px] font-sans font-medium text-[#0B2B26]">
                 <span
-                  className="w-2.5 h-2.5 rounded-full border border-white/30 inline-block"
+                  aria-hidden="true"
+                  className="w-2.5 h-2.5 rounded-full border border-[#0B2B26]/20 inline-block"
                   style={{ backgroundColor: cpk.hex }}
                 />
                 <span>{el}</span>
@@ -502,42 +521,53 @@ export default function Molecule3DViewer({
 
       {/* Bottom Interactive Control Dock */}
       <div className="absolute bottom-3 left-3.5 right-3.5 flex items-center justify-between gap-2 pointer-events-auto">
-        <div className="text-[10px] font-mono text-emerald-200/75 bg-[#08120f]/85 border border-white/10 px-2.5 py-1.5 rounded-lg hidden sm:block truncate">
+        <div className="text-[11px] font-sans text-[#2E524C] bg-white/95 border border-[#0B2B26]/10 px-3 py-1.5 rounded-full hidden sm:block truncate">
           Drag to rotate 3D · Scroll to zoom · {molecule.geometryType}
         </div>
 
-        <div className="flex items-center gap-1.5 bg-[#08120f]/90 border border-white/15 p-1 rounded-xl ml-auto">
+        <div
+          role="group"
+          aria-label="3D molecule viewer controls"
+          className="flex flex-wrap items-center justify-end gap-1.5 ml-auto"
+        >
           <button
             type="button"
+            aria-pressed={autoRotate}
             onClick={() => setAutoRotate((v) => !v)}
             aria-label={autoRotate ? "Pause 3D rotation" : "Resume 3D rotation"}
-            className="px-2.5 py-1 rounded-lg text-[11px] font-medium text-emerald-100 hover:bg-emerald-900/60 transition flex items-center gap-1 cursor-pointer whitespace-nowrap"
+            className="btn-glass-compact min-h-[44px] min-w-[44px] px-3.5 py-2 rounded-full text-[11px] font-medium inline-flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0E807E]"
           >
-            {autoRotate ? <Pause className="w-3 h-3" /> : <Play className="w-3 h-3" />}
+            {autoRotate ? (
+              <Pause aria-hidden="true" className="w-3.5 h-3.5 text-[#0E807E]" />
+            ) : (
+              <Play aria-hidden="true" className="w-3.5 h-3.5 text-[#0E807E]" />
+            )}
             <span>{autoRotate ? "Spinning" : "Paused"}</span>
           </button>
 
           <button
             type="button"
+            aria-pressed={renderStyle === "space-fill"}
             onClick={() =>
               setRenderStyle((s) => (s === "ball-stick" ? "space-fill" : "ball-stick"))
             }
             aria-label="Toggle CPK Space-Fill or Ball-and-Stick model"
-            className="px-2.5 py-1 rounded-lg text-[11px] font-medium text-emerald-100 hover:bg-emerald-900/60 transition flex items-center gap-1 cursor-pointer whitespace-nowrap"
+            className="btn-glass-compact min-h-[44px] min-w-[44px] px-3.5 py-2 rounded-full text-[11px] font-medium inline-flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0E807E]"
           >
-            <Layers className="w-3 h-3" />
+            <Layers aria-hidden="true" className="w-3.5 h-3.5 text-[#0E807E]" />
             <span>{renderStyle === "ball-stick" ? "Ball & Stick" : "CPK Van der Waals"}</span>
           </button>
 
           <button
             type="button"
+            aria-pressed={showLabels}
             onClick={() => setShowLabels((v) => !v)}
             aria-label="Toggle atom labels"
-            className={`px-2 py-1 rounded-lg text-[11px] font-mono transition cursor-pointer whitespace-nowrap ${
-              showLabels ? "bg-emerald-600/40 text-emerald-200" : "text-slate-400 hover:text-white"
+            className={`min-h-[44px] min-w-[44px] px-3.5 py-2 rounded-full text-[11px] font-medium inline-flex items-center justify-center cursor-pointer whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0E807E] ${
+              showLabels ? "btn-glass-primary" : "btn-glass-compact"
             }`}
           >
-            Labels
+            <span>Labels</span>
           </button>
 
           <button
@@ -546,9 +576,9 @@ export default function Molecule3DViewer({
               cameraDistanceRef.current = Math.max(4.5, cameraDistanceRef.current - 1.1);
             }}
             aria-label="Zoom in 3D molecule"
-            className="p-1.5 rounded-lg text-slate-200 hover:bg-emerald-900/60 transition cursor-pointer"
+            className="btn-glass-compact min-h-[44px] min-w-[44px] p-2.5 rounded-full inline-flex items-center justify-center cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0E807E]"
           >
-            <ZoomIn className="w-3.5 h-3.5" />
+            <ZoomIn aria-hidden="true" className="w-4 h-4 text-[#0E807E]" />
           </button>
 
           <button
@@ -557,9 +587,9 @@ export default function Molecule3DViewer({
               cameraDistanceRef.current = Math.min(13.5, cameraDistanceRef.current + 1.1);
             }}
             aria-label="Zoom out 3D molecule"
-            className="p-1.5 rounded-lg text-slate-200 hover:bg-emerald-900/60 transition cursor-pointer"
+            className="btn-glass-compact min-h-[44px] min-w-[44px] p-2.5 rounded-full inline-flex items-center justify-center cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0E807E]"
           >
-            <ZoomOut className="w-3.5 h-3.5" />
+            <ZoomOut aria-hidden="true" className="w-4 h-4 text-[#0E807E]" />
           </button>
 
           <button
@@ -569,9 +599,9 @@ export default function Molecule3DViewer({
               cameraDistanceRef.current = 8.2;
             }}
             aria-label="Reset 3D camera view"
-            className="p-1.5 rounded-lg text-slate-200 hover:bg-emerald-900/60 transition cursor-pointer"
+            className="btn-glass-compact min-h-[44px] min-w-[44px] p-2.5 rounded-full inline-flex items-center justify-center cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0E807E]"
           >
-            <RotateCcw className="w-3.5 h-3.5" />
+            <RotateCcw aria-hidden="true" className="w-4 h-4 text-[#0E807E]" />
           </button>
         </div>
       </div>

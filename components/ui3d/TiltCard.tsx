@@ -145,10 +145,10 @@ export default function TiltCard({
     }
   };
 
-  // Strip expensive per-frame backdrop-blur classes on scrolling cards to prevent GPU compositor stalls
+  // Strip expensive backdrop-blur and drop/box shadows to adhere to Auros zero-shadow discipline
   const optimizedClassName = className
     .replace(/\bbackdrop-blur(?:-[a-z0-9]+)?\b/g, "")
-    .replace(/\bbg-white\/(?:80|85|90|95)\b/g, "bg-white");
+    .replace(/\b(?:drop-)?shadow(?:-[a-z0-9[\]_,.()/]+)?\b/g, "");
 
   return (
     <div

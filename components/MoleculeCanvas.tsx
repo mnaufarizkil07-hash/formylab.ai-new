@@ -34,8 +34,8 @@ export default function MoleculeCanvas() {
     window.addEventListener("mousemove", handleMouseMove);
     document.addEventListener("mouseleave", handleMouseLeave);
 
-    const palette = ["#a4cf4a", "#00f5d4", "#38bdf8", "#2dd4bf"];
-    const particlesCount = Math.floor((window.innerWidth * window.innerHeight) / 12000);
+    const palette = ["#3FC6C5", "#47C4A5", "#89D78C", "#0E7A78"];
+    const particlesCount = Math.floor((window.innerWidth * window.innerHeight) / 16000);
     const particles: Array<{
       x: number;
       y: number;
@@ -49,9 +49,9 @@ export default function MoleculeCanvas() {
       particles.push({
         x: Math.random() * window.innerWidth,
         y: Math.random() * window.innerHeight,
-        vx: (Math.random() - 0.5) * 0.5,
-        vy: (Math.random() - 0.5) * 0.5,
-        radius: Math.random() * 2.5 + 2.5,
+        vx: (Math.random() - 0.5) * 0.45,
+        vy: (Math.random() - 0.5) * 0.45,
+        radius: Math.random() * 2 + 2,
         color: palette[i % palette.length],
       });
     }
@@ -74,43 +74,37 @@ export default function MoleculeCanvas() {
         const dyMouse = mouse.y - p.y;
         const distMouse = Math.sqrt(dxMouse * dxMouse + dyMouse * dyMouse);
 
-        if (distMouse < mouse.radius) {
+        if (distMouse < mouse.radius && distMouse > 0.01) {
           const force = (mouse.radius - distMouse) / mouse.radius;
-          p.x += (dxMouse / distMouse) * force * 1.2;
-          p.y += (dyMouse / distMouse) * force * 1.2;
+          p.x += (dxMouse / distMouse) * force * 1.1;
+          p.y += (dyMouse / distMouse) * force * 1.1;
         }
 
-        // Jaringan Garis Poligon Glowing
         for (let j = i + 1; j < particles.length; j++) {
           const p2 = particles[j];
           const dx = p.x - p2.x;
           const dy = p.y - p2.y;
           const dist = Math.sqrt(dx * dx + dy * dy);
 
-          if (dist < 155) {
-            ctx.save();
+          if (dist < 145) {
             ctx.beginPath();
             ctx.moveTo(p.x, p.y);
             ctx.lineTo(p2.x, p2.y);
-            let alpha = (1 - dist / 155) * 0.48;
-            if (distMouse < mouse.radius) alpha = Math.min(0.88, alpha * 1.6);
+            let alpha = (1 - dist / 145) * 0.28;
+            if (distMouse < mouse.radius) alpha = Math.min(0.55, alpha * 1.5);
 
-            ctx.strokeStyle = `rgba(0, 245, 212, ${alpha.toFixed(3)})`;
-            ctx.lineWidth = dist < 90 ? 1.8 : 1.1;
+            ctx.strokeStyle = `rgba(14, 122, 120, ${alpha.toFixed(3)})`;
+            ctx.lineWidth = dist < 85 ? 1.3 : 0.9;
             ctx.stroke();
-            ctx.restore();
           }
         }
 
-        // Titik Atom Glowing
-        ctx.save();
         ctx.beginPath();
         ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
         ctx.fillStyle = p.color;
-        ctx.shadowColor = p.color;
-        ctx.shadowBlur = 12;
+        ctx.globalAlpha = 0.55;
         ctx.fill();
-        ctx.restore();
+        ctx.globalAlpha = 1;
       }
 
       animationFrameId = requestAnimationFrame(animate);
@@ -127,9 +121,17 @@ export default function MoleculeCanvas() {
   }, []);
 
   return (
-    <canvas 
-      ref={canvasRef} 
-      style={{ position: "fixed", top: 0, left: 0, width: "100vw", height: "100vh", pointerEvents: "none", zIndex: 10 }}
+    <canvas
+      ref={canvasRef}
+      style={{
+        position: "fixed",
+        top: 0,
+        left: 0,
+        width: "100vw",
+        height: "100vh",
+        pointerEvents: "none",
+        zIndex: 10,
+      }}
     />
   );
 }

@@ -1,142 +1,121 @@
 import { NextResponse } from "next/server";
 import fs from "fs";
 import path from "path";
-import type { SavedFormulationRecord } from "../../../lib/formulationStorage";
+import {
+  DEMO_ACCOUNT_EMAIL,
+  isDemoAccountEmail,
+  normalizeUserScopeId,
+} from "../../../lib/auth";
+import {
+  DEMO_SEED_FORMULATIONS,
+  type SavedFormulationRecord,
+} from "../../../lib/formulationStorage";
 
 const STORAGE_PATH = path.join(process.cwd(), "data", "saved_formulations.json");
+const TMP_STORAGE_PATH = "/tmp/saved_formulations_v2.json";
 
-const DEFAULT_SEED_RECORDS: SavedFormulationRecord[] = [
-  {
-    id: "FRM-LAB-001",
-    createdAt: "2026-11-09T08:15:00.000Z",
-    productType: "Facial Moisturizer (Cream)",
-    skinTarget: "Sensitive & Redness",
-    targetPh: "5.25",
-    targetViscosity: "8500 - 15000 cPs",
-    batchSize: "100",
-    customIngredients: ["Niacinamide 4%", "Panthenol 2%", "Ceramide NP 1%"],
-    candidates: [
-      {
-        id: "candidate-a",
-        title: "Candidate A",
-        badge: "Best match (Hypoallergenic)",
-        viscosity: "8,950 cP",
-        ph: "5.28",
-        estCost: "Rp 34.850 (BOM)",
-        overallRisk: "Low",
-        riskSummaryText: "Dataset CSV baris F0004 + System A O/W Lamellar Emulsion (Stabilitas: Stable).",
-        observationText: "AI R&D ANALYSIS: Terverifikasi supplier Halal LPPOM MUI & IFANCA dengan skor kompatibilitas 98%.",
-        ingredients: [
-          {
-            name: "Water",
-            category: "Base Formulation",
-            conc: "63.13%",
-            riskLevel: "Low",
-            riskNote: "Aman berdasarkan dataset",
-            supplier: "PT Otsuka Indonesia",
-            isHalal: true,
-            compatibilityScore: 99,
-            casNumber: "7732-18-5",
-            molecularFormula: "H₂O",
-          },
-          {
-            name: "Glycerin",
-            category: "Base Formulation",
-            conc: "4.50%",
-            riskLevel: "Low",
-            riskNote: "Trihydric Humectant (USP Grade)",
-            supplier: "PT SMART Tbk",
-            isHalal: true,
-            compatibilityScore: 98,
-            casNumber: "56-81-5",
-            molecularFormula: "C₃H₈O₃",
-          },
-          {
-            name: "Cetyl Alcohol",
-            category: "Base Formulation",
-            conc: "4.50%",
-            riskLevel: "Low",
-            riskNote: "Lamellar Gel Network Stabilizer",
-            supplier: "PT SMART Tbk",
-            isHalal: true,
-            compatibilityScore: 97,
-            casNumber: "36653-82-4",
-            molecularFormula: "C₁₆H₃₄O",
-          },
-          {
-            name: "Niacinamide",
-            category: "Custom Active Compound",
-            conc: "4.00%",
-            riskLevel: "Low",
-            riskNote: "Barrier Ceramide Synthesis & Brightening",
-            supplier: "DSM Nutritional Products",
-            isHalal: true,
-            compatibilityScore: 99,
-            casNumber: "98-92-0",
-            molecularFormula: "C₆H₆N₂O",
-          },
-          {
-            name: "Panthenol",
-            category: "Custom Active Compound",
-            conc: "2.00%",
-            riskLevel: "Low",
-            riskNote: "Pro-Vitamin B5 Corneocyte Repair",
-            supplier: "BASF SE",
-            isHalal: true,
-            compatibilityScore: 99,
-            casNumber: "81-13-0",
-            molecularFormula: "C₉H₁₉NO₄",
-          },
-          {
-            name: "Phenoxyethanol (Safe Preservative)",
-            category: "AI Safety Replacement",
-            conc: "1.00%",
-            riskLevel: "Low",
-            riskNote: "Substitusi aman bebas paraben",
-            supplier: "Schülke & Mayr",
-            isHalal: true,
-            compatibilityScore: 97,
-            casNumber: "122-99-6",
-            molecularFormula: "C₈H₁₀O₂",
-          },
-        ],
-      },
-    ],
-  },
-];
+interface ScopedFormulationsStore {
+  version: 2;
+  byUser: Record<string, SavedFormulationRecord[]>;
+}
 
-const TMP_STORAGE_PATH = "/tmp/saved_formulations.json";
-let memoryFallbackRecords: SavedFormulationRecord[] | null = null;
+let memoryStore: ScopedFormulationsStore | null = null;
 
-function readSavedRecords(): SavedFormulationRecord[] {
+function createEmptyStore(): ScopedFormulationsStore {
+  return {
+    version: 2,
+    byUser: Object.create(null) as Record<string, SavedFormulationRecord[]>,
+  };
+}
+
+function hydrateStore(raw: unknown): ScopedFormulationsStore {
+  const store = createEmptyStore();
+
+  // Legacy v1 flat array format: migrate strictly into the Demo account bucket only
+  if (Array.isArray(raw)) {
+    const valid = raw.filter(
+      (item): item is SavedFormulationRecord =>
+        Boolean(item && typeof item === "object" && "id" in item && "productType" in item)
+    );
+    store.byUser[DEMO_ACCOUNT_EMAIL] =
+      valid.length > 0 ? valid.slice(0, 40) : [...DEMO_SEED_FORMULATIONS];
+    return store;
+  }
+
+  if (
+    raw &&
+    typeof raw === "object" &&
+    "byUser" in raw &&
+    raw.byUser &&
+    typeof raw.byUser === "object" &&
+    !Array.isArray(raw.byUser)
+  ) {
+    const entries = Object.entries(raw.byUser as Record<string, unknown>);
+    for (const [key, value] of entries) {
+      const safeKey = normalizeUserScopeId(key);
+      if (safeKey && Array.isArray(value)) {
+        store.byUser[safeKey] = value
+          .filter(
+            (item): item is SavedFormulationRecord =>
+              Boolean(
+                item &&
+                  typeof item === "object" &&
+                  "id" in item &&
+                  "productType" in item
+              )
+          )
+          .slice(0, 40);
+      }
+    }
+  }
+
+  return store;
+}
+
+function readScopedStore(): ScopedFormulationsStore {
+  if (memoryStore) return memoryStore;
+
   try {
     if (fs.existsSync(TMP_STORAGE_PATH)) {
       const tmpContent = fs.readFileSync(TMP_STORAGE_PATH, "utf-8");
-      const tmpParsed = JSON.parse(tmpContent);
-      if (Array.isArray(tmpParsed) && tmpParsed.length > 0) {
-        return tmpParsed;
-      }
+      const hydrated = hydrateStore(JSON.parse(tmpContent));
+      memoryStore = hydrated;
+      return hydrated;
     }
     if (fs.existsSync(STORAGE_PATH)) {
       const content = fs.readFileSync(STORAGE_PATH, "utf-8");
-      const parsed = JSON.parse(content);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        return parsed;
-      }
+      const hydrated = hydrateStore(JSON.parse(content));
+      memoryStore = hydrated;
+      return hydrated;
     }
-    if (memoryFallbackRecords && memoryFallbackRecords.length > 0) {
-      return memoryFallbackRecords;
-    }
-    return DEFAULT_SEED_RECORDS;
   } catch {
-    return memoryFallbackRecords || DEFAULT_SEED_RECORDS;
+    // Fall back to clean in-memory store
   }
+
+  const fresh = createEmptyStore();
+  memoryStore = fresh;
+  return fresh;
 }
 
-function writeSavedRecords(records: SavedFormulationRecord[]) {
-  const trimmed = records.slice(0, 40);
-  memoryFallbackRecords = trimmed;
-  const serialized = JSON.stringify(trimmed, null, 2);
+function writeScopedStore(store: ScopedFormulationsStore) {
+  memoryStore = store;
+  const plainByUser: Record<string, SavedFormulationRecord[]> = {};
+  for (const [key, value] of Object.entries(store.byUser)) {
+    const safeKey = normalizeUserScopeId(key);
+    if (safeKey && Array.isArray(value)) {
+      plainByUser[safeKey] = value.slice(0, 40);
+    }
+  }
+
+  const serialized = JSON.stringify(
+    {
+      version: 2,
+      byUser: plainByUser,
+    },
+    null,
+    2
+  );
+
   try {
     const dir = path.dirname(STORAGE_PATH);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -145,34 +124,102 @@ function writeSavedRecords(records: SavedFormulationRecord[]) {
     try {
       fs.writeFileSync(TMP_STORAGE_PATH, serialized, "utf-8");
     } catch {
-      // In-memory cache already updated
+      // In-memory store already updated
     }
   }
 }
 
-export async function GET() {
-  const records = readSavedRecords();
+function getRecordsForUser(
+  store: ScopedFormulationsStore,
+  userId: string
+): SavedFormulationRecord[] {
+  if (Object.prototype.hasOwnProperty.call(store.byUser, userId)) {
+    return store.byUser[userId] || [];
+  }
+  // Only the Demo account receives default seed sample studies when uninitialized
+  if (isDemoAccountEmail(userId)) {
+    return [...DEMO_SEED_FORMULATIONS];
+  }
+  return [];
+}
+
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url);
+  const userId = normalizeUserScopeId(searchParams.get("userId"));
+
+  // Never leak demo or global records if user scope is missing/invalid
+  if (!userId) {
+    return NextResponse.json({ success: true, records: [] });
+  }
+
+  const store = readScopedStore();
+  const records = getRecordsForUser(store, userId);
   return NextResponse.json({ success: true, records });
 }
 
 export async function POST(request: Request) {
   try {
-    const body = (await request.json()) as SavedFormulationRecord;
-    if (!body || !body.productType || !Array.isArray(body.candidates)) {
-      return NextResponse.json({ success: false, error: "Invalid formulation payload" }, { status: 400 });
+    const rawBody = (await request.json()) as {
+      userId?: string;
+      record?: SavedFormulationRecord;
+    } & Partial<SavedFormulationRecord>;
+
+    const userId = normalizeUserScopeId(rawBody?.userId);
+    if (!userId) {
+      return NextResponse.json(
+        { success: false, error: "Valid user account scope is required" },
+        { status: 400 }
+      );
     }
-    const current = readSavedRecords();
+
+    const payload = rawBody.record || rawBody;
+    if (
+      !payload ||
+      typeof payload.productType !== "string" ||
+      !payload.productType.trim() ||
+      !Array.isArray(payload.candidates)
+    ) {
+      return NextResponse.json(
+        { success: false, error: "Invalid formulation payload" },
+        { status: 400 }
+      );
+    }
+
+    const store = readScopedStore();
+    const current = getRecordsForUser(store, userId);
+
     const record: SavedFormulationRecord = {
-      ...body,
-      id: body.id || `FRM-${Date.now().toString(36).toUpperCase()}`,
-      createdAt: body.createdAt || new Date().toISOString(),
+      id:
+        typeof payload.id === "string" && payload.id.trim()
+          ? payload.id.trim().slice(0, 64)
+          : `FRM-${Date.now().toString(36).toUpperCase()}`,
+      createdAt:
+        typeof payload.createdAt === "string" && payload.createdAt.trim()
+          ? payload.createdAt
+          : new Date().toISOString(),
+      productType: payload.productType.trim(),
+      skinTarget: typeof payload.skinTarget === "string" ? payload.skinTarget : "",
+      targetPh: typeof payload.targetPh === "string" ? payload.targetPh : "",
+      targetViscosity:
+        typeof payload.targetViscosity === "string" ? payload.targetViscosity : "",
+      batchSize: typeof payload.batchSize === "string" ? payload.batchSize : "100",
+      customIngredients: Array.isArray(payload.customIngredients)
+        ? payload.customIngredients.filter((x): x is string => typeof x === "string")
+        : [],
+      candidates: payload.candidates,
     };
+
     const updated = [record, ...current.filter((r) => r.id !== record.id)].slice(0, 40);
-    writeSavedRecords(updated);
+    store.byUser[userId] = updated;
+    writeScopedStore(store);
+
     return NextResponse.json({ success: true, record, records: updated });
   } catch (err) {
     console.error("POST /api/formulations error:", err);
-    return NextResponse.json({ success: false, error: "Failed to save formulation" }, { status: 500 });
+    return NextResponse.json(
+      { success: false, error: "Failed to save formulation" },
+      { status: 500 }
+    );
   }
 }
 
@@ -180,11 +227,26 @@ export async function DELETE(request: Request) {
   try {
     const { searchParams } = new URL(request.url);
     const id = searchParams.get("id");
-    const current = readSavedRecords();
+    const userId = normalizeUserScopeId(searchParams.get("userId"));
+
+    if (!userId) {
+      return NextResponse.json(
+        { success: false, error: "Valid user account scope is required" },
+        { status: 400 }
+      );
+    }
+
+    const store = readScopedStore();
+    const current = getRecordsForUser(store, userId);
     const updated = id ? current.filter((r) => r.id !== id) : current;
-    writeSavedRecords(updated);
+    store.byUser[userId] = updated;
+    writeScopedStore(store);
+
     return NextResponse.json({ success: true, records: updated });
   } catch {
-    return NextResponse.json({ success: false, error: "Failed to delete formulation" }, { status: 500 });
+    return NextResponse.json(
+      { success: false, error: "Failed to delete formulation" },
+      { status: 500 }
+    );
   }
 }

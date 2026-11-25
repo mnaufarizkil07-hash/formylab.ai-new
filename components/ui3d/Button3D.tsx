@@ -12,8 +12,9 @@ export interface Button3DProps
 }
 
 /**
- * Clean, smooth rounded button (restored to original sleek pill/rounded style
- * without boxy/stiff 3D bottom ledges, per user request).
+ * Optical Glass Action Button (Clear iOS + Blur One UI, Zero Outer Shadow):
+ * - Primary / Navy: .btn-glass-primary (Aqua / Mint Teal / Soft Green refractive tint)
+ * - Secondary: .btn-glass-secondary (Clear frosted crystal)
  */
 export default function Button3D({
   variant = "primary",
@@ -29,18 +30,16 @@ export default function Button3D({
 
   const sizeClasses =
     size === "sm"
-      ? "px-4 py-2 text-xs sm:text-sm"
+      ? "px-5 py-2 text-[12px]"
       : size === "lg"
-      ? "px-7 py-3.5 text-sm"
-      : "px-5 py-2.5 text-xs sm:text-sm";
+      ? "px-7 py-3.5 text-[13px]"
+      : "px-6 py-2.5 text-[12.5px]";
 
   const variantClasses = isDisabled
-    ? "bg-slate-200 text-slate-400 cursor-not-allowed"
-    : variant === "navy"
-    ? "bg-[#12382f] hover:bg-[#0f766e] text-white shadow-sm hover:opacity-95 cursor-pointer"
+    ? "btn-glass-secondary opacity-50 cursor-not-allowed"
     : variant === "secondary"
-    ? "bg-slate-100 hover:bg-emerald-50 text-slate-800 border border-slate-200 cursor-pointer"
-    : "bg-gradient-to-r from-[#14b8a6] to-[#0f766e] text-white shadow-md hover:opacity-95 cursor-pointer";
+    ? "btn-glass-secondary cursor-pointer"
+    : "btn-glass-primary cursor-pointer";
 
   return (
     <button
@@ -48,7 +47,7 @@ export default function Button3D({
       type={type}
       disabled={isDisabled}
       onClick={onClick}
-      className={`inline-flex items-center justify-center gap-2 rounded-full font-bold transition whitespace-nowrap ${sizeClasses} ${variantClasses} ${className}`}
+      className={`inline-flex items-center justify-center gap-2 rounded-full font-medium uppercase tracking-[0.06em] whitespace-nowrap ${sizeClasses} ${variantClasses} ${className}`}
     >
       {children}
     </button>

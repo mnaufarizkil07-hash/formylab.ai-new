@@ -14,15 +14,15 @@ import {
 } from "lucide-react";
 
 export const MODULE_ICONS: Record<string, React.ReactNode> = {
-  "brief-interpreter": <FileText className="w-7 h-7 text-white stroke-[2]" />,
-  "formula-generator": <FlaskConical className="w-7 h-7 text-white stroke-[2]" />,
-  "regulatory-checker": <ShieldCheck className="w-7 h-7 text-white stroke-[2]" />,
-  "halal-checker": <CheckCircle2 className="w-7 h-7 text-white stroke-[2]" />,
-  "compatibility-checker": <Scale className="w-7 h-7 text-white stroke-[2]" />,
-  "inventory-cost-optimizer": <Calculator className="w-7 h-7 text-white stroke-[2]" />,
-  "substitution-engine": <Repeat className="w-7 h-7 text-white stroke-[2]" />,
-  "trial-planner": <ClipboardList className="w-7 h-7 text-white stroke-[2]" />,
-  "learning-loop": <RefreshCw className="w-7 h-7 text-white stroke-[2]" />,
+  "brief-interpreter": <FileText aria-hidden="true" className="w-5 h-5 text-[#0E807E] stroke-[1.75]" />,
+  "formula-generator": <FlaskConical aria-hidden="true" className="w-5 h-5 text-[#0E807E] stroke-[1.75]" />,
+  "regulatory-checker": <ShieldCheck aria-hidden="true" className="w-5 h-5 text-[#0E807E] stroke-[1.75]" />,
+  "halal-checker": <CheckCircle2 aria-hidden="true" className="w-5 h-5 text-[#0E807E] stroke-[1.75]" />,
+  "compatibility-checker": <Scale aria-hidden="true" className="w-5 h-5 text-[#0E807E] stroke-[1.75]" />,
+  "inventory-cost-optimizer": <Calculator aria-hidden="true" className="w-5 h-5 text-[#0E807E] stroke-[1.75]" />,
+  "substitution-engine": <Repeat aria-hidden="true" className="w-5 h-5 text-[#0E807E] stroke-[1.75]" />,
+  "trial-planner": <ClipboardList aria-hidden="true" className="w-5 h-5 text-[#0E807E] stroke-[1.75]" />,
+  "learning-loop": <RefreshCw aria-hidden="true" className="w-5 h-5 text-[#0E807E] stroke-[1.75]" />,
 };
 
 interface SpinModuleCardProps {
@@ -33,13 +33,6 @@ interface SpinModuleCardProps {
   actionLabel?: string;
 }
 
-/**
- * <SpinModuleCard />
- * Menampilkan item modul AI dengan:
- * - Satu warna brand tunggal yang bersih dan rapi (tanpa warna-warni pelangi & tanpa efek pantulan cahaya/glare)
- * - Tanpa label Tahap
- * - Efek putar 360 derajat pada sumbu Y saat mouseenter atau tap
- */
 export default function SpinModuleCard({
   moduleId,
   name,
@@ -80,15 +73,14 @@ export default function SpinModuleCard({
             }
           : undefined
       }
-      className={`group flex items-center gap-5 p-5 sm:p-6 rounded-3xl bg-white hover:bg-emerald-50/40 border border-slate-200/80 hover:border-[#0d9488]/40 shadow-xs hover:shadow-md transition-all ${
+      className={`group flex items-start gap-4 p-6 rounded-[16px] bg-white hover:bg-[#f6fdfb] border border-[#0B2B26]/10 hover:border-[#47C4A5] transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0E807E] ${
         onClick ? "cursor-pointer" : ""
       }`}
     >
-      {/* 3D Perspective Wrapper for 360° Y-Axis Spin — Clean Single Solid Brand Color, No Glare */}
-      <div className="spin-logo-wrapper shrink-0">
+      <div className="spin-logo-wrapper shrink-0 pt-0.5">
         <div
           onAnimationEnd={handleAnimationEnd}
-          className={`spin-logo-inner w-16 h-16 sm:w-18 sm:h-18 rounded-full bg-[#10b981] flex items-center justify-center ${
+          className={`spin-logo-inner flex items-center justify-center ${
             isSpinning ? "is-spinning" : ""
           }`}
         >
@@ -96,13 +88,12 @@ export default function SpinModuleCard({
         </div>
       </div>
 
-      {/* Right Column: Clean Heading + Subtitle (No Stage Tag) */}
       <div className="min-w-0 flex-1">
-        <h3 className="text-lg sm:text-xl font-extrabold text-slate-900 tracking-tight mb-1 group-hover:text-[#0f766e] transition-colors">
+        <h3 className="text-[17px] font-medium text-[#0B2B26] tracking-[-0.02em] mb-1.5 group-hover:text-[#0E807E] transition-colors">
           {name}
         </h3>
-        <p className="text-sm sm:text-[15px] text-slate-500 font-medium leading-relaxed">
-          {fungsi}
+        <p className="text-[14px] text-[#2E524C] font-normal leading-[1.45]">
+          {fungsi.replace(/\s*—\s*/g, ", ")}
         </p>
       </div>
     </div>

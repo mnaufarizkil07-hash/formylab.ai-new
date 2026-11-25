@@ -1,25 +1,28 @@
 "use client";
 
 import React, { useState, useEffect } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
   FlaskConical,
-  BookOpen,
-  Sparkles,
+  Check,
   CheckCircle2,
+  Circle,
   Plus,
   X,
   Info,
   Sliders,
   ShieldCheck,
   Atom,
-  ArrowLeft,
   MessageSquare,
   Calculator,
   CalendarClock,
+  ChevronDown,
+  AlertCircle,
+  AlertTriangle,
 } from "lucide-react";
 import WorkspaceNavbar from "../../components/WorkspaceNavbar";
-import LivingLabBackground from "../../components/LivingLabBackground";
+import AmbientBioluminescence from "../../components/AmbientBioluminescence";
 import Molecule3DViewer from "../../components/Molecule3DViewer";
 import {
   VALIDATED_PRODUCT_TYPES,
@@ -90,10 +93,13 @@ export default function FormulatePage() {
   const [customIngredientsInput, setCustomIngredientsInput] = useState("");
   const [viewCost, setViewCost] = useState(true);
   const [isLoading, setIsLoading] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
   const [previewIngredient3D, setPreviewIngredient3D] = useState("Niacinamide");
   const [importedBannerText, setImportedBannerText] = useState("");
 
   const activeSpec = getProductTypeSpec(productType);
+  const sanitizeEmDash = (text: string, replacement = ": ") =>
+    text.replace(/\s*—\s*/g, replacement);
 
   // Calibrated default commercial recommendations based on active Product Type
   const getRecommendedBriefDefaults = (specName: string) => {
@@ -284,6 +290,7 @@ export default function FormulatePage() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsLoading(true);
+    setSubmitError(null);
 
     const resolvedPh = targetPh.trim() || activeSpec.targetPh;
     const resolvedViscosity =
@@ -318,7 +325,7 @@ export default function FormulatePage() {
 
       const data = await res.json();
 
-      if (data.success) {
+      if (res.ok && data.success) {
         localStorage.setItem("currentFormulation", JSON.stringify(formData));
         localStorage.setItem(
           "aiGeneratedCandidates",
@@ -337,10 +344,18 @@ export default function FormulatePage() {
 
         router.push("/result");
       } else {
+        setSubmitError(
+          typeof data?.error === "string" && data.error.trim()
+            ? data.error
+            : "Gagal menyusun kandidat formulasi dari server. Periksa kembali parameter input lalu coba lagi."
+        );
         setIsLoading(false);
       }
     } catch (error) {
       console.error("Failed to call formulation API:", error);
+      setSubmitError(
+        "Tidak dapat terhubung ke layanan formulasi. Periksa koneksi jaringan Anda lalu coba lagi."
+      );
       setIsLoading(false);
     }
   };
@@ -400,367 +415,478 @@ export default function FormulatePage() {
   const totalMoqEstimatedBudgetRp = resolvedHppNum * resolvedMoqNum;
 
   return (
-    <div className="min-h-screen relative font-sans text-slate-800 pb-24">
-      <LivingLabBackground variant="mint" />
+    <div className="min-h-screen relative bg-[#f8fdfb] text-[#0B2B26] pb-24 overflow-x-clip">
+      <a
+        href="#main-content"
+        className="sr-only focus:not-sr-only focus:fixed focus:top-4 focus:left-4 focus:z-50 focus:px-4 focus:py-2.5 focus:rounded-full focus:bg-[#0B2B26] focus:text-white focus:text-xs focus:font-medium focus:outline-none focus:ring-2 focus:ring-[#0E807E] focus:ring-offset-2"
+      >
+        Skip to main content
+      </a>
 
-      {/* Top Floating Pill Navbar with Back to Home */}
+      {/* Top Navbar with Back to Home */}
       <WorkspaceNavbar backHref="/dashboard" backLabel="Back to Home" />
 
-      <main className="relative z-10 max-w-7xl mx-auto px-4 sm:px-6 pt-4">
-        {/* Page Header */}
-        <div className="flex flex-col md:flex-row md:items-end justify-between gap-4 mb-6">
-          <div>
-            <button
-              type="button"
-              onClick={() => router.push("/dashboard")}
-              className="inline-flex items-center gap-1.5 text-xs font-bold text-[#0f766e] hover:text-[#12382f] mb-2 cursor-pointer"
-            >
-              <ArrowLeft className="w-3.5 h-3.5" />
-              <span>Back to Dashboard Home</span>
-            </button>
-            <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-teal-50 border border-teal-200 text-[#0f766e] text-[11px] font-mono font-bold mb-2">
-              <span>TAHAP 1, 2 &amp; 3 · INPUT BRIEF KLIEN BRAND &amp; PEMBUATAN FORMULA AWAL</span>
+      <main id="main-content" className="relative z-10">
+        {/* Top Ambient Light Header */}
+        <div className="relative overflow-hidden bg-white border-b border-[#0B2B26]/10 mb-8">
+          <AmbientBioluminescence variant="section" />
+          <div className="relative z-10 max-w-7xl mx-auto px-4 sm:px-6 pt-8 pb-8 lg:min-h-[336px] flex flex-col justify-between">
+            <div className="max-w-3xl">
+              <span className="text-[11px] font-medium uppercase tracking-[0.12em] text-[#0E807E] block mb-2.5">
+                Tahap 1-3 · Brief &amp; Formula Awal
+              </span>
+              <h1 className="text-3xl sm:text-[40px] leading-[1.08] font-medium text-[#0B2B26] tracking-[-0.035em] text-balance">
+                AI Cosmetic Formulator &amp; Brief Specification Studio
+              </h1>
+              <p className="text-[#2E524C] text-sm sm:text-[15px] mt-3 leading-relaxed">
+                Tentukan sediaan, target kulit, pH, viskositas, target HPP, status halal, dan MOQ
+                untuk menyusun kandidat Formula A, B, dan C siap uji lab.
+              </p>
             </div>
-            <h1 className="text-3xl sm:text-4xl font-extrabold text-slate-900 tracking-tight">
-              AI Cosmetic Formulator &amp; Brief Specification Studio
-            </h1>
-            <p className="text-slate-600 text-sm mt-1 leading-relaxed max-w-3xl">
-              <strong>Definisi Halaman Formulator (Tim R&amp;D Maklon):</strong> Masukkan permintaan klien
-              brand (jenis produk, klaim, target kulit &amp; tekstur, target HPP &amp; budget
-              percobaan, wajib halal, deadline &amp; MOQ). AI menerjemahkan bahasa marketing klien
-              menjadi spesifikasi teknis formulator (tipe sediaan, rentang pH, viskositas cPs, HLB,
-              kandidat bahan aktif, eksipien lengkap &amp; urutan metode pembuatan) sebelum disaring
-              ke 5 pengecekan berlapis dan Output Formula A, B &amp; C.
-            </p>
-          </div>
 
-          <div className="flex flex-wrap items-center gap-2 self-start md:self-auto">
-            <button
-              type="button"
-              onClick={handleAutoCalibrateRecommended}
-              className="px-4 py-2.5 bg-[#0f766e] hover:bg-[#12382f] text-white rounded-full font-bold text-xs shadow-xs transition flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
-            >
-              <Sparkles className="w-3.5 h-3.5" />
-              <span>Isi Semua Value Akurat Otomatis</span>
-            </button>
+            {/* 3 Optical Liquid Glass Active AI Engine Cards */}
+            <div className="mt-6 grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div className="card-glass-optical p-5 rounded-[18px]! min-h-[116px] flex flex-col justify-between">
+                <div className="flex items-center gap-2.5">
+                  <span className="w-8 h-8 rounded-[10px] bg-[#0E807E]/10 border border-[#0E807E]/20 text-[#0E807E] flex items-center justify-center shrink-0">
+                    <svg
+                      viewBox="0 0 24 24"
+                      className="w-5 h-5"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.5"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      <circle cx="12" cy="12" r="7.5" />
+                      <circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none" />
+                      <line x1="12" y1="2.25" x2="12" y2="6.25" />
+                      <line x1="12" y1="17.75" x2="12" y2="21.75" />
+                      <line x1="2.25" y1="12" x2="6.25" y2="12" />
+                      <line x1="17.75" y1="12" x2="21.75" y2="12" />
+                    </svg>
+                  </span>
+                  <span className="text-[11px] font-mono uppercase tracking-[0.1em] font-medium text-[#0E807E] tabular-nums">
+                    01 · BRIEF INTERPRETER
+                  </span>
+                </div>
+                <div className="mt-2.5">
+                  <div className="text-sm font-medium text-[#0B2B26]">
+                    Spesifikasi Teknis Otomatis
+                  </div>
+                  <p className="text-xs text-[#2E524C] mt-1 leading-relaxed line-clamp-2">
+                    Menerjemahkan brief klien ke target pH, viskositas, HLB, dan profil tekstur.
+                  </p>
+                </div>
+              </div>
 
-            <button
-              type="button"
-              onClick={() => router.push("/library")}
-              className="px-4 py-2.5 bg-white/95 hover:bg-emerald-50 text-[#12382f] border border-emerald-900/15 rounded-full font-bold text-xs shadow-xs transition flex items-center gap-2 cursor-pointer whitespace-nowrap"
-            >
-              <BookOpen className="w-4 h-4 text-[#0f766e]" />
-              <span>3D Library ({allLibraryActives.length}+)</span>
-            </button>
+              <div className="card-glass-optical p-5 rounded-[18px]! min-h-[116px] flex flex-col justify-between">
+                <div className="flex items-center gap-2.5">
+                  <span className="w-8 h-8 rounded-[10px] bg-[#0E807E]/10 border border-[#0E807E]/20 text-[#0E807E] flex items-center justify-center shrink-0">
+                    <svg
+                      viewBox="0 0 24 24"
+                      className="w-5 h-5"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.5"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      <polygon points="12,2.8 20.75,9.16 17.41,19.44 6.59,19.44 3.25,9.16" />
+                      <polygon
+                        points="12,7.2 16.56,10.52 14.82,15.88 9.18,15.88 7.44,10.52"
+                        opacity="0.65"
+                      />
+                      <circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none" />
+                    </svg>
+                  </span>
+                  <span className="text-[11px] font-mono uppercase tracking-[0.1em] font-medium text-[#0E807E] tabular-nums">
+                    02 · 5-GATE SCREENING
+                  </span>
+                </div>
+                <div className="mt-2.5">
+                  <div className="text-sm font-medium text-[#0B2B26]">
+                    Validasi Regulasi &amp; Stok
+                  </div>
+                  <p className="text-xs text-[#2E524C] mt-1 leading-relaxed line-clamp-2">
+                    Menyaring kandidat bahan terhadap BPOM, kompatibilitas, Halal MUI/BPJPH, stok,
+                    &amp; HPP.
+                  </p>
+                </div>
+              </div>
+
+              <div className="card-glass-optical p-5 rounded-[18px]! min-h-[116px] flex flex-col justify-between">
+                <div className="flex items-center gap-2.5">
+                  <span className="w-8 h-8 rounded-[10px] bg-[#0E807E]/10 border border-[#0E807E]/20 text-[#0E807E] flex items-center justify-center shrink-0">
+                    <svg
+                      viewBox="0 0 24 24"
+                      className="w-5 h-5"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.5"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      <circle cx="12" cy="4.5" r="2.35" />
+                      <circle cx="5.4" cy="16.8" r="2.35" />
+                      <circle cx="18.6" cy="16.8" r="2.35" />
+                      <circle cx="12" cy="12.2" r="1.5" fill="currentColor" stroke="none" />
+                      <line x1="12" y1="6.85" x2="12" y2="10.7" />
+                      <line x1="7.35" y1="15.45" x2="10.7" y2="13.1" />
+                      <line x1="16.65" y1="15.45" x2="13.3" y2="13.1" />
+                    </svg>
+                  </span>
+                  <span className="text-[11px] font-mono uppercase tracking-[0.1em] font-medium text-[#0E807E] tabular-nums">
+                    03 · FORMULA A/B/C ENGINE
+                  </span>
+                </div>
+                <div className="mt-2.5">
+                  <div className="text-sm font-medium text-[#0B2B26]">
+                    Kandidat &amp; Rencana Trial
+                  </div>
+                  <p className="text-xs text-[#2E524C] mt-1 leading-relaxed line-clamp-2">
+                    Menyusun 3 opsi formula siap uji lab dengan analisis trade-off dan estimasi
+                    biaya.
+                  </p>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
 
-        {importedBannerText && (
-          <div className="mb-6 bg-emerald-900 text-white px-5 py-3.5 rounded-2xl flex items-center justify-between gap-3 shadow-sm">
-            <div className="text-xs sm:text-sm font-semibold">
-              ✓ {importedBannerText}
-            </div>
-            <button
-              type="button"
-              onClick={() => setImportedBannerText("")}
-              className="text-xs text-emerald-200 hover:text-white font-bold cursor-pointer"
+        <div className="max-w-7xl mx-auto px-4 sm:px-6">
+          {/* Synchronization Confirmation Banner */}
+          {importedBannerText && (
+            <div
+              role="status"
+              className="mb-8 bg-[#eaf9f0] text-[#0B2B26] px-6 py-4 rounded-[16px] border border-[#47C4A5]/45 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
             >
-              Tutup
-            </button>
-          </div>
-        )}
+              <div className="flex items-start sm:items-center gap-2.5 text-xs sm:text-sm font-medium text-[#0B2B26] leading-relaxed">
+                <CheckCircle2 aria-hidden="true" className="w-4 h-4 text-[#0E807E] shrink-0 mt-0.5 sm:mt-0" />
+                <span>{importedBannerText}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setImportedBannerText("")}
+                className="btn-glass-compact min-h-[44px] px-4 py-2 text-xs cursor-pointer self-end sm:self-auto whitespace-nowrap inline-flex items-center justify-center"
+              >
+                <span>Tutup</span>
+              </button>
+            </div>
+          )}
 
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-          {/* LEFT 7 COLUMNS: FORMULATOR INPUT CONSOLE */}
-          <div className="lg:col-span-7 bg-white p-7 sm:p-9 rounded-[2rem] shadow-[0_20px_50px_-15px_rgba(16,68,56,0.15)] border border-emerald-900/10">
-            <form onSubmit={handleSubmit} className="space-y-6">
-              {/* PARAMETER GROUP 1: TARGET KULIT & TEKSTUR YANG DIINGINKAN */}
-              <div className="p-4 sm:p-5 rounded-2xl bg-slate-50/90 border border-slate-200/80 space-y-4">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-extrabold uppercase tracking-wider text-[#0f766e]">
-                    1. Target Kulit &amp; Tekstur yang Diinginkan
-                  </span>
-                  <span className="text-[11px] font-mono text-slate-500">
-                    Brief Interpreter
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+            {/* LEFT 7 COLUMNS: PRECISION FORMULATOR INPUT CONSOLE */}
+            <form onSubmit={handleSubmit} className="lg:col-span-7 space-y-6">
+              {/* SURFACE CARD 1: TARGET KULIT, TEKSTUR & REOLOGI */}
+              <section className="bg-white rounded-[16px] p-6 sm:p-8 border border-[#0B2B26]/10 space-y-6">
+                <div className="flex flex-wrap items-baseline justify-between gap-2 pb-4 border-b border-[#0B2B26]/10">
+                  <div>
+                    <span className="text-[12px] font-mono tabular-nums font-medium tracking-[0.04em] text-[#0E807E] block mb-1">
+                      01 · Brief Interpreter &amp; Rheology
+                    </span>
+                    <h2 className="text-lg sm:text-xl font-medium text-[#0B2B26] tracking-[-0.02em]">
+                      Target Kulit &amp; Tekstur yang Diinginkan
+                    </h2>
+                  </div>
+                  <span className="text-xs font-sans font-medium text-[#2E524C]">
+                    {activeSpec.systemType}
                   </span>
                 </div>
 
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
                   <div>
                     <label
                       htmlFor="product-type-select"
-                      className="block text-xs font-bold text-slate-800 mb-1.5 uppercase tracking-wider"
+                      className="text-[11px] font-medium uppercase tracking-[0.12em] text-[#0E807E] block mb-2"
                     >
                       Product Type ({VALIDATED_PRODUCT_TYPES.length} Systems)
                     </label>
-                    <select
-                      id="product-type-select"
-                      value={productType}
-                      onChange={(e) => handleProductTypeChange(e.target.value)}
-                      className="w-full p-3 rounded-xl border border-slate-200 bg-white focus:outline-none focus:ring-2 focus:ring-[#14b8a6] text-xs sm:text-sm font-semibold text-slate-900"
-                    >
-                      {!VALIDATED_PRODUCT_TYPES.some(
-                        (s) => s.name === productType
-                      ) && (
-                        <option value={productType}>
-                          {productType} (pH {targetPh || activeSpec.targetPh})
-                        </option>
-                      )}
-                      {VALIDATED_PRODUCT_TYPES.map((spec) => (
-                        <option key={spec.id} value={spec.name}>
-                          {spec.name} (pH {spec.targetPh})
-                        </option>
-                      ))}
-                    </select>
+                    <div className="relative">
+                      <select
+                        id="product-type-select"
+                        value={productType}
+                        onChange={(e) => handleProductTypeChange(e.target.value)}
+                        className="w-full min-h-[44px] appearance-none pl-3.5 pr-10 py-3 rounded-[12px] bg-[#f8fdfb] border border-[#0B2B26]/15 text-sm font-medium text-[#0B2B26] focus:outline-none focus:border-[#0E807E] focus-visible:ring-2 focus-visible:ring-[#0E807E] focus-visible:ring-offset-1 transition-colors cursor-pointer"
+                      >
+                        {!VALIDATED_PRODUCT_TYPES.some(
+                          (s) => s.name === productType
+                        ) && (
+                          <option value={productType}>
+                            {productType} (pH {targetPh || activeSpec.targetPh})
+                          </option>
+                        )}
+                        {VALIDATED_PRODUCT_TYPES.map((spec) => (
+                          <option key={spec.id} value={spec.name}>
+                            {spec.name} (pH {spec.targetPh})
+                          </option>
+                        ))}
+                      </select>
+                      <ChevronDown aria-hidden="true" className="w-4 h-4 text-[#2E524C] pointer-events-none absolute right-3.5 top-1/2 -translate-y-1/2" />
+                    </div>
                   </div>
 
                   <div>
                     <label
                       htmlFor="skin-target-select"
-                      className="block text-xs font-bold text-slate-800 mb-1.5 uppercase tracking-wider"
+                      className="text-[11px] font-medium uppercase tracking-[0.12em] text-[#0E807E] block mb-2"
                     >
                       Target Kulit (Primary Skin Target)
                     </label>
-                    <select
-                      id="skin-target-select"
-                      value={skinTarget}
-                      onChange={(e) => setSkinTarget(e.target.value)}
-                      className="w-full p-3 rounded-xl border border-slate-200 bg-white focus:outline-none focus:ring-2 focus:ring-[#14b8a6] text-xs sm:text-sm font-semibold text-slate-900"
-                    >
-                      {!SKIN_TARGETS.includes(skinTarget) && (
-                        <option value={skinTarget}>{skinTarget}</option>
-                      )}
-                      {SKIN_TARGETS.map((target) => (
-                        <option key={target} value={target}>
-                          {target}
-                        </option>
-                      ))}
-                    </select>
+                    <div className="relative">
+                      <select
+                        id="skin-target-select"
+                        value={skinTarget}
+                        onChange={(e) => setSkinTarget(e.target.value)}
+                        className="w-full min-h-[44px] appearance-none pl-3.5 pr-10 py-3 rounded-[12px] bg-[#f8fdfb] border border-[#0B2B26]/15 text-sm font-medium text-[#0B2B26] focus:outline-none focus:border-[#0E807E] focus-visible:ring-2 focus-visible:ring-[#0E807E] focus-visible:ring-offset-1 transition-colors cursor-pointer"
+                      >
+                        {!SKIN_TARGETS.includes(skinTarget) && (
+                          <option value={skinTarget}>{skinTarget}</option>
+                        )}
+                        {SKIN_TARGETS.map((target) => (
+                          <option key={target} value={target}>
+                            {target}
+                          </option>
+                        ))}
+                      </select>
+                      <ChevronDown aria-hidden="true" className="w-4 h-4 text-[#2E524C] pointer-events-none absolute right-3.5 top-1/2 -translate-y-1/2" />
+                    </div>
                   </div>
                 </div>
 
                 <div>
                   <label
                     htmlFor="desired-texture-select"
-                    className="block text-xs font-bold text-slate-800 mb-1.5 uppercase tracking-wider"
+                    className="text-[11px] font-medium uppercase tracking-[0.12em] text-[#0E807E] block mb-2"
                   >
                     Tekstur &amp; Skin-Feel yang Diinginkan
                   </label>
-                  <select
-                    id="desired-texture-select"
-                    value={desiredTexture}
-                    onChange={(e) => setDesiredTexture(e.target.value)}
-                    className="w-full p-3 rounded-xl border border-slate-200 bg-white focus:outline-none focus:ring-2 focus:ring-[#14b8a6] text-xs sm:text-sm font-semibold text-slate-900"
-                  >
-                    {!TEXTURE_OPTIONS.includes(desiredTexture) && (
-                      <option value={desiredTexture}>{desiredTexture}</option>
-                    )}
-                    {TEXTURE_OPTIONS.map((tex) => (
-                      <option key={tex} value={tex}>
-                        {tex}
-                      </option>
-                    ))}
-                  </select>
+                  <div className="relative">
+                    <select
+                      id="desired-texture-select"
+                      value={desiredTexture}
+                      onChange={(e) => setDesiredTexture(e.target.value)}
+                      className="w-full min-h-[44px] appearance-none pl-3.5 pr-10 py-3 rounded-[12px] bg-[#f8fdfb] border border-[#0B2B26]/15 text-sm font-medium text-[#0B2B26] focus:outline-none focus:border-[#0E807E] focus-visible:ring-2 focus-visible:ring-[#0E807E] focus-visible:ring-offset-1 transition-colors cursor-pointer"
+                    >
+                      {!TEXTURE_OPTIONS.includes(desiredTexture) && (
+                        <option value={desiredTexture}>{desiredTexture}</option>
+                      )}
+                      {TEXTURE_OPTIONS.map((tex) => (
+                        <option key={tex} value={tex}>
+                          {tex}
+                        </option>
+                      ))}
+                    </select>
+                    <ChevronDown aria-hidden="true" className="w-4 h-4 text-[#2E524C] pointer-events-none absolute right-3.5 top-1/2 -translate-y-1/2" />
+                  </div>
                 </div>
 
-                {/* Target pH, Target Viscosity & Batch Size */}
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-1">
-                  <div>
-                    <div className="flex items-center justify-between mb-1.5">
-                      <label
-                        htmlFor="target-ph-input"
-                        className="text-xs font-bold text-slate-800 uppercase tracking-wider"
-                      >
-                        Target pH
-                      </label>
-                      <span className="text-[10px] font-mono text-[#0f766e] font-bold">
-                        Valid: {activeSpec.validPhRange}
-                      </span>
-                    </div>
+              {/* Target pH, Target Viscosity & Batch Size */}
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-5 pt-1 items-start">
+                <div>
+                  <label
+                    htmlFor="target-ph-input"
+                    className="text-[11px] font-medium uppercase tracking-[0.12em] text-[#0E807E] block mb-2 whitespace-nowrap"
+                  >
+                    Target pH
+                  </label>
+                  <input
+                    id="target-ph-input"
+                    type="text"
+                    value={targetPh}
+                    onChange={(e) => setTargetPh(e.target.value)}
+                    placeholder={`e.g. ${activeSpec.targetPh} atau 5.0 - 5.5`}
+                    className="w-full min-h-[44px] px-3.5 py-3 rounded-[12px] bg-[#f8fdfb] border border-[#0B2B26]/15 focus:outline-none focus:border-[#0E807E] focus-visible:ring-2 focus-visible:ring-[#0E807E] focus-visible:ring-offset-1 text-sm font-mono font-medium text-[#0B2B26] placeholder:text-[#2E524C]/80 placeholder:font-normal tabular-nums transition-colors"
+                    required
+                  />
+                  <span className="text-[11px] font-mono text-[#0E807E] block mt-1.5 tabular-nums">
+                    Valid: {activeSpec.validPhRange}
+                  </span>
+                </div>
+
+                <div>
+                  <label
+                    htmlFor="target-viscosity-input"
+                    className="text-[11px] font-medium uppercase tracking-[0.12em] text-[#0E807E] block mb-2 whitespace-nowrap"
+                  >
+                    Target Viscosity
+                  </label>
+                  <input
+                    id="target-viscosity-input"
+                    type="text"
+                    value={targetViscosity}
+                    onChange={(e) => setTargetViscosity(e.target.value)}
+                    placeholder={`e.g. ${activeSpec.targetViscosity}`}
+                    className="w-full min-h-[44px] px-3.5 py-3 rounded-[12px] bg-[#f8fdfb] border border-[#0B2B26]/15 focus:outline-none focus:border-[#0E807E] focus-visible:ring-2 focus-visible:ring-[#0E807E] focus-visible:ring-offset-1 text-xs sm:text-sm font-mono font-medium text-[#0B2B26] placeholder:text-[#2E524C]/80 placeholder:font-normal tabular-nums transition-colors"
+                    required
+                  />
+                  <span className="text-[11px] font-mono text-[#0E807E] block mt-1.5 tabular-nums">
+                    Rec: {activeSpec.targetViscosity}
+                  </span>
+                </div>
+
+                <div>
+                  <label
+                    htmlFor="batch-size-input"
+                    className="text-[11px] font-medium uppercase tracking-[0.12em] text-[#0E807E] block mb-2 whitespace-nowrap"
+                  >
+                    Ukuran Batch
+                  </label>
+                  <div className="relative">
                     <input
-                      id="target-ph-input"
-                      type="text"
-                      value={targetPh}
-                      onChange={(e) => setTargetPh(e.target.value)}
-                      placeholder={`e.g. ${activeSpec.targetPh} atau 5.0 - 5.5`}
-                      className="w-full p-3 rounded-xl border border-slate-200 bg-white focus:outline-none focus:ring-2 focus:ring-[#14b8a6] text-sm font-mono font-bold text-slate-900 placeholder:text-slate-400 placeholder:font-normal tabular-nums"
+                      id="batch-size-input"
+                      type="number"
+                      min="10"
+                      max="100000"
+                      value={batchSize}
+                      onChange={(e) => setBatchSize(e.target.value)}
+                      placeholder="e.g. 100"
+                      className="w-full min-h-[44px] px-3.5 py-3 pr-9 rounded-[12px] bg-[#f8fdfb] border border-[#0B2B26]/15 focus:outline-none focus:border-[#0E807E] focus-visible:ring-2 focus-visible:ring-[#0E807E] focus-visible:ring-offset-1 text-sm font-sans font-medium text-[#0B2B26] placeholder:text-[#2E524C]/80 placeholder:font-normal tabular-nums transition-colors"
                       required
                     />
+                    <span className="absolute right-3.5 top-1/2 -translate-y-1/2 text-[#2E524C] text-xs font-sans font-medium pointer-events-none">
+                      g
+                    </span>
                   </div>
+                  <span className="text-[11px] font-sans text-[#2E524C] block mt-1.5">
+                    Grams (g) per lab trial
+                  </span>
+                </div>
+              </div>
+            </section>
 
-                  <div>
-                    <div className="flex items-center justify-between mb-1.5">
-                      <label
-                        htmlFor="target-viscosity-input"
-                        className="text-xs font-bold text-slate-800 uppercase tracking-wider"
-                      >
-                        Target Viscosity
-                      </label>
-                      <span className="text-[10px] font-mono text-[#0f766e] font-bold">
-                        Rec: {activeSpec.targetViscosity}
-                      </span>
-                    </div>
+            {/* SURFACE CARD 2: TARGET HPP, BUDGET PERCOBAAN, STATUS HALAL, DEADLINE & MOQ */}
+            <section className="bg-white rounded-[16px] p-6 sm:p-8 border border-[#0B2B26]/10 space-y-6">
+              <div className="flex flex-wrap items-baseline justify-between gap-2 pb-4 border-b border-[#0B2B26]/10">
+                <div>
+                  <span className="text-[12px] font-mono tabular-nums font-medium tracking-[0.04em] text-[#0E807E] block mb-1">
+                    02 · Cost · Halal · Trial Planner
+                  </span>
+                  <h2 className="text-lg sm:text-xl font-medium text-[#0B2B26] tracking-[-0.02em]">
+                    Target HPP, Budget Percobaan, Status Halal, Deadline &amp; MOQ
+                  </h2>
+                </div>
+              </div>
+
+              {/* Target HPP & Budget Percobaan */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                <div>
+                  <div className="flex items-center justify-between gap-2 mb-2">
+                    <label
+                      htmlFor="target-hpp-input"
+                      className="text-[11px] font-medium uppercase tracking-[0.12em] text-[#0E807E]"
+                    >
+                      Target HPP per Pcs (Rp)
+                    </label>
+                    <span className="text-[11px] font-mono text-[#2E524C] tabular-nums">
+                      Rec: Rp {Number(recDefaults.hpp).toLocaleString("id-ID")}
+                    </span>
+                  </div>
+                  <div className="relative">
+                    <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-[#2E524C] text-xs font-mono font-medium pointer-events-none">
+                      Rp
+                    </span>
                     <input
-                      id="target-viscosity-input"
-                      type="text"
-                      value={targetViscosity}
-                      onChange={(e) => setTargetViscosity(e.target.value)}
-                      placeholder={`e.g. ${activeSpec.targetViscosity}`}
-                      className="w-full p-3 rounded-xl border border-slate-200 bg-white focus:outline-none focus:ring-2 focus:ring-[#14b8a6] text-xs font-mono font-bold text-slate-900 placeholder:text-slate-400 placeholder:font-normal tabular-nums"
-                      required
+                      id="target-hpp-input"
+                      type="number"
+                      min="1000"
+                      step="500"
+                      value={targetHppPerUnit}
+                      onChange={(e) => setTargetHppPerUnit(e.target.value)}
+                      placeholder={`e.g. ${recDefaults.hpp}`}
+                      className="w-full min-h-[44px] pl-10 pr-3.5 py-3 rounded-[12px] bg-[#f8fdfb] border border-[#0B2B26]/15 focus:outline-none focus:border-[#0E807E] focus-visible:ring-2 focus-visible:ring-[#0E807E] focus-visible:ring-offset-1 text-sm font-mono font-medium text-[#0B2B26] placeholder:text-[#2E524C]/80 placeholder:font-normal tabular-nums transition-colors"
                     />
                   </div>
+                </div>
 
-                  <div>
-                    <div className="flex items-center justify-between mb-1.5">
-                      <label
-                        htmlFor="batch-size-input"
-                        className="text-xs font-bold text-slate-800 uppercase tracking-wider"
-                      >
-                        Ukuran Batch / Pcs
-                      </label>
-                      <span className="text-[10px] font-mono text-slate-500">
-                        Grams (g)
-                      </span>
-                    </div>
-                    <div className="relative">
-                      <input
-                        id="batch-size-input"
-                        type="number"
-                        min="10"
-                        max="100000"
-                        value={batchSize}
-                        onChange={(e) => setBatchSize(e.target.value)}
-                        placeholder="e.g. 100"
-                        className="w-full p-3 rounded-xl border border-slate-200 bg-white focus:outline-none focus:ring-2 focus:ring-[#14b8a6] text-sm font-mono font-bold text-slate-900 placeholder:text-slate-400 placeholder:font-normal pr-8 tabular-nums"
-                        required
-                      />
-                      <span className="absolute right-3 top-3 text-slate-400 text-xs font-mono font-bold">
-                        g
-                      </span>
-                    </div>
+                <div>
+                  <div className="flex items-center justify-between gap-2 mb-2">
+                    <label
+                      htmlFor="trial-budget-input"
+                      className="text-[11px] font-medium uppercase tracking-[0.12em] text-[#0E807E]"
+                    >
+                      Budget Percobaan Lab (Rp)
+                    </label>
+                    <span className="text-[11px] font-mono text-[#2E524C] tabular-nums">
+                      Est. {maxLabTrialsCovered}x Trial Lab
+                    </span>
+                  </div>
+                  <div className="relative">
+                    <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-[#2E524C] text-xs font-mono font-medium pointer-events-none">
+                      Rp
+                    </span>
+                    <input
+                      id="trial-budget-input"
+                      type="number"
+                      min="50000"
+                      step="25000"
+                      value={trialBudgetRp}
+                      onChange={(e) => setTrialBudgetRp(e.target.value)}
+                      placeholder={`e.g. ${recDefaults.trialBudget}`}
+                      className="w-full min-h-[44px] pl-10 pr-3.5 py-3 rounded-[12px] bg-[#f8fdfb] border border-[#0B2B26]/15 focus:outline-none focus:border-[#0E807E] focus-visible:ring-2 focus-visible:ring-[#0E807E] focus-visible:ring-offset-1 text-sm font-mono font-medium text-[#0B2B26] placeholder:text-[#2E524C]/80 placeholder:font-normal tabular-nums transition-colors"
+                    />
                   </div>
                 </div>
               </div>
 
-              {/* PARAMETER GROUP 2: TARGET HPP, BUDGET PERCOBAAN, WAJIB HALAL, DEADLINE & MOQ */}
-              <div className="p-4 sm:p-5 rounded-2xl bg-emerald-50/50 border border-emerald-200/80 space-y-4">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-extrabold uppercase tracking-wider text-[#12382f]">
-                    2. Target HPP, Budget Percobaan, Status Halal, Deadline &amp; MOQ
-                  </span>
-                  <span className="text-[11px] font-mono text-[#0f766e] font-bold">
-                    Cost · Halal · Trial Planner
-                  </span>
-                </div>
-
-                {/* Target HPP & Budget Percobaan */}
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div>
-                    <div className="flex items-center justify-between mb-1.5">
-                      <label
-                        htmlFor="target-hpp-input"
-                        className="text-xs font-bold text-slate-800 uppercase tracking-wider"
+              {/* Wajib Halal atau Tidak */}
+              <div>
+                <span
+                  id="halal-requirement-label"
+                  className="text-[11px] font-medium uppercase tracking-[0.12em] text-[#0E807E] block mb-2.5"
+                >
+                  Status Kehalalan Produk (Wajib Halal atau Tidak)
+                </span>
+                <div
+                  role="group"
+                  aria-labelledby="halal-requirement-label"
+                  className="grid grid-cols-1 sm:grid-cols-2 gap-3"
+                >
+                  {(
+                    [
+                      "Wajib Halal (LPPOM MUI / BPJPH)",
+                      "Tidak Wajib / Reguler (Standard CoA)",
+                    ] as const
+                  ).map((opt) => {
+                    const isSelected = halalRequirement === opt;
+                    return (
+                      <button
+                        key={opt}
+                        type="button"
+                        aria-pressed={isSelected}
+                        onClick={() => setHalalRequirement(opt)}
+                        className={`min-h-[44px] px-4 py-3 text-xs flex items-center justify-between gap-2 cursor-pointer text-left ${
+                          isSelected ? "btn-glass-primary" : "btn-glass-secondary"
+                        }`}
                       >
-                        Target HPP per Pcs / Batch (Rp)
-                      </label>
-                      <span className="text-[10px] font-mono text-[#0f766e] font-bold">
-                        Rec: Rp {Number(recDefaults.hpp).toLocaleString("id-ID")}
-                      </span>
-                    </div>
-                    <div className="relative">
-                      <span className="absolute left-3.5 top-3 text-slate-400 text-xs font-mono font-bold">
-                        Rp
-                      </span>
-                      <input
-                        id="target-hpp-input"
-                        type="number"
-                        min="1000"
-                        step="500"
-                        value={targetHppPerUnit}
-                        onChange={(e) => setTargetHppPerUnit(e.target.value)}
-                        placeholder={`e.g. ${recDefaults.hpp}`}
-                        className="w-full pl-9 pr-3 py-3 rounded-xl border border-slate-200 bg-white focus:outline-none focus:ring-2 focus:ring-[#14b8a6] text-sm font-mono font-bold text-slate-900 placeholder:text-slate-400 placeholder:font-normal tabular-nums"
-                      />
-                    </div>
-                  </div>
-
-                  <div>
-                    <div className="flex items-center justify-between mb-1.5">
-                      <label
-                        htmlFor="trial-budget-input"
-                        className="text-xs font-bold text-slate-800 uppercase tracking-wider"
-                      >
-                        Budget Percobaan R&amp;D Lab (Rp)
-                      </label>
-                      <span className="text-[10px] font-mono text-[#0f766e] font-bold">
-                        Est. {maxLabTrialsCovered}x Trial Lab
-                      </span>
-                    </div>
-                    <div className="relative">
-                      <span className="absolute left-3.5 top-3 text-slate-400 text-xs font-mono font-bold">
-                        Rp
-                      </span>
-                      <input
-                        id="trial-budget-input"
-                        type="number"
-                        min="50000"
-                        step="25000"
-                        value={trialBudgetRp}
-                        onChange={(e) => setTrialBudgetRp(e.target.value)}
-                        placeholder={`e.g. ${recDefaults.trialBudget}`}
-                        className="w-full pl-9 pr-3 py-3 rounded-xl border border-slate-200 bg-white focus:outline-none focus:ring-2 focus:ring-[#14b8a6] text-sm font-mono font-bold text-slate-900 placeholder:text-slate-400 placeholder:font-normal tabular-nums"
-                      />
-                    </div>
-                  </div>
+                        <span>{opt}</span>
+                        {isSelected && (
+                          <CheckCircle2 aria-hidden="true" className="w-4 h-4 shrink-0 text-[#0E807E]" />
+                        )}
+                      </button>
+                    );
+                  })}
                 </div>
+              </div>
 
-                {/* Wajib Halal atau Tidak */}
+              {/* Deadline dan MOQ */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
                 <div>
-                  <label className="block text-xs font-bold text-slate-800 mb-1.5 uppercase tracking-wider">
-                    Status Kehalalan Produk (Wajib Halal atau Tidak)
+                  <label
+                    htmlFor="deadline-select"
+                    className="text-[11px] font-medium uppercase tracking-[0.12em] text-[#0E807E] block mb-2"
+                  >
+                    Target Deadline Proyek
                   </label>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    {(
-                      [
-                        "Wajib Halal (LPPOM MUI / BPJPH)",
-                        "Tidak Wajib / Reguler (Standard CoA)",
-                      ] as const
-                    ).map((opt) => {
-                      const isSelected = halalRequirement === opt;
-                      return (
-                        <button
-                          key={opt}
-                          type="button"
-                          onClick={() => setHalalRequirement(opt)}
-                          className={`p-3 rounded-xl border text-xs font-bold transition flex items-center justify-between cursor-pointer ${
-                            isSelected
-                              ? "bg-[#0f766e] text-white border-[#0f766e] shadow-xs"
-                              : "bg-white text-slate-700 border-slate-200 hover:border-[#0f766e]"
-                          }`}
-                        >
-                          <span>{opt}</span>
-                          {isSelected && <CheckCircle2 className="w-4 h-4 shrink-0" />}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                {/* Deadline dan MOQ */}
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div>
-                    <label
-                      htmlFor="deadline-select"
-                      className="block text-xs font-bold text-slate-800 mb-1.5 uppercase tracking-wider"
-                    >
-                      Target Deadline Proyek
-                    </label>
+                  <div className="relative">
                     <select
                       id="deadline-select"
                       value={projectDeadline}
                       onChange={(e) => setProjectDeadline(e.target.value)}
-                      className="w-full p-3 rounded-xl border border-slate-200 bg-white focus:outline-none focus:ring-2 focus:ring-[#14b8a6] text-xs font-semibold text-slate-900"
+                      className="w-full min-h-[44px] appearance-none pl-3.5 pr-10 py-3 rounded-[12px] bg-[#f8fdfb] border border-[#0B2B26]/15 focus:outline-none focus:border-[#0E807E] focus-visible:ring-2 focus-visible:ring-[#0E807E] focus-visible:ring-offset-1 text-xs sm:text-sm font-medium text-[#0B2B26] transition-colors cursor-pointer"
                     >
                       {DEADLINE_OPTIONS.map((dl) => (
                         <option key={dl} value={dl}>
@@ -768,54 +894,76 @@ export default function FormulatePage() {
                         </option>
                       ))}
                     </select>
+                    <ChevronDown aria-hidden="true" className="w-4 h-4 text-[#2E524C] pointer-events-none absolute right-3.5 top-1/2 -translate-y-1/2" />
                   </div>
+                </div>
 
-                  <div>
-                    <div className="flex items-center justify-between mb-1.5">
-                      <label
-                        htmlFor="target-moq-input"
-                        className="text-xs font-bold text-slate-800 uppercase tracking-wider"
-                      >
-                        Target MOQ Produksi (Pcs)
-                      </label>
-                      <span className="text-[10px] font-mono text-[#0f766e] font-bold">
-                        Total Bulk: {totalMoqBulkKg} kg
-                      </span>
-                    </div>
-                    <div className="relative">
-                      <input
-                        id="target-moq-input"
-                        type="number"
-                        min="100"
-                        step="100"
-                        value={targetMoq}
-                        onChange={(e) => setTargetMoq(e.target.value)}
-                        placeholder={`e.g. ${recDefaults.moq}`}
-                        className="w-full p-3 pr-12 rounded-xl border border-slate-200 bg-white focus:outline-none focus:ring-2 focus:ring-[#14b8a6] text-sm font-mono font-bold text-slate-900 placeholder:text-slate-400 placeholder:font-normal tabular-nums"
-                      />
-                      <span className="absolute right-3.5 top-3 text-slate-400 text-xs font-mono font-bold">
-                        pcs
-                      </span>
-                    </div>
+                <div>
+                  <div className="flex items-center justify-between gap-2 mb-2">
+                    <label
+                      htmlFor="target-moq-input"
+                      className="text-[11px] font-medium uppercase tracking-[0.12em] text-[#0E807E]"
+                    >
+                      Target MOQ Produksi (Pcs)
+                    </label>
+                    <span className="text-[11px] font-mono text-[#2E524C] tabular-nums">
+                      Total Bulk: {totalMoqBulkKg} kg
+                    </span>
+                  </div>
+                  <div className="relative">
+                    <input
+                      id="target-moq-input"
+                      type="number"
+                      min="100"
+                      step="100"
+                      value={targetMoq}
+                      onChange={(e) => setTargetMoq(e.target.value)}
+                      placeholder={`e.g. ${recDefaults.moq}`}
+                      className="w-full min-h-[44px] px-3.5 py-3 pr-12 rounded-[12px] bg-[#f8fdfb] border border-[#0B2B26]/15 focus:outline-none focus:border-[#0E807E] focus-visible:ring-2 focus-visible:ring-[#0E807E] focus-visible:ring-offset-1 text-sm font-mono font-medium text-[#0B2B26] placeholder:text-[#2E524C]/80 placeholder:font-normal tabular-nums transition-colors"
+                    />
+                    <span className="absolute right-3.5 top-1/2 -translate-y-1/2 text-[#2E524C] text-xs font-mono font-medium pointer-events-none">
+                      pcs
+                    </span>
                   </div>
                 </div>
               </div>
+            </section>
 
-              {/* Row 3: Product-Type Matched Recommended Actives Quick-Pick */}
-              <div className="bg-emerald-50/70 rounded-2xl p-4 border border-emerald-200/80">
-                <div className="flex items-center justify-between gap-2 mb-2.5">
-                  <div className="flex items-center gap-2 text-xs font-bold text-[#12382f]">
-                    <Sliders className="w-4 h-4 text-[#0f766e]" />
+            {/* SURFACE CARD 3: BAHAN AKTIF, EKSIPIEN & KALKULASI BOM */}
+            <section className="bg-white rounded-[16px] p-6 sm:p-8 border border-[#0B2B26]/10 space-y-6">
+              <div className="flex flex-wrap items-baseline justify-between gap-2 pb-4 border-b border-[#0B2B26]/10">
+                <div>
+                  <span className="text-[12px] font-mono tabular-nums font-medium tracking-[0.04em] text-[#0E807E] block mb-1">
+                    03 · Active Matrix &amp; Excipient Calibration
+                  </span>
+                  <h2 className="text-lg sm:text-xl font-medium text-[#0B2B26] tracking-[-0.02em]">
+                    Komposisi Bahan Aktif &amp; Basis Sediaan
+                  </h2>
+                </div>
+                <span className="text-xs font-sans font-medium text-[#2E524C]">
+                  {activeSpec.shortName}
+                </span>
+              </div>
+
+              {/* Recommended Actives Quick-Pick */}
+              <div>
+                <div className="flex items-center justify-between gap-2 mb-3">
+                  <div
+                    id="recommended-actives-label"
+                    className="flex items-center gap-2 text-[11px] font-medium uppercase tracking-[0.12em] text-[#0E807E]"
+                  >
+                    <Sliders aria-hidden="true" className="w-3.5 h-3.5 text-[#0E807E]" />
                     <span>
-                      Recommended Actives for {activeSpec.shortName} (Click to Toggle &amp; Inspect 3D)
+                      Recommended Actives ({activeSpec.shortName}) · Click to Toggle &amp; 3D
                     </span>
                   </div>
-                  <span className="text-[11px] font-mono text-slate-500">
-                    {activeSpec.systemType}
-                  </span>
                 </div>
 
-                <div className="flex flex-wrap gap-2">
+                <div
+                  role="group"
+                  aria-labelledby="recommended-actives-label"
+                  className="flex flex-wrap gap-2"
+                >
                   {activeSpec.recommendedActives.map((act) => {
                     const baseName = act.name
                       .replace(/\d+(\.\d+)?\s*%/g, "")
@@ -828,18 +976,17 @@ export default function FormulatePage() {
                       <button
                         key={act.name}
                         type="button"
+                        aria-pressed={isSelected}
                         onClick={() => toggleActiveIngredient(act.name)}
                         title={act.role}
-                        className={`px-3 py-1.5 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer ${
-                          isSelected
-                            ? "bg-[#0f766e] text-white shadow-xs"
-                            : "bg-white text-slate-700 border border-emerald-200 hover:border-[#0f766e]"
+                        className={`min-h-[44px] px-3.5 py-2 text-xs flex items-center gap-1.5 cursor-pointer ${
+                          isSelected ? "btn-glass-primary" : "btn-glass-compact"
                         }`}
                       >
                         {isSelected ? (
-                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          <CheckCircle2 aria-hidden="true" className="w-3.5 h-3.5 text-[#0E807E]" />
                         ) : (
-                          <Plus className="w-3.5 h-3.5 text-[#0f766e]" />
+                          <Plus aria-hidden="true" className="w-3.5 h-3.5 text-[#0E807E]" />
                         )}
                         <span>{act.name}</span>
                       </button>
@@ -848,21 +995,21 @@ export default function FormulatePage() {
                 </div>
               </div>
 
-              {/* Row 4: Custom Active / Base Ingredients Input + Complete Ingredient Picker */}
-              <div>
-                <div className="flex items-center justify-between mb-2">
+              {/* Custom Active / Base Ingredients Input */}
+              <div className="pt-2 border-t border-[#0B2B26]/10">
+                <div className="flex items-center justify-between gap-2 mb-1">
                   <label
                     htmlFor="custom-ingredients-input"
-                    className="block text-xs font-bold text-slate-800 uppercase tracking-wider"
+                    className="text-[11px] font-medium uppercase tracking-[0.12em] text-[#0E807E]"
                   >
                     Active &amp; Custom Ingredients (with % Concentration)
                   </label>
                   <button
                     type="button"
                     onClick={() => setCustomIngredientsInput("")}
-                    className="text-[11px] font-semibold text-slate-500 hover:text-rose-600 flex items-center gap-1 cursor-pointer"
+                    className="min-h-[44px] px-2.5 -mr-2.5 text-xs font-medium text-[#2E524C] hover:text-[#b91c1c] inline-flex items-center gap-1 cursor-pointer transition-colors rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0E807E] focus-visible:ring-offset-1"
                   >
-                    <X className="w-3 h-3" />
+                    <X aria-hidden="true" className="w-3.5 h-3.5" />
                     <span>Clear All</span>
                   </button>
                 </div>
@@ -876,30 +1023,33 @@ export default function FormulatePage() {
                     .slice(0, 3)
                     .map((a) => a.name)
                     .join(", ")}`}
-                  className="w-full p-3.5 rounded-xl border border-slate-200 bg-slate-50/80 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#14b8a6] text-sm font-medium text-slate-900 placeholder:text-slate-400 placeholder:font-normal"
+                  className="w-full min-h-[44px] px-4 py-3.5 rounded-[12px] bg-[#f8fdfb] border border-[#0B2B26]/15 focus:outline-none focus:border-[#0E807E] focus-visible:ring-2 focus-visible:ring-[#0E807E] focus-visible:ring-offset-1 text-sm font-medium text-[#0B2B26] placeholder:text-[#2E524C]/80 placeholder:font-normal transition-colors"
                 />
 
                 {copilotEval.categorizedIngredients &&
                   copilotEval.categorizedIngredients.length > 0 && (
-                    <div className="mt-2.5 p-3 rounded-xl bg-emerald-50/50 border border-emerald-200/70">
-                      <div className="text-[11px] font-bold text-[#12382f] mb-1.5 flex items-center justify-between">
-                        <span>
+                    <div className="mt-4 p-4 rounded-[12px] bg-[#f4fbf8] border border-[#0B2B26]/10">
+                      <div className="text-xs font-medium text-[#0B2B26] mb-3 flex flex-wrap items-center justify-between gap-2 pb-2.5 border-b border-[#0B2B26]/10">
+                        <span className="text-[11px] font-medium uppercase tracking-[0.12em] text-[#0E807E]">
                           Komposisi Bahan Terkategorisasi (
-                          {copilotEval.categorizedIngredients.length} Bahan):
+                          {copilotEval.categorizedIngredients.length} Bahan)
                         </span>
-                        <span className="font-mono text-[10px] text-[#0f766e]">
+                        <span className="font-mono text-xs text-[#0B2B26] font-medium tabular-nums">
                           Aktif: {copilotEval.totalActivePercent}% · Base/Eksipien:{" "}
                           {copilotEval.estimatedBasePercent}%
                         </span>
                       </div>
-                      <div className="flex flex-wrap gap-1.5">
+                      <div className="flex flex-wrap gap-2">
                         {copilotEval.categorizedIngredients.map((item, idx) => (
                           <span
                             key={`${item.name}-${idx}`}
-                            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-white border border-emerald-900/10 text-[11px] font-semibold text-slate-800 shadow-2xs"
+                            className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-white border border-[#0B2B26]/10 text-xs text-[#0B2B26]"
                           >
-                            <span>{item.label}</span>
-                            <span className="px-1.5 py-0.5 rounded bg-emerald-100/80 text-[#0f766e] text-[10px] font-mono font-bold">
+                            <span className="font-medium">{item.label}</span>
+                            <span className="text-[#0B2B26]/30" aria-hidden="true">
+                              ·
+                            </span>
+                            <span className="text-[#0E807E] text-[10px] font-medium uppercase tracking-[0.06em]">
                               {item.category}
                             </span>
                           </span>
@@ -909,11 +1059,18 @@ export default function FormulatePage() {
                   )}
 
                 {/* Quick Add from Full 43-Ingredient Database */}
-                <div className="mt-3">
-                  <p className="text-[11px] font-semibold text-slate-500 mb-2">
-                    Quick-Add from Validated Ingredient Database (Matched to {activeSpec.shortName}):
-                  </p>
-                  <div className="flex flex-wrap gap-1.5 max-h-28 overflow-y-auto pr-1">
+                <div className="mt-5">
+                  <span
+                    id="quick-add-database-label"
+                    className="text-[11px] font-medium uppercase tracking-[0.12em] text-[#0E807E] block mb-2.5"
+                  >
+                    Quick-Add from Validated Ingredient Database ({activeSpec.shortName})
+                  </span>
+                  <div
+                    role="group"
+                    aria-labelledby="quick-add-database-label"
+                    className="flex flex-wrap gap-2 max-h-44 overflow-y-auto pr-1"
+                  >
                     {allLibraryActives
                       .filter((ing) =>
                         ing.compatibleProductTypes.includes(activeSpec.name)
@@ -932,14 +1089,18 @@ export default function FormulatePage() {
                           <button
                             key={ing.key}
                             type="button"
+                            aria-pressed={isAdded}
                             onClick={() => toggleActiveIngredient(labelWithRate)}
-                            className={`px-2.5 py-1 rounded-lg text-[11px] font-medium transition cursor-pointer ${
-                              isAdded
-                                ? "bg-emerald-700 text-white"
-                                : "bg-slate-100 hover:bg-emerald-100 text-slate-700"
+                            className={`min-h-[44px] px-3.5 py-2 text-xs cursor-pointer inline-flex items-center gap-1.5 ${
+                              isAdded ? "btn-glass-primary" : "btn-glass-compact"
                             }`}
                           >
-                            {isAdded ? `✓ ${shortTitle}` : `+ ${shortTitle}`}
+                            {isAdded ? (
+                              <Check aria-hidden="true" className="w-3.5 h-3.5 text-[#0E807E] shrink-0" />
+                            ) : (
+                              <Plus aria-hidden="true" className="w-3.5 h-3.5 text-[#0E807E] shrink-0" />
+                            )}
+                            <span>{shortTitle}</span>
                           </button>
                         );
                       })}
@@ -947,276 +1108,361 @@ export default function FormulatePage() {
                 </div>
               </div>
 
-              {/* Row 5: BOM Cost Toggle */}
-              <div className="flex items-center gap-3 bg-slate-50 p-4 rounded-xl border border-slate-200/80">
+              {/* BOM Cost Toggle */}
+              <label
+                htmlFor="costToggle"
+                className="min-h-[44px] flex items-start sm:items-center gap-3 bg-[#f4fbf8] px-4 py-3 rounded-[12px] border border-[#0B2B26]/10 cursor-pointer select-none"
+              >
                 <input
                   type="checkbox"
                   id="costToggle"
                   checked={viewCost}
                   onChange={(e) => setViewCost(e.target.checked)}
-                  className="w-4 h-4 accent-[#0f766e] rounded cursor-pointer"
+                  className="w-5 h-5 mt-0.5 sm:mt-0 accent-[#0E807E] rounded-[4px] cursor-pointer shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0E807E] focus-visible:ring-offset-2"
                 />
-                <label
-                  htmlFor="costToggle"
-                  className="text-xs sm:text-sm font-semibold text-slate-800 cursor-pointer select-none"
-                >
+                <span className="text-xs sm:text-[13px] font-normal text-[#2E524C] leading-relaxed">
                   Hitung &amp; tampilkan estimasi biaya produksi (HPP / BOM Cost), budget trial, dan
                   kebutuhan MOQ berdasarkan database{" "}
-                  <span className="font-mono text-[#0f766e]">supplier.csv</span>
-                </label>
-              </div>
+                  <span className="font-medium text-[#0E807E]">supplier.csv</span>
+                </span>
+              </label>
 
-              {/* Submit Button */}
+              {/* Submission Error Alert (R-27) */}
+              {submitError && (
+                <div
+                  role="alert"
+                  className="p-4 rounded-[12px] bg-[#fef2f2] border border-[#b91c1c]/30 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                >
+                  <div className="flex items-start gap-2.5 text-xs sm:text-sm text-[#991b1b] font-medium leading-relaxed">
+                    <AlertCircle aria-hidden="true" className="w-4 h-4 shrink-0 mt-0.5 text-[#b91c1c]" />
+                    <span>{submitError}</span>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0 self-end sm:self-auto">
+                    <button
+                      type="submit"
+                      disabled={isLoading}
+                      className="btn-glass-secondary min-h-[44px] px-4 py-2 text-xs font-medium text-[#0B2B26] cursor-pointer whitespace-nowrap"
+                    >
+                      <span>Coba Lagi</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSubmitError(null)}
+                      aria-label="Tutup pesan error formulasi"
+                      className="btn-glass-compact min-h-[44px] min-w-[44px] px-3 py-2 text-xs font-medium text-[#0B2B26] cursor-pointer inline-flex items-center justify-center"
+                    >
+                      <X aria-hidden="true" className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Primary Submit CTA */}
               <button
                 type="submit"
                 disabled={isLoading}
-                className={`w-full py-4 rounded-2xl font-bold text-white transition shadow-md flex justify-center items-center gap-2 text-sm cursor-pointer ${
-                  isLoading
-                    ? "bg-slate-400 cursor-not-allowed"
-                    : "bg-gradient-to-r from-[#14b8a6] to-[#0f766e] hover:opacity-95"
-                }`}
+                className="btn-glass-primary min-h-[44px] w-full py-4 px-7 text-[13px] uppercase tracking-[0.06em] flex justify-center items-center gap-2 cursor-pointer"
               >
                 {isLoading ? (
                   <span>Calibrating BBD Dataset, Halal Status &amp; Supplier Matrix...</span>
                 ) : (
                   <>
-                    <Sparkles className="w-4 h-4" />
+                    <FlaskConical aria-hidden="true" className="w-4 h-4 text-[#0E807E]" />
                     <span>Generate Calibrated Formulation Candidates</span>
                   </>
                 )}
               </button>
-            </form>
-          </div>
+            </section>
+          </form>
 
-          {/* RIGHT 5 COLUMNS: LIVE BRIEF ACCURACY SUMMARY, INTERACTIVE AI CO-PILOT & 3D MOLECULE PREVIEW */}
-          <div className="lg:col-span-5 space-y-6">
-            {/* NEW: LIVE BRIEF SPECIFICATION & COMMERCIAL ACCURACY READOUT CARD */}
-            <div className="bg-gradient-to-br from-[#0f2922] via-[#12382f] to-[#0f172a] text-white p-6 rounded-[2rem] shadow-xl border border-emerald-500/20">
-              <div className="flex items-center justify-between gap-2 mb-3">
+          {/* RIGHT 5 COLUMNS: LIVE CALIBRATION READOUT, AI CO-PILOT, PRODUCT SPEC & 3D MOLECULE */}
+          <aside className="lg:col-span-5 space-y-6">
+            {/* LIVE CALIBRATION INSTRUMENT READOUT */}
+            <section className="bg-white text-[#0B2B26] p-6 sm:p-8 rounded-[16px] border border-[#0B2B26]/10">
+              <div className="flex items-start justify-between gap-3 pb-5 mb-6 border-b border-[#0B2B26]/10">
                 <div>
-                  <span className="text-[10px] font-mono uppercase tracking-[0.18em] text-emerald-300 font-bold block">
-                    LIVE BRIEF &amp; COMMERCIAL ACCURACY
+                  <span className="text-[11px] font-medium uppercase tracking-[0.14em] text-[#0E807E] block mb-1">
+                    Live Brief &amp; Commercial Accuracy
                   </span>
-                  <h2 className="text-base font-extrabold text-white">
+                  <h2 className="text-lg sm:text-xl font-medium text-[#0B2B26] tracking-[-0.02em]">
                     Ringkasan Parameter Formulator Terkalibrasi
                   </h2>
                 </div>
-                <Calculator className="w-5 h-5 text-emerald-300 shrink-0" />
+                <Calculator aria-hidden="true" className="w-5 h-5 text-[#0E807E] shrink-0 mt-1 stroke-[1.75]" />
               </div>
 
-              <div className="grid grid-cols-2 gap-2.5 text-xs mb-3">
-                <div className="p-3 rounded-xl bg-white/8 border border-white/10">
-                  <span className="text-[10px] text-emerald-200 uppercase font-mono block">
-                    Target Kulit &amp; Tekstur
-                  </span>
-                  <span className="font-bold text-white block truncate mt-0.5">
-                    {skinTarget}
-                  </span>
-                  <span className="text-[11px] text-emerald-100/80 block truncate">
-                    {desiredTexture.split("(")[0].trim()}
-                  </span>
-                </div>
-
-                <div className="p-3 rounded-xl bg-white/8 border border-white/10">
-                  <span className="text-[10px] text-emerald-200 uppercase font-mono block">
-                    Target HPP &amp; Trial Budget
-                  </span>
-                  <span className="font-mono font-bold text-white block mt-0.5 tabular-nums">
-                    HPP: Rp {resolvedHppNum.toLocaleString("id-ID")}/pcs
-                  </span>
-                  <span className="text-[11px] text-emerald-300 font-mono block tabular-nums">
-                    Trial: Rp {resolvedTrialBudgetNum.toLocaleString("id-ID")} ({maxLabTrialsCovered}x batch)
-                  </span>
-                </div>
-
-                <div className="p-3 rounded-xl bg-white/8 border border-white/10">
-                  <span className="text-[10px] text-emerald-200 uppercase font-mono block">
-                    Status Kehalalan
-                  </span>
-                  <span className="font-bold text-emerald-300 block mt-0.5 truncate">
-                    {halalRequirement.includes("Wajib Halal")
-                      ? "✓ Wajib Halal MUI/BPJPH"
-                      : "Reguler (Standard CoA)"}
-                  </span>
-                  <span className="text-[11px] text-emerald-100/80 block">
-                     Bebas Alkohol Khamr &amp; Porcine
-                  </span>
-                </div>
-
-                <div className="p-3 rounded-xl bg-white/8 border border-white/10">
-                  <span className="text-[10px] text-emerald-200 uppercase font-mono block">
-                    Deadline &amp; MOQ Produksi
-                  </span>
-                  <span className="font-mono font-bold text-white block mt-0.5 tabular-nums">
-                    MOQ: {resolvedMoqNum.toLocaleString("id-ID")} pcs ({totalMoqBulkKg} kg)
-                  </span>
-                  <span className="text-[11px] text-emerald-100/80 block truncate">
-                    {projectDeadline.split("(")[0].trim()}
-                  </span>
-                </div>
-              </div>
-
-              <div className="p-3 rounded-xl bg-emerald-500/15 border border-emerald-400/25 flex items-center justify-between text-xs">
-                <span className="flex items-center gap-1.5 text-emerald-100 font-medium">
-                  <CalendarClock className="w-4 h-4 text-emerald-300 shrink-0" />
-                  <span>Estimasi Total Nilai Produksi MOQ:</span>
-                </span>
-                <span className="font-mono font-extrabold text-emerald-300 tabular-nums">
-                  Rp {totalMoqEstimatedBudgetRp.toLocaleString("id-ID")}
-                </span>
-              </div>
-            </div>
-
-            {/* REAL-TIME INTERACTIVE AI CO-PILOT (4-PILLAR LIVE ASSISTANT) */}
-            <div className="bg-white p-6 rounded-[2rem] shadow-[0_20px_50px_-15px_rgba(16,68,56,0.15)] border border-emerald-900/10">
-              <div className="flex items-center justify-between gap-2 mb-3">
+              {/* PRIMARY INSTRUMENT READOUT GRID */}
+              <div className="grid grid-cols-2 gap-x-6 gap-y-6 pb-6 border-b border-[#0B2B26]/10">
                 <div>
-                  <span className="text-[11px] font-mono text-[#0f766e] font-bold block">
-                    INTERACTIVE AI CO-PILOT · ANALYTICAL COMPATIBILITY
+                  <span className="text-[11px] font-medium uppercase tracking-[0.12em] text-[#2E524C] block mb-2">
+                    Target pH
                   </span>
-                  <h2 className="text-base font-extrabold text-slate-900">
-                    Real-Time Formulation Compatibility &amp; Guide
-                  </h2>
+                  <div className="text-3xl sm:text-[34px] font-mono text-[#0B2B26] font-medium tabular-nums leading-none tracking-[-0.03em]">
+                    {targetPh.trim() || activeSpec.targetPh}
+                  </div>
+                  <span className="text-[11px] font-mono text-[#0E807E] block mt-2 tabular-nums">
+                    Valid: {activeSpec.validPhRange}
+                  </span>
                 </div>
+
+                <div>
+                  <span className="text-[11px] font-medium uppercase tracking-[0.12em] text-[#2E524C] block mb-2">
+                    HPP / Pcs
+                  </span>
+                  <div className="text-2xl sm:text-[28px] font-mono text-[#0B2B26] font-medium tabular-nums leading-none tracking-[-0.03em]">
+                    Rp {resolvedHppNum.toLocaleString("id-ID")}
+                  </div>
+                  <span className="text-[11px] font-mono text-[#2E524C] block mt-2 tabular-nums">
+                    Trial: Rp {resolvedTrialBudgetNum.toLocaleString("id-ID")} · {maxLabTrialsCovered}x batch
+                  </span>
+                </div>
+
+                <div className="col-span-2 pt-5 border-t border-[#0B2B26]/10">
+                  <div className="flex flex-wrap items-baseline justify-between gap-2 mb-2">
+                    <span className="text-[11px] font-medium uppercase tracking-[0.12em] text-[#2E524C]">
+                      Rasio Aktif vs Base
+                    </span>
+                    <span className="text-[11px] font-mono text-[#2E524C] tabular-nums">
+                      {parsedCustomList.length} bahan terinput · {resolvedBatchG} g/batch
+                    </span>
+                  </div>
+                  <div className="flex items-baseline gap-3">
+                    <span className="text-3xl sm:text-[34px] font-mono text-[#0E807E] font-medium tabular-nums leading-none tracking-[-0.03em]">
+                      {copilotEval.totalActivePercent}% : {copilotEval.estimatedBasePercent}%
+                    </span>
+                    <span className="text-xs font-sans text-[#2E524C]">
+                      Aktif / Base
+                    </span>
+                  </div>
+                </div>
+
+                <div className="col-span-2 pt-5 border-t border-[#0B2B26]/10">
+                  <div className="flex items-center justify-between gap-2 mb-2">
+                    <span className="text-[11px] font-medium uppercase tracking-[0.12em] text-[#2E524C] flex items-center gap-1.5">
+                      <CalendarClock aria-hidden="true" className="w-3.5 h-3.5 text-[#0E807E]" />
+                      <span>Estimasi Total Nilai Produksi MOQ</span>
+                    </span>
+                  </div>
+                  <div className="text-3xl sm:text-[36px] font-mono text-[#0B2B26] font-medium tabular-nums leading-none tracking-[-0.03em]">
+                    Rp {totalMoqEstimatedBudgetRp.toLocaleString("id-ID")}
+                  </div>
+                  <span className="text-xs font-mono text-[#2E524C] block mt-2 tabular-nums">
+                    MOQ {resolvedMoqNum.toLocaleString("id-ID")} pcs · Total Bulk {totalMoqBulkKg} kg
+                  </span>
+                </div>
+              </div>
+
+              {/* SECONDARY CALIBRATED SPECIFICATION ROWS */}
+              <dl className="divide-y divide-[#0B2B26]/10 pt-2 text-xs">
+                <div className="py-3 flex items-start justify-between gap-4">
+                  <dt className="text-[11px] font-medium uppercase tracking-[0.1em] text-[#2E524C] shrink-0">
+                    Target Kulit &amp; Tekstur
+                  </dt>
+                  <dd className="text-right">
+                    <span className="font-medium text-[#0B2B26] block">
+                      {skinTarget}
+                    </span>
+                    <span className="text-[#2E524C] block mt-0.5">
+                      {desiredTexture.split("(")[0].trim()}
+                    </span>
+                  </dd>
+                </div>
+
+                <div className="py-3 flex items-start justify-between gap-4">
+                  <dt className="text-[11px] font-medium uppercase tracking-[0.1em] text-[#2E524C] shrink-0">
+                    Status Kehalalan
+                  </dt>
+                  <dd className="text-right">
+                    <span className="font-medium text-[#146c43] inline-flex items-center justify-end gap-1.5">
+                      {halalRequirement.includes("Wajib Halal") ? (
+                        <>
+                          <Check aria-hidden="true" className="w-3.5 h-3.5 shrink-0" />
+                          <span>Wajib Halal MUI/BPJPH</span>
+                        </>
+                      ) : (
+                        <span>Reguler (Standard CoA)</span>
+                      )}
+                    </span>
+                    <span className="text-[#2E524C] block mt-0.5">
+                      Bebas Alkohol Khamr &amp; Porcine
+                    </span>
+                  </dd>
+                </div>
+
+                <div className="pt-3 flex items-start justify-between gap-4">
+                  <dt className="text-[11px] font-medium uppercase tracking-[0.1em] text-[#2E524C] shrink-0">
+                    Deadline Proyek
+                  </dt>
+                  <dd className="text-right font-medium text-[#0B2B26]">
+                    {projectDeadline.split("(")[0].trim()}
+                  </dd>
+                </div>
+              </dl>
+            </section>
+
+            {/* REAL-TIME INTERACTIVE AI CO-PILOT */}
+            <section className="bg-white p-6 sm:p-8 rounded-[16px] border border-[#0B2B26]/10">
+              <div className="pb-4 mb-4 border-b border-[#0B2B26]/10">
+                <span className="text-[11px] font-medium uppercase tracking-[0.14em] text-[#0E807E] block mb-1">
+                  Interactive AI Co-Pilot · Analytical Compatibility
+                </span>
+                <h2 className="text-base sm:text-lg font-medium text-[#0B2B26] tracking-[-0.02em]">
+                  Real-Time Formulation Compatibility &amp; Guide
+                </h2>
               </div>
 
               {/* STATUS INDICATOR */}
-              <div className="flex flex-wrap items-center justify-between gap-2 bg-slate-50 p-3 rounded-xl border border-slate-200/80 mb-3 text-xs">
-                <span
-                  className={`font-bold ${
-                    copilotEval.status === "critical"
-                      ? "text-rose-700"
-                      : copilotEval.status === "warning"
-                        ? "text-amber-700"
-                        : "text-emerald-700"
-                  }`}
-                >
-                  {copilotEval.status === "critical"
-                    ? "✖ "
+              <div
+                className={`flex flex-wrap items-center justify-between gap-2 px-4 py-3 rounded-[12px] border mb-4 text-xs ${
+                  copilotEval.status === "critical"
+                    ? "bg-[#fef2f2] border-[#fca5a5] text-[#b91c1c]"
                     : copilotEval.status === "warning"
-                      ? "▲ "
-                      : "● "}
-                  {copilotEval.statusLabel}
+                    ? "bg-[#fef9e7] border-[#f5d078] text-[#7A4F00]"
+                    : "bg-[#eaf9f0] border-[#47C4A5]/40 text-[#146c43]"
+                }`}
+              >
+                <span className="font-medium inline-flex items-center gap-1.5">
+                  {copilotEval.status === "critical" ? (
+                    <X aria-hidden="true" className="w-3.5 h-3.5 shrink-0" />
+                  ) : copilotEval.status === "warning" ? (
+                    <AlertTriangle aria-hidden="true" className="w-3.5 h-3.5 shrink-0" />
+                  ) : (
+                    <Circle aria-hidden="true" className="w-2.5 h-2.5 fill-current shrink-0" />
+                  )}
+                  <span>{copilotEval.statusLabel}</span>
                 </span>
-                <span className="font-mono font-bold text-slate-700 tabular-nums">
-                  Aktif: {copilotEval.totalActivePercent}% · Base:{" "}
+                <span className="font-mono font-medium tabular-nums">
+                  Aktif {copilotEval.totalActivePercent}% · Base{" "}
                   {copilotEval.estimatedBasePercent}%
                 </span>
               </div>
 
               {/* LIVE ALERTS & SYNERGIES */}
-              <div className="space-y-2 mb-3">
+              <div className="space-y-2.5 mb-5">
                 {copilotEval.alerts.map((al, i) => (
                   <div
                     key={i}
-                    className="p-3 rounded-xl border border-slate-200 bg-white text-xs"
+                    className={`p-3.5 rounded-[12px] border text-xs ${
+                      al.level === "critical"
+                        ? "bg-[#fef2f2] border-[#fca5a5]/70"
+                        : al.level === "warning"
+                        ? "bg-[#fef9e7] border-[#f5d078]/70"
+                        : "bg-[#f4fbf8] border-[#0B2B26]/10"
+                    }`}
                   >
                     <div
-                      className={`font-bold mb-0.5 ${
+                      className={`font-medium mb-1 ${
                         al.level === "critical"
-                          ? "text-rose-700"
+                          ? "text-[#b91c1c]"
                           : al.level === "warning"
-                            ? "text-amber-700"
-                            : "text-slate-900"
+                          ? "text-[#7A4F00]"
+                          : "text-[#0B2B26]"
                       }`}
                     >
-                      {al.title}
+                      {sanitizeEmDash(al.title)}
                     </div>
-                    <p className="text-slate-600 leading-relaxed">{al.detail}</p>
+                    <p className="text-[#2E524C] leading-relaxed">{sanitizeEmDash(al.detail, ", ")}</p>
                   </div>
                 ))}
 
                 {copilotEval.synergiesFound.map((syn, idx) => (
                   <div
                     key={idx}
-                    className="p-2.5 rounded-xl bg-emerald-50/70 border border-emerald-200/80 text-xs text-[#12382f] font-medium"
+                    className="px-3.5 py-2.5 rounded-[12px] bg-[#eaf9f0] border border-[#47C4A5]/40 text-xs text-[#146c43] font-medium flex items-start gap-2"
                   >
-                    ✓ {syn}
+                    <Check aria-hidden="true" className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                    <span>{sanitizeEmDash(syn, ", ")}</span>
                   </div>
                 ))}
               </div>
 
               {/* QUICK INTERACTIVE ACTIONS */}
-              <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-slate-100">
+              <div className="flex flex-wrap items-center gap-2.5 pt-4 border-t border-[#0B2B26]/10">
                 <button
                   type="button"
                   onClick={handleAutoCalibrateRecommended}
-                  className="px-3 py-1.5 rounded-xl text-xs font-bold bg-emerald-50 hover:bg-emerald-100 text-[#12382f] border border-emerald-200 transition cursor-pointer whitespace-nowrap"
+                  className="btn-glass-secondary min-h-[44px] px-4 py-2.5 text-xs cursor-pointer whitespace-nowrap inline-flex items-center justify-center"
                 >
-                  Isi Rekomendasi Terkalibrasi
+                  <span>Isi Rekomendasi Terkalibrasi</span>
                 </button>
                 <button
                   type="button"
                   onClick={() => router.push("/chat")}
-                  className="px-3 py-1.5 rounded-xl text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 transition flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+                  className="btn-glass-primary min-h-[44px] px-4 py-2.5 text-xs flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap"
                 >
-                  <MessageSquare className="w-3.5 h-3.5 text-[#0f766e]" />
+                  <MessageSquare aria-hidden="true" className="w-3.5 h-3.5 text-[#0E807E]" />
                   <span>Diskusi di AI Consultant</span>
                 </button>
               </div>
-            </div>
+            </section>
 
-            {/* Validated Product Specification Card */}
-            <div className="bg-white p-6 sm:p-7 rounded-[2rem] shadow-[0_20px_50px_-15px_rgba(16,68,56,0.15)] border border-emerald-900/10">
-              <div className="flex items-start justify-between gap-3 mb-4">
+            {/* VALIDATED PRODUCT SPECIFICATION CARD */}
+            <section className="bg-white p-6 sm:p-8 rounded-[16px] border border-[#0B2B26]/10">
+              <div className="flex items-start justify-between gap-3 pb-4 mb-4 border-b border-[#0B2B26]/10">
                 <div>
-                  <span className="text-[11px] font-mono uppercase tracking-wider text-[#0f766e] font-bold block">
-                    ACTIVE PRODUCT SYSTEM SPECIFICATION
+                  <span className="text-[11px] font-medium uppercase tracking-[0.14em] text-[#0E807E] block mb-1">
+                    Active Product System Specification
                   </span>
-                  <h2 className="text-xl font-extrabold text-slate-900 mt-0.5">
+                  <h2 className="text-lg sm:text-xl font-medium text-[#0B2B26] tracking-[-0.02em]">
                     {activeSpec.name}
                   </h2>
                 </div>
-                <FlaskConical className="w-6 h-6 text-[#0f766e] shrink-0" />
+                <FlaskConical aria-hidden="true" className="w-5 h-5 text-[#0E807E] shrink-0 mt-1 stroke-[1.75]" />
               </div>
 
-              <p className="text-xs text-slate-600 leading-relaxed mb-4">
-                {activeSpec.scientificBasis}
+              <p className="text-xs sm:text-[13px] text-[#2E524C] leading-relaxed mb-5">
+                {sanitizeEmDash(activeSpec.scientificBasis, ", ")}
               </p>
 
-              <div className="grid grid-cols-2 gap-3 mb-4">
-                <div className="bg-slate-50 p-3 rounded-xl border border-slate-200/70">
-                  <span className="text-[10px] font-mono uppercase text-slate-400 block">
+              <div className="grid grid-cols-2 gap-4 py-4 mb-5 border-y border-[#0B2B26]/10">
+                <div>
+                  <span className="text-[11px] font-medium uppercase tracking-[0.12em] text-[#2E524C] block mb-1.5">
                     Calibrated pH Window
                   </span>
-                  <span className="text-sm font-mono font-bold text-slate-900 tabular-nums">
-                    pH {activeSpec.targetPh} ({activeSpec.validPhRange})
+                  <span className="text-base font-mono font-medium text-[#0E807E] tabular-nums">
+                    pH {activeSpec.targetPh}
+                  </span>
+                  <span className="text-[11px] font-mono text-[#2E524C] block mt-0.5 tabular-nums">
+                    Range {activeSpec.validPhRange}
                   </span>
                 </div>
-                <div className="bg-slate-50 p-3 rounded-xl border border-slate-200/70">
-                  <span className="text-[10px] font-mono uppercase text-slate-400 block">
+                <div>
+                  <span className="text-[11px] font-medium uppercase tracking-[0.12em] text-[#2E524C] block mb-1.5">
                     Target Viscosity (cPs)
                   </span>
-                  <span className="text-xs font-mono font-bold text-slate-900 truncate block tabular-nums">
+                  <span className="text-xs sm:text-sm font-mono font-medium text-[#0B2B26] block tabular-nums">
                     {activeSpec.targetViscosity}
                   </span>
                 </div>
               </div>
 
-              <div className="bg-emerald-50/70 rounded-xl p-3.5 border border-emerald-200/70 mb-4">
-                <div className="flex items-center gap-1.5 text-xs font-bold text-[#12382f] mb-1">
-                  <Info className="w-3.5 h-3.5 text-[#0f766e]" />
+              <div className="mb-5">
+                <div className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-[0.12em] text-[#0E807E] mb-2">
+                  <Info aria-hidden="true" className="w-3.5 h-3.5 text-[#0E807E]" />
                   <span>Compounding &amp; Thermal Protocol</span>
                 </div>
-                <p className="text-xs text-slate-600 leading-relaxed">
-                  {activeSpec.processingNotes}
+                <p className="text-xs text-[#2E524C] leading-relaxed">
+                  {sanitizeEmDash(activeSpec.processingNotes, ", ")}
                 </p>
               </div>
 
-              <div className="text-[11px] text-slate-500 flex items-center justify-between pt-3 border-t border-slate-100">
-                <span className="truncate">{activeSpec.referenceSource}</span>
-                <ShieldCheck className="w-4 h-4 text-[#0f766e] shrink-0" />
+              <div className="text-[11px] text-[#2E524C] flex items-center justify-between gap-3 pt-4 border-t border-[#0B2B26]/10">
+                <span className="truncate">{sanitizeEmDash(activeSpec.referenceSource, ": ")}</span>
+                <ShieldCheck aria-hidden="true" className="w-4 h-4 text-[#0E807E] shrink-0" />
               </div>
-            </div>
+            </section>
 
-            {/* Live 3D Molecule Preview of Selected Active */}
-            <div className="bg-white p-6 rounded-[2rem] shadow-[0_20px_50px_-15px_rgba(16,68,56,0.15)] border border-emerald-900/10">
-              <div className="flex items-center justify-between gap-2 mb-3">
-                <div className="flex items-center gap-2">
-                  <Atom className="w-4 h-4 text-[#0f766e]" />
-                  <h3 className="text-sm font-extrabold text-slate-900">
-                    3D Molecular Conformer Preview: {previewIngredient3D}
-                  </h3>
+            {/* LIVE 3D MOLECULE PREVIEW OF SELECTED ACTIVE */}
+            <section className="bg-white p-6 rounded-[16px] border border-[#0B2B26]/10">
+              <div className="flex items-center justify-between gap-2 mb-4">
+                <div>
+                  <span className="text-[11px] font-medium uppercase tracking-[0.14em] text-[#0E807E] block mb-0.5">
+                    3D Molecular Conformer
+                  </span>
+                  <h2 className="text-base font-medium text-[#0B2B26] flex items-center gap-2">
+                    <Atom aria-hidden="true" className="w-4 h-4 text-[#0E807E]" />
+                    <span>{previewIngredient3D}</span>
+                  </h2>
                 </div>
               </div>
               <Molecule3DViewer
@@ -1224,10 +1470,49 @@ export default function FormulatePage() {
                 heightClass="h-[260px]"
                 compact
               />
-            </div>
-          </div>
+            </section>
+          </aside>
+        </div>
         </div>
       </main>
+
+      {/* Clean Editorial Footer (top-level landmark outside <main>, aligned with Landing Page) */}
+      <footer className="relative z-10 border-t border-[#0B2B26]/10 mt-14">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-8 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-[#2E524C]">
+          <nav
+            aria-label="Workspace Footer Navigation"
+            className="flex flex-wrap items-center justify-center sm:justify-start gap-x-6 gap-y-2"
+          >
+            <Link
+              href="/about"
+              className="text-xs uppercase tracking-[0.08em] font-medium text-[#2E524C] hover:text-[#0B2B26] min-h-[44px] inline-flex items-center transition-colors rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0E807E] focus-visible:ring-offset-2"
+            >
+              ABOUT US
+            </Link>
+            <Link
+              href="/careers"
+              className="text-xs uppercase tracking-[0.08em] font-medium text-[#2E524C] hover:text-[#0B2B26] min-h-[44px] inline-flex items-center transition-colors rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0E807E] focus-visible:ring-offset-2"
+            >
+              CAREERS
+            </Link>
+            <Link
+              href="/trust"
+              className="text-xs uppercase tracking-[0.08em] font-medium text-[#2E524C] hover:text-[#0B2B26] min-h-[44px] inline-flex items-center transition-colors rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0E807E] focus-visible:ring-offset-2"
+            >
+              TRUST
+            </Link>
+            <Link
+              href="/faq"
+              className="text-xs uppercase tracking-[0.08em] font-medium text-[#2E524C] hover:text-[#0B2B26] min-h-[44px] inline-flex items-center transition-colors rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0E807E] focus-visible:ring-offset-2"
+            >
+              FAQ
+            </Link>
+          </nav>
+          <p className="text-[#2E524C] font-normal">
+            &copy; 2026 formylab.ai · Cosmetic R&amp;D Formulation Workspace
+          </p>
+        </div>
+      </footer>
     </div>
   );
 }

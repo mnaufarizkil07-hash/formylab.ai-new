@@ -2,13 +2,21 @@
 
 import { useState, useRef, useEffect } from "react";
 import { usePathname, useRouter } from "next/navigation";
-import ChatComposerBar from "./ChatComposerBar";
+import {
+  Menu,
+  ArrowUpRight,
+  X,
+  Plus,
+  Trash2,
+  MessageSquare,
+} from "lucide-react";
+import ChatComposerBar, {
+  MultimodalSendOptions,
+} from "./ChatComposerBar";
 import FormattedChatText from "./FormattedChatText";
 import {
   AiModelId,
-  GeminiLogo,
   ModelIcon,
-  OpenAILogo,
   getModelOption,
 } from "./AiModelLogos";
 import {
@@ -26,7 +34,7 @@ export default function FloatingChatWidget() {
   const pathname = usePathname();
   const router = useRouter();
 
-  // Do not render floating widget on the login page (/) or inside the dedicated /chat page
+  // Do not render floating widget on the landing/login page (/) or inside the dedicated /chat page
   const isHiddenRoute = pathname === "/" || pathname === "/chat";
 
   const [isOpen, setIsOpen] = useState(false);
@@ -68,9 +76,26 @@ export default function FloatingChatWidget() {
 
   useEffect(() => {
     if (isOpen) {
-      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+      const shouldReduceMotion =
+        typeof window !== "undefined" &&
+        window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      messagesEndRef.current?.scrollIntoView({
+        behavior: shouldReduceMotion ? "auto" : "smooth",
+      });
     }
   }, [isOpen, activeSession?.messages, isLoading]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setIsOpen(false);
+        setShowSessionDrawer(false);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [isOpen]);
 
   const handleSelectModel = (model: AiModelId) => {
     setSelectedModel(model);
@@ -121,17 +146,35 @@ export default function FloatingChatWidget() {
 
   const handleSendMessage = async (
     text: string,
-    attachments: ChatAttachment[] = []
+    attachments: ChatAttachment[] = [],
+    options?: MultimodalSendOptions
   ) => {
-    if ((!text && attachments.length === 0) || isLoading || !activeSession)
+    const hasAudioPayload = Boolean(options?.audio?.base64);
+    const hasImagePayload = Boolean(options?.image?.base64);
+    if (
+      (!text &&
+        attachments.length === 0 &&
+        !hasAudioPayload &&
+        !hasImagePayload) ||
+      isLoading ||
+      !activeSession
+    )
       return;
+
+    const isVoiceNote =
+      options?.interactionMode === "voice_note" ||
+      attachments.some((a) => a.isVoiceNote);
+    const isVision =
+      options?.interactionMode === "vision" ||
+      hasImagePayload ||
+      attachments.some((a) => a.mimeType.startsWith("image/"));
 
     setErrorMessage("");
     const userMsgId = generateUniqueId("float-u");
 
     const displayText =
       text ||
-      (attachments.some((a) => a.isVoiceNote)
+      (isVoiceNote
         ? "🎤 Mengirim Voice Note (VN)"
         : `📎 Mengirim ${attachments.length} file`);
 
@@ -148,7 +191,7 @@ export default function FloatingChatWidget() {
     const newTitle = isFirstUserMessage
       ? generateSessionTitle(
           text || attachments[0]?.textPreview || "",
-          attachments.some((a) => a.isVoiceNote),
+          isVoiceNote,
           attachments.length > 0
         )
       : activeSession.title;
@@ -185,19 +228,73 @@ export default function FloatingChatWidget() {
         attachments: m.attachments,
       }));
 
+      const requestPayload: Record<string, unknown> = {
+        messages: payloadMessages,
+        history: geminiHistory,
+        model: selectedModel,
+      };
+
+      if (options?.interactionMode && options.interactionMode !== "chat") {
+        requestPayload.interactionMode = options.interactionMode;
+      }
+      if (options?.audio?.base64) {
+        requestPayload.audio = options.audio;
+      }
+      if (options?.image?.base64) {
+        requestPayload.image = options.image;
+      }
+
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          messages: payloadMessages,
-          history: geminiHistory,
-          model: selectedModel,
-        }),
+        body: JSON.stringify(requestPayload),
       });
 
       const data = await res.json();
 
       if (data.success && data.reply) {
+        const extractedTranscript =
+          typeof data.transcript === "string" ? data.transcript.trim() : "";
+
+        const messagesWithMemory = updatedMessages.map((m) => {
+          if (m.id !== userMsgId) return m;
+          if (isVoiceNote && extractedTranscript) {
+            const updatedContent = text
+              ? `[Voice Note]: ${extractedTranscript}\n\n${text}`
+              : `[Voice Note]: ${extractedTranscript}`;
+            const updatedAtts = m.attachments?.map((att) =>
+              att.isVoiceNote
+                ? { ...att, textPreview: extractedTranscript }
+                : att
+            );
+            return {
+              ...m,
+              content: updatedContent,
+              attachments: updatedAtts,
+            };
+          }
+          if (isVision && m.attachments?.length) {
+            const imgName =
+              options?.image?.name || m.attachments[0]?.name || "Foto Lampiran";
+            const visionSummarySnippet = data.reply
+              .replace(/\s+/g, " ")
+              .slice(0, 260);
+            const updatedAtts = m.attachments.map((att) =>
+              att.mimeType.startsWith("image/")
+                ? {
+                    ...att,
+                    textPreview: `${att.textPreview ? att.textPreview + "\n" : ""}[Konteks Analisis Visual ${imgName}: ${visionSummarySnippet}]`,
+                  }
+                : att
+            );
+            return {
+              ...m,
+              attachments: updatedAtts,
+            };
+          }
+          return m;
+        });
+
         const botMsgId = generateUniqueId("float-b");
         const botMsg: ChatMessage = {
           id: botMsgId,
@@ -207,7 +304,7 @@ export default function FloatingChatWidget() {
           timestamp: "Baru saja",
         };
 
-        const finalMessages = [...updatedMessages, botMsg];
+        const finalMessages = [...messagesWithMemory, botMsg];
         const finalSessions = updatedSessions.map((s) =>
           s.id === activeSession.id ? { ...s, messages: finalMessages } : s
         );
@@ -230,33 +327,42 @@ export default function FloatingChatWidget() {
   const activeModelOpt = getModelOption(selectedModel);
 
   return (
-    <div className="fixed bottom-14 left-6 z-50 flex flex-col items-start select-none font-sans">
-      {/* POPUP CHAT WINDOW */}
+    <div className="fixed bottom-4 right-4 sm:bottom-6 sm:right-6 z-50 flex flex-col items-end select-none font-matter">
+      {/* POPUP CHAT WINDOW: Optical Glass Shell + Crisp White Message Reading Area */}
       {isOpen && (
-        <div className="w-[370px] sm:w-[440px] h-[590px] mb-3 bg-white/95 backdrop-blur-xl rounded-3xl shadow-[0_16px_50px_rgba(35,78,66,0.28)] border border-green-200/90 flex flex-col overflow-hidden animate-in fade-in slide-in-from-bottom-6 duration-200">
-          {/* HEADER POPUP */}
-          <div className="bg-[#234e42] text-white p-3.5 flex items-center justify-between border-b border-green-800">
-            <div className="flex items-center gap-2">
+        <div
+          id="ai-chemist-dialog"
+          role="dialog"
+          aria-label="AI Chemist Assistant"
+          className="w-[calc(100vw-2rem)] sm:w-[370px] max-w-[370px] h-[min(590px,calc(100dvh-6.5rem))] mb-3 card-glass-optical card-glass-static flex flex-col overflow-hidden"
+        >
+          {/* HEADER POPUP (no nested backdrop-blur inside .card-glass-optical) */}
+          <div className="bg-white/92 text-[#0B2B26] px-3 py-2.5 flex items-center justify-between gap-2 border-b border-[#0B2B26]/10">
+            <div className="flex items-center gap-2 min-w-0">
               <button
                 type="button"
                 onClick={() => setShowSessionDrawer(!showSessionDrawer)}
-                className="p-1.5 hover:bg-white/10 rounded-lg text-xs font-bold transition flex items-center gap-1.5 cursor-pointer"
+                aria-expanded={showSessionDrawer}
+                aria-controls="ai-chemist-session-drawer"
+                className="btn-glass-compact px-3 min-h-[44px] min-w-[44px] text-xs flex items-center gap-1.5 cursor-pointer"
                 title="Daftar Riwayat Chat"
               >
-                <span>☰</span>
-                <span className="max-w-[160px] truncate text-xs font-semibold">
-                  {activeSession?.title || "AI Chat"}
+                <Menu aria-hidden="true" className="w-3.5 h-3.5 text-[#2E524C] shrink-0" />
+                <span className="max-w-[125px] truncate text-xs font-medium text-[#0B2B26]">
+                  {activeSession?.title || "AI Chemist"}
                 </span>
               </button>
             </div>
 
-            <div className="flex items-center gap-2">
-              <span className="inline-flex items-center gap-1.5 bg-white/15 px-2.5 py-1 rounded-full text-[11px] font-bold">
-                <ModelIcon
-                  modelId={activeModelOpt.id}
-                  className="w-3.5 h-3.5"
-                  idSuffix="float-head"
-                />
+            <div className="flex items-center gap-1.5 shrink-0">
+              <span className="inline-flex items-center gap-1.5 text-[#2E524C] px-1.5 py-1 text-[11px] font-medium">
+                <span aria-hidden="true" className="inline-flex">
+                  <ModelIcon
+                    modelId={activeModelOpt.id}
+                    className="w-3.5 h-3.5"
+                    idSuffix="float-head"
+                  />
+                </span>
                 <span>{activeModelOpt.shortName}</span>
               </span>
 
@@ -266,70 +372,87 @@ export default function FloatingChatWidget() {
                   setIsOpen(false);
                   router.push("/chat");
                 }}
-                className="text-white/80 hover:text-white p-1 hover:bg-white/10 rounded-lg text-xs cursor-pointer"
+                className="btn-glass-compact min-h-[44px] min-w-[44px] inline-flex items-center justify-center cursor-pointer"
                 title="Buka Halaman Penuh"
+                aria-label="Buka Halaman Penuh"
               >
-                ↗
+                <ArrowUpRight aria-hidden="true" className="w-4 h-4 text-[#0B2B26]" />
               </button>
               <button
                 type="button"
-                onClick={() => setIsOpen(false)}
-                className="text-white/80 hover:text-white p-1 hover:bg-white/10 rounded-lg text-sm cursor-pointer"
+                onClick={() => {
+                  setIsOpen(false);
+                  setShowSessionDrawer(false);
+                }}
+                className="btn-glass-compact min-h-[44px] min-w-[44px] inline-flex items-center justify-center cursor-pointer"
+                title="Tutup"
+                aria-label="Tutup AI Chemist"
               >
-                ✕
+                <X aria-hidden="true" className="w-4 h-4 text-[#0B2B26]" />
               </button>
             </div>
           </div>
 
-          {/* DRAWER RIWAYAT SESI CHAT */}
+          {/* DRAWER RIWAYAT SESI CHAT (clean solid tint, no nested backdrop-blur) */}
           {showSessionDrawer && (
-            <div className="bg-slate-50 border-b border-gray-200 p-3 max-h-[180px] overflow-y-auto">
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-[11px] font-bold text-gray-500 uppercase tracking-wider">
+            <div
+              id="ai-chemist-session-drawer"
+              className="bg-[#f8fdfb] border-b border-[#0B2B26]/10 p-3 max-h-[210px] overflow-y-auto"
+            >
+              <div className="flex items-center justify-between gap-2 mb-2.5">
+                <span className="eyebrow-label text-[10px] text-[#2E524C]">
                   Riwayat Chat ({sessions.length})
                 </span>
                 <button
                   type="button"
                   onClick={handleNewSession}
-                  className="text-xs bg-green-100 hover:bg-green-200 text-[#234e42] px-2.5 py-1 rounded-lg font-bold flex items-center gap-1 cursor-pointer"
+                  className="btn-glass-primary inline-flex items-center justify-center gap-1.5 px-3.5 min-h-[44px] text-[11px] cursor-pointer"
                 >
-                  <span>+</span>
+                  <Plus aria-hidden="true" className="w-3.5 h-3.5 text-[#0B2B26]" />
                   <span>Chat Baru</span>
                 </button>
               </div>
 
-              <div className="space-y-1">
+              <div className="space-y-1.5">
                 {sessions.map((sess) => {
                   const sOpt = getModelOption(sess.model);
+                  const isCurrent = sess.id === activeSessionId;
                   return (
                     <div
                       key={sess.id}
-                      onClick={() => handleSelectSession(sess.id)}
-                      className={`flex items-center justify-between p-2 rounded-xl text-xs cursor-pointer transition ${
-                        sess.id === activeSessionId
-                          ? "bg-[#234e42] text-white font-bold"
-                          : "hover:bg-white text-gray-700 font-medium"
+                      className={`flex items-center gap-1.5 rounded-[12px] p-1 transition-colors ${
+                        isCurrent
+                          ? "bg-white border border-[#47C4A5]/60"
+                          : "border border-transparent hover:bg-white/80"
                       }`}
                     >
-                      <div className="flex items-center gap-1.5 truncate flex-1 pr-2">
-                        <ModelIcon
-                          modelId={sOpt.id}
-                          className="w-3.5 h-3.5 shrink-0"
-                          idSuffix={`drawer-${sess.id}`}
-                        />
+                      <button
+                        type="button"
+                        onClick={() => handleSelectSession(sess.id)}
+                        aria-current={isCurrent ? "true" : undefined}
+                        className={`flex-1 min-w-0 min-h-[44px] px-2.5 py-2 rounded-[10px] flex items-center gap-2 text-left text-xs cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0E807E] focus-visible:ring-offset-1 ${
+                          isCurrent
+                            ? "text-[#0B2B26] font-medium"
+                            : "text-[#2E524C] hover:text-[#0B2B26] font-normal"
+                        }`}
+                      >
+                        <span aria-hidden="true" className="inline-flex shrink-0">
+                          <ModelIcon
+                            modelId={sOpt.id}
+                            className="w-3.5 h-3.5 text-[#0E807E]"
+                            idSuffix={`drawer-${sess.id}`}
+                          />
+                        </span>
                         <span className="truncate">{sess.title}</span>
-                      </div>
+                      </button>
                       <button
                         type="button"
                         onClick={(e) => handleDeleteSession(e, sess.id)}
-                        className={`text-[11px] p-1 rounded-md opacity-60 hover:opacity-100 ${
-                          sess.id === activeSessionId
-                            ? "hover:bg-white/20"
-                            : "hover:bg-red-50 text-red-600"
-                        }`}
+                        className="btn-glass-danger min-h-[44px] min-w-[44px] inline-flex items-center justify-center shrink-0 cursor-pointer"
                         title="Hapus riwayat"
+                        aria-label={`Hapus riwayat ${sess.title}`}
                       >
-                        🗑
+                        <Trash2 aria-hidden="true" className="w-3.5 h-3.5" />
                       </button>
                     </div>
                   );
@@ -338,8 +461,8 @@ export default function FloatingChatWidget() {
             </div>
           )}
 
-          {/* LIST CHAT MESSAGES */}
-          <div className="flex-1 p-3 overflow-y-auto space-y-3 text-xs bg-slate-50/50">
+          {/* LIST CHAT MESSAGES: Crisp White Reading Area */}
+          <div className="flex-1 p-3 overflow-y-auto space-y-3 text-xs bg-white">
             {activeSession?.messages.map((m) => {
               const isUser = m.role === "user";
               const mOpt = getModelOption(m.modelBadge || selectedModel);
@@ -350,19 +473,21 @@ export default function FloatingChatWidget() {
                   className={`flex ${isUser ? "justify-end" : "justify-start"}`}
                 >
                   <div
-                    className={`max-w-[88%] p-3.5 rounded-2xl shadow-2xs leading-relaxed ${
+                    className={`max-w-[88%] p-3.5 rounded-[16px] leading-relaxed ${
                       isUser
-                        ? "bg-[#234e42] text-white rounded-tr-xs"
-                        : "bg-white text-gray-800 border border-gray-100 rounded-tl-xs"
+                        ? "bg-[#0B2B26] text-white"
+                        : "bg-[#f8fdfb] text-[#0B2B26] border border-[#0B2B26]/10"
                     }`}
                   >
                     {!isUser && (
-                      <div className="flex items-center gap-1.5 mb-1.5 text-[10px] font-bold text-gray-500">
-                        <ModelIcon
-                          modelId={mOpt.id}
-                          className="w-3.5 h-3.5"
-                          idSuffix={`wmsg-${m.id}`}
-                        />
+                      <div className="flex items-center gap-1.5 mb-1.5 text-[10px] font-medium uppercase tracking-[0.08em] text-[#2E524C]">
+                        <span aria-hidden="true" className="inline-flex">
+                          <ModelIcon
+                            modelId={mOpt.id}
+                            className="w-3.5 h-3.5"
+                            idSuffix={`wmsg-${m.id}`}
+                          />
+                        </span>
                         <span>{mOpt.name}</span>
                       </div>
                     )}
@@ -373,15 +498,15 @@ export default function FloatingChatWidget() {
                         {m.attachments.map((att) => (
                           <div
                             key={att.id}
-                            className={`rounded-xl p-2 border ${
+                            className={`rounded-[12px] p-2 border ${
                               isUser
                                 ? "bg-white/10 border-white/15 text-white"
-                                : "bg-gray-50 border-gray-200 text-gray-800"
+                                : "bg-white border-[#0B2B26]/10 text-[#0B2B26]"
                             }`}
                           >
                             {att.isVoiceNote ? (
                               <div className="flex flex-col gap-1">
-                                <span className="font-bold text-[11px]">
+                                <span className="font-medium text-[11px]">
                                   🎤 {att.name}
                                 </span>
                                 {att.dataUrl && (
@@ -393,7 +518,7 @@ export default function FloatingChatWidget() {
                                 )}
                               </div>
                             ) : (
-                              <div className="font-semibold text-[11px] truncate">
+                              <div className="font-medium text-[11px] truncate">
                                 📎 {att.name} ({att.sizeLabel})
                               </div>
                             )}
@@ -403,7 +528,10 @@ export default function FloatingChatWidget() {
                     )}
 
                     <div className="text-xs">
-                      <FormattedChatText content={m.content} />
+                      <FormattedChatText
+                        content={m.content}
+                        tone={isUser ? "on-dark" : "light"}
+                      />
                     </div>
                   </div>
                 </div>
@@ -411,14 +539,17 @@ export default function FloatingChatWidget() {
             })}
 
             {isLoading && (
-              <div className="flex items-center gap-2 text-xs text-gray-500 font-medium p-2">
-                <div className="animate-spin w-3 h-3 border-2 border-green-700 border-t-transparent rounded-full"></div>
+              <div className="flex items-center gap-2 text-xs text-[#2E524C] font-medium p-2">
+                <div
+                  aria-hidden="true"
+                  className="animate-spin w-3.5 h-3.5 border-2 border-[#3FC6C5] border-t-transparent rounded-full"
+                />
                 <span>{activeModelOpt.name} sedang memproses...</span>
               </div>
             )}
 
             {errorMessage && (
-              <div className="p-2.5 rounded-xl bg-red-50 text-red-600 text-xs font-medium">
+              <div className="p-2.5 rounded-[12px] bg-[#fef2f2] border border-[#b91c1c]/20 text-[#b91c1c] text-xs font-medium">
                 ⚠️ {errorMessage}
               </div>
             )}
@@ -426,8 +557,8 @@ export default function FloatingChatWidget() {
             <div ref={messagesEndRef} />
           </div>
 
-          {/* DARK COMPOSER BAR IN FLOATING WIDGET */}
-          <div className="p-2.5 bg-white border-t border-gray-100">
+          {/* COMPOSER BAR IN FLOATING WIDGET (clean semi-solid surface, no nested backdrop-blur) */}
+          <div className="p-2.5 bg-white/95 border-t border-[#0B2B26]/10">
             <ChatComposerBar
               selectedModel={selectedModel}
               onSelectModel={handleSelectModel}
@@ -439,24 +570,26 @@ export default function FloatingChatWidget() {
         </div>
       )}
 
-      {/* FLOATING TRIGGER BUTTON (POJOK KIRI BAWAH DENGAN LOGO GEMINI & GPT ASLI) */}
+      {/* OPTICAL GLASS FLOATING TRIGGER PILL */}
       <button
         type="button"
         onClick={handleToggleWidget}
-        className="group flex items-center gap-2.5 bg-[#1e1f22] hover:bg-[#2b2d31] text-white px-4 py-3 rounded-full shadow-[0_8px_24px_rgba(0,0,0,0.35)] transition-all transform hover:scale-105 cursor-pointer border border-white/20"
-        title="Buka AI Chemist Chatbot (Gemini & GPT-6 Luna)"
+        aria-expanded={isOpen}
+        aria-controls="ai-chemist-dialog"
+        aria-label={isOpen ? "Tutup AI Chemist" : "Buka AI Chemist"}
+        className="btn-glass-compact group inline-flex items-center justify-center gap-2.5 px-4 min-h-[44px] min-w-[44px] cursor-pointer"
+        title="Buka AI Chemist"
       >
-        <div className="flex items-center -space-x-1">
-          <span className="w-6 h-6 rounded-full bg-[#121316] border border-white/15 flex items-center justify-center">
-            <GeminiLogo className="w-3.5 h-3.5" idSuffix="fab-gemini" />
-          </span>
-          <span className="w-6 h-6 rounded-full bg-[#121316] border border-white/15 flex items-center justify-center text-white">
-            <OpenAILogo className="w-3.5 h-3.5" />
-          </span>
-        </div>
-        <span className="font-bold text-xs">AI Chat</span>
-        <span className="bg-emerald-500/20 text-emerald-300 border border-emerald-400/30 text-[10px] font-extrabold px-2 py-0.5 rounded-full">
-          GPT-6 Luna
+        <span
+          aria-hidden="true"
+          className="w-2 h-2 rounded-full bg-[#47C4A5]"
+        />
+        <MessageSquare
+          aria-hidden="true"
+          className="w-4 h-4 text-[#0E807E]"
+        />
+        <span className="font-medium text-xs text-[#0B2B26] tracking-[0.02em]">
+          AI Chemist
         </span>
       </button>
     </div>

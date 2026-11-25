@@ -13,8 +13,82 @@ export const DEFAULT_ACCOUNTS: UserAccount[] = [
   { email: "jauja@gmail.com", password: "12345", name: "Jauja" },
 ];
 
+export const DEMO_ACCOUNT_EMAIL = "rnd.chemist@formylab.ai";
+
 export const ACCOUNTS_STORAGE_KEY = "formylabAccounts";
 export const ACTIVE_USER_STORAGE_KEY = "formylabUser";
+export const AUTH_CHANGE_EVENT = "formylab-auth-change";
+
+const FORBIDDEN_SCOPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+export function normalizeUserScopeId(emailOrId?: string | null): string | null {
+  if (typeof emailOrId !== "string") return null;
+  const cleaned = emailOrId.trim().toLowerCase();
+  if (!cleaned || cleaned.length > 160) return null;
+  if (FORBIDDEN_SCOPE_KEYS.has(cleaned)) return null;
+  // Restrict to safe identifier/email characters (blocks path traversal & control chars)
+  if (!/^[a-z0-9._@+-]+$/.test(cleaned)) return null;
+  return cleaned;
+}
+
+export function isDemoAccountEmail(email?: string | null): boolean {
+  const normalized = normalizeUserScopeId(email);
+  return normalized === DEMO_ACCOUNT_EMAIL;
+}
+
+export function getActiveUserAccount(): UserAccount | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(ACTIVE_USER_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<UserAccount> | null;
+    if (!parsed || typeof parsed.email !== "string") return null;
+    const normalizedEmail = normalizeUserScopeId(parsed.email);
+    if (!normalizedEmail) return null;
+    return {
+      email: normalizedEmail,
+      password: typeof parsed.password === "string" ? parsed.password : "",
+      name:
+        typeof parsed.name === "string" && parsed.name.trim()
+          ? parsed.name.trim()
+          : formatNameFromEmail(normalizedEmail),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function setActiveUserSession(user: UserAccount): void {
+  if (typeof window === "undefined") return;
+  try {
+    const normalizedEmail = normalizeUserScopeId(user.email) || user.email.trim().toLowerCase();
+    const safeUser: UserAccount = {
+      email: normalizedEmail,
+      password: user.password,
+      name: user.name?.trim() || formatNameFromEmail(normalizedEmail),
+    };
+    window.localStorage.setItem(ACTIVE_USER_STORAGE_KEY, JSON.stringify(safeUser));
+    // Clear legacy global keys & transient studio drafts so previous account state never leaks
+    window.localStorage.removeItem("formylab_saved_formulations_v1");
+    window.localStorage.removeItem("currentFormulation");
+    window.localStorage.removeItem("aiGeneratedCandidates");
+    window.dispatchEvent(new Event(AUTH_CHANGE_EVENT));
+  } catch {
+    // Ignore storage write errors
+  }
+}
+
+export function clearActiveUserSession(): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.removeItem(ACTIVE_USER_STORAGE_KEY);
+    window.localStorage.removeItem("currentFormulation");
+    window.localStorage.removeItem("aiGeneratedCandidates");
+    window.dispatchEvent(new Event(AUTH_CHANGE_EVENT));
+  } catch {
+    // Ignore storage write errors
+  }
+}
 
 export function formatNameFromEmail(email: string): string {
   const rawName = email.trim().split("@")[0] || "User";

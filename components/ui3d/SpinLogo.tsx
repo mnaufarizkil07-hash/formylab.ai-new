@@ -58,9 +58,9 @@ export default function SpinLogo({ size = "lg", className = "" }: SpinLogoProps)
           }`}
         />
         <span
-          className={`font-extrabold text-[var(--color-navy)] tracking-tighter ${textSize}`}
+          className={`font-medium text-[var(--color-platinum)] tracking-tighter ${textSize}`}
         >
-          formylab<span className="text-[var(--color-menthe)]">.ai</span>
+          formylab<span className="text-[var(--color-aurora-cyan)]">.ai</span>
         </span>
       </div>
     </div>

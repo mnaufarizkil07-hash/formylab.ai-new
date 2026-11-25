@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import {
   PanelLeftClose,
@@ -13,16 +13,49 @@ import {
   Table2,
   ShieldCheck,
   Globe,
-  Sparkles,
+  Loader2,
   Trash2,
   Pencil,
   Check,
+  Cloud,
+  ExternalLink,
 } from "lucide-react";
-import Logo from "../../components/Logo";
-import ChatComposerBar from "../../components/ChatComposerBar";
+import BrandLogo from "../../components/BrandLogo";
+import ChatComposerBar, {
+  MultimodalSendOptions,
+} from "../../components/ChatComposerBar";
+import ChatNoteCard from "../../components/ChatNoteCard";
+import GoogleDocCard from "../../components/GoogleDocCard";
+import {
+  ChatNoteArtifact,
+  GoogleDocArtifact,
+  WebSourceCitation,
+  encodeChatNoteMessage,
+  encodeGoogleDocMessage,
+  formatGoogleDocForHistoryContext,
+  formatNoteForHistoryContext,
+  mergeUniqueWebSources,
+  normalizeChatNoteArtifact,
+  normalizeGoogleDocArtifact,
+  normalizeWebSourceCitation,
+  parseChatNoteMessage,
+  parseGoogleDocMessage,
+} from "../../components/chatNoteUtils";
+import {
+  connectGoogleDrive,
+  disconnectGoogleDrive,
+  isGoogleDriveConnected,
+  isGoogleDriveOAuthConfigured,
+  subscribeGoogleDriveAuth,
+} from "../../lib/googleDocsClient";
 import FormattedChatText from "../../components/FormattedChatText";
-import { useInteractiveVoice } from "../../components/InteractiveVoiceController";
-import LiveVoiceCallModal from "../../components/LiveVoiceCallModal";
+import {
+  useInteractiveVoice,
+  VoiceCallReplyAudio,
+} from "../../components/InteractiveVoiceController";
+import LiveVoiceCallModal, {
+  VoiceCallTurnResult,
+} from "../../components/LiveVoiceCallModal";
 import InteractiveMessageActions from "../../components/InteractiveMessageActions";
 import {
   AiModelId,
@@ -54,7 +87,7 @@ export default function ChatPage() {
   );
   const [selectedModel, setSelectedModel] = useState<AiModelId>("auto");
 
-  // Sidebar & Search Bar visibility states (collapsible like ChatGPT)
+  // Sidebar & Search Bar visibility states
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -64,14 +97,37 @@ export default function ChatPage() {
   const [greetingIndex, setGreetingIndex] = useState(0);
 
   const [isLoading, setIsLoading] = useState(false);
+  const [loadingMode, setLoadingMode] = useState<
+    "chat" | "voice_note" | "voice_call" | "vision"
+  >("chat");
+  const [messagePillarsMap, setMessagePillarsMap] = useState<
+    Record<string, string[]>
+  >({});
+  const [messageSourcesMap, setMessageSourcesMap] = useState<
+    Record<string, WebSourceCitation[]>
+  >({});
   const [errorMessage, setErrorMessage] = useState("");
 
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
   const [editingTitle, setEditingTitle] = useState("");
   const [isVoiceCallOpen, setIsVoiceCallOpen] = useState(false);
+  const [isVoiceMicMuted, setIsVoiceMicMuted] = useState(false);
+  const [isDriveConnected, setIsDriveConnected] = useState(false);
+  const [isDriveConfigured, setIsDriveConfigured] = useState(false);
+  const [isConnectingDrive, setIsConnectingDrive] = useState(false);
 
   const messagesContainerRef = useRef<HTMLDivElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const activeSessionIdRef = useRef<string>(activeSessionId);
+  const selectedModelRef = useRef<AiModelId>(selectedModel);
+
+  useEffect(() => {
+    activeSessionIdRef.current = activeSessionId;
+  }, [activeSessionId]);
+
+  useEffect(() => {
+    selectedModelRef.current = selectedModel;
+  }, [selectedModel]);
 
   const scrollToBottom = () => {
     if (messagesContainerRef.current) {
@@ -80,7 +136,6 @@ export default function ChatPage() {
     }
   };
 
-  // Load stored sessions and logged-in user profile
   useEffect(() => {
     queueMicrotask(() => {
       try {
@@ -109,10 +164,46 @@ export default function ChatPage() {
         setSessions([def]);
         setActiveSessionId(def.id);
       }
+
+      setIsDriveConfigured(isGoogleDriveOAuthConfigured());
+      setIsDriveConnected(isGoogleDriveConnected());
+
+      try {
+        const rawSources = localStorage.getItem("formylab_msg_sources_v1");
+        if (rawSources) {
+          const parsed = JSON.parse(rawSources) as Record<string, unknown>;
+          if (parsed && typeof parsed === "object") {
+            const restored: Record<string, WebSourceCitation[]> = {};
+            for (const [msgKey, val] of Object.entries(parsed)) {
+              if (Array.isArray(val)) {
+                const cleanList = val
+                  .map((item) => normalizeWebSourceCitation(item))
+                  .filter((item): item is WebSourceCitation => item !== null);
+                if (cleanList.length > 0) {
+                  restored[msgKey] = cleanList;
+                }
+              }
+            }
+            if (Object.keys(restored).length > 0) {
+              setMessageSourcesMap(restored);
+            }
+          }
+        }
+      } catch {
+        // Ignore malformed source cache
+      }
     });
+
+    const unsubscribeDrive = subscribeGoogleDriveAuth((snapshot) => {
+      setIsDriveConfigured(snapshot.isConfigured);
+      setIsDriveConnected(snapshot.isConnected);
+    });
+
+    return () => {
+      unsubscribeDrive();
+    };
   }, []);
 
-  // Rotate welcome greeting phrases smoothly
   const dynamicGreetings = [
     `Halo, ${userName}! Mulai dari mana kita hari ini?`,
     `Ada apa hari ini, ${userName}?`,
@@ -133,7 +224,13 @@ export default function ChatPage() {
 
   const userMessagesCount =
     activeSession?.messages.filter((m) => m.role === "user").length || 0;
-  const isNewEmptyChat = userMessagesCount === 0 && !isLoading;
+  const nonWelcomeCount =
+    activeSession?.messages.filter((m) => m.id !== "msg-welcome").length || 0;
+  const isNewEmptyChat =
+    userMessagesCount === 0 &&
+    nonWelcomeCount === 0 &&
+    !isLoading &&
+    !isVoiceCallOpen;
 
   useEffect(() => {
     if (!messagesContainerRef.current) return;
@@ -142,7 +239,7 @@ export default function ChatPage() {
     } else {
       scrollToBottom();
     }
-  }, [activeSession?.messages, isLoading, isNewEmptyChat]);
+  }, [activeSession?.messages, isLoading, isNewEmptyChat, isVoiceCallOpen]);
 
   const handleToggleSearch = () => {
     setIsSearchOpen((prev) => {
@@ -222,25 +319,58 @@ export default function ChatPage() {
     setEditingSessionId(null);
   };
 
-  const handleSendMessage = async (
+  const executeChatTurn = async (
     text: string,
     attachments: ChatAttachment[] = [],
-    voiceCallMode = false
-  ): Promise<string | null> => {
-    if ((!text && attachments.length === 0) || isLoading || !activeSession)
-      return null;
+    options?: MultimodalSendOptions & { voiceCallMode?: boolean }
+  ): Promise<VoiceCallTurnResult> => {
+    const hasAudioPayload = Boolean(options?.audio?.base64);
+    const hasImagePayload = Boolean(options?.image?.base64);
+    if (
+      !text &&
+      attachments.length === 0 &&
+      !hasAudioPayload &&
+      !hasImagePayload
+    ) {
+      return { reply: null };
+    }
+    if (isLoading || !activeSession) {
+      return { reply: null };
+    }
+
+    const isVoiceCall =
+      options?.interactionMode === "voice_call" ||
+      options?.voiceCallMode === true;
+    const isVoiceNote =
+      options?.interactionMode === "voice_note" ||
+      attachments.some((a) => a.isVoiceNote);
+    const isVision =
+      options?.interactionMode === "vision" ||
+      hasImagePayload ||
+      attachments.some((a) => a.mimeType.startsWith("image/"));
+
+    const effectiveMode: "chat" | "voice_note" | "voice_call" | "vision" =
+      isVoiceCall
+        ? "voice_call"
+        : isVoiceNote
+          ? "voice_note"
+          : isVision
+            ? "vision"
+            : "chat";
 
     setErrorMessage("");
-    if (!voiceCallMode) {
+    if (!isVoiceCall) {
       voice.stopSpeech();
     }
     const userMsgId = generateUniqueId("user");
 
     const displayText =
       text ||
-      (attachments.some((a) => a.isVoiceNote)
+      (isVoiceNote
         ? "🎤 Mengirim Voice Note (VN)"
-        : `📎 Mengirim ${attachments.length} file`);
+        : isVoiceCall && hasAudioPayload
+          ? "🎤 (Ucapan Suara Telepon AI)"
+          : `📎 Mengirim ${attachments.length} file`);
 
     const userMsg: ChatMessage = {
       id: userMsgId,
@@ -255,7 +385,7 @@ export default function ChatPage() {
     const newTitle = isFirstUserMessage
       ? generateSessionTitle(
           text || attachments[0]?.textPreview || "",
-          attachments.some((a) => a.isVoiceNote),
+          isVoiceNote || isVoiceCall,
           attachments.length > 0
         )
       : activeSession.title;
@@ -275,16 +405,30 @@ export default function ChatPage() {
 
     setSessions(updatedSessions);
     saveStoredSessions(updatedSessions);
+    setLoadingMode(effectiveMode);
     setIsLoading(true);
 
     try {
       const payloadMessages = updatedMessages
         .filter((m) => m.id !== "msg-welcome")
-        .map((m) => ({
-          role: m.role,
-          content: m.content,
-          attachments: m.attachments,
-        }));
+        .map((m) => {
+          const parsedNote = parseChatNoteMessage(m.content);
+          if (parsedNote) {
+            return {
+              role: m.role,
+              content: formatNoteForHistoryContext(parsedNote),
+              attachments: m.attachments,
+            };
+          }
+          const parsedGoogleDoc = parseGoogleDocMessage(m.content);
+          return {
+            role: m.role,
+            content: parsedGoogleDoc
+              ? formatGoogleDocForHistoryContext(parsedGoogleDoc)
+              : m.content,
+            attachments: m.attachments,
+          };
+        });
 
       const geminiHistory = payloadMessages.map((m) => ({
         role: m.role === "assistant" ? ("model" as const) : ("user" as const),
@@ -301,21 +445,80 @@ export default function ChatPage() {
           : {}),
       }));
 
+      const requestPayload: Record<string, unknown> = {
+        contents: geminiContents,
+        messages: payloadMessages,
+        history: geminiHistory,
+        model: selectedModel,
+        voiceCallMode: isVoiceCall,
+      };
+
+      if (effectiveMode !== "chat") {
+        requestPayload.interactionMode = effectiveMode;
+      }
+      if (options?.audio?.base64) {
+        requestPayload.audio = options.audio;
+      }
+      if (options?.image?.base64) {
+        requestPayload.image = options.image;
+      }
+
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: geminiContents,
-          messages: payloadMessages,
-          history: geminiHistory,
-          model: selectedModel,
-          voiceCallMode,
-        }),
+        body: JSON.stringify(requestPayload),
       });
 
       const data = await res.json();
 
       if (data.success && data.reply) {
+        const extractedTranscript =
+          typeof data.transcript === "string" ? data.transcript.trim() : "";
+
+        // Update user message content in chat history when Voice Note / Call audio transcript is returned
+        // so follow-up messages have 100% memory of what the user said in the Voice Note
+        const messagesWithMemory = updatedMessages.map((m) => {
+          if (m.id !== userMsgId) return m;
+
+          if ((isVoiceNote || (isVoiceCall && hasAudioPayload)) && extractedTranscript) {
+            const updatedContent = text
+              ? `[Voice Note]: ${extractedTranscript}\n\n${text}`
+              : `[Voice Note]: ${extractedTranscript}`;
+            const updatedAtts = m.attachments?.map((att) =>
+              att.isVoiceNote
+                ? { ...att, textPreview: extractedTranscript }
+                : att
+            );
+            return {
+              ...m,
+              content: updatedContent,
+              attachments: updatedAtts,
+            };
+          }
+
+          if (isVision && m.attachments?.length) {
+            const imgName =
+              options?.image?.name || m.attachments[0]?.name || "Foto Lampiran";
+            const visionSummarySnippet = data.reply
+              .replace(/\s+/g, " ")
+              .slice(0, 260);
+            const updatedAtts = m.attachments.map((att) =>
+              att.mimeType.startsWith("image/")
+                ? {
+                    ...att,
+                    textPreview: `${att.textPreview ? att.textPreview + "\n" : ""}[Konteks Analisis Visual ${imgName}: ${visionSummarySnippet}]`,
+                  }
+                : att
+            );
+            return {
+              ...m,
+              attachments: updatedAtts,
+            };
+          }
+
+          return m;
+        });
+
         const botMsgId = generateUniqueId("bot");
         const assistantMsg: ChatMessage = {
           id: botMsgId,
@@ -323,9 +526,64 @@ export default function ChatPage() {
           content: data.reply,
           modelBadge: selectedModel,
           timestamp: "Baru saja",
+          attachments:
+            isVision && userMsg.attachments ? userMsg.attachments : undefined,
         };
 
-        const finalMessages = [...updatedMessages, assistantMsg];
+        if (Array.isArray(data.activePillars) && data.activePillars.length > 0) {
+          setMessagePillarsMap((prev) => ({
+            ...prev,
+            [botMsgId]: data.activePillars as string[],
+          }));
+        }
+
+        const returnedSources: WebSourceCitation[] = Array.isArray(data.sources)
+          ? (data.sources as unknown[])
+              .map((item) => normalizeWebSourceCitation(item))
+              .filter((item): item is WebSourceCitation => item !== null)
+          : [];
+        if (returnedSources.length > 0) {
+          attachWebSourcesToMessage(botMsgId, returnedSources);
+        }
+
+        const returnedCreatedNotes: ChatNoteArtifact[] = Array.isArray(
+          data.createdNotes
+        )
+          ? (data.createdNotes as unknown[])
+              .map((item) => normalizeChatNoteArtifact(item))
+              .filter((item): item is ChatNoteArtifact => item !== null)
+          : [];
+
+        const noteMessages: ChatMessage[] = returnedCreatedNotes.map((note) => ({
+          id: generateUniqueId("note"),
+          role: "assistant",
+          content: encodeChatNoteMessage(note),
+          modelBadge: selectedModel,
+          timestamp: "Catatan",
+        }));
+
+        const returnedGoogleDocs: GoogleDocArtifact[] = Array.isArray(
+          data.createdGoogleDocs
+        )
+          ? (data.createdGoogleDocs as unknown[])
+              .map((item) => normalizeGoogleDocArtifact(item))
+              .filter((item): item is GoogleDocArtifact => item !== null)
+          : [];
+
+        const gdocMessages: ChatMessage[] = returnedGoogleDocs.map((doc) => ({
+          id: generateUniqueId("gdoc"),
+          role: "assistant",
+          content: encodeGoogleDocMessage(doc),
+          modelBadge: selectedModel,
+          timestamp: "Google Docs",
+        }));
+
+        const finalMessages = [
+          ...messagesWithMemory,
+          assistantMsg,
+          ...noteMessages,
+          ...gdocMessages,
+        ];
         const finalSessions = updatedSessions.map((s) =>
           s.id === activeSession.id ? { ...s, messages: finalMessages } : s
         );
@@ -333,7 +591,29 @@ export default function ChatPage() {
         setSessions(finalSessions);
         saveStoredSessions(finalSessions);
 
-        return data.reply as string;
+        const returnedReplyAudio: VoiceCallReplyAudio | null =
+          isVoiceCall &&
+          data.replyAudio &&
+          typeof data.replyAudio.base64 === "string"
+            ? {
+                base64: data.replyAudio.base64,
+                mimeType:
+                  typeof data.replyAudio.mimeType === "string"
+                    ? data.replyAudio.mimeType
+                    : "audio/wav",
+              }
+            : null;
+
+        return {
+          reply: data.reply as string,
+          transcript: extractedTranscript || undefined,
+          replyAudio: returnedReplyAudio,
+          createdNotes:
+            returnedCreatedNotes.length > 0 ? returnedCreatedNotes : undefined,
+          createdGoogleDocs:
+            returnedGoogleDocs.length > 0 ? returnedGoogleDocs : undefined,
+          sources: returnedSources.length > 0 ? returnedSources : undefined,
+        };
       } else {
         const technicalErrorText =
           data.reply ||
@@ -358,7 +638,7 @@ export default function ChatPage() {
         setSessions(finalSessions);
         saveStoredSessions(finalSessions);
         setErrorMessage(data.error || "Gagal mendapatkan balasan dari AI.");
-        return technicalErrorText;
+        return { reply: technicalErrorText };
       }
     } catch (err: unknown) {
       const networkErrorDetail =
@@ -382,11 +662,245 @@ export default function ChatPage() {
       setSessions(finalSessions);
       saveStoredSessions(finalSessions);
       setErrorMessage(networkErrorDetail);
-      return null;
+      return { reply: null };
     } finally {
       setIsLoading(false);
+      setLoadingMode("chat");
     }
   };
+
+  const handleSendMessage = async (
+    text: string,
+    attachments: ChatAttachment[] = [],
+    voiceCallModeOrOptions: boolean | MultimodalSendOptions = false
+  ): Promise<string | null> => {
+    const opts: MultimodalSendOptions & { voiceCallMode?: boolean } =
+      typeof voiceCallModeOrOptions === "boolean"
+        ? {
+            voiceCallMode: voiceCallModeOrOptions,
+            interactionMode: voiceCallModeOrOptions ? "voice_call" : "chat",
+          }
+        : voiceCallModeOrOptions;
+
+    const res = await executeChatTurn(text, attachments, opts);
+    return res.reply;
+  };
+
+  const handleSendSpokenPromptInCall = async (
+    spokenText: string
+  ): Promise<VoiceCallTurnResult> => {
+    return executeChatTurn(spokenText, [], {
+      interactionMode: "voice_call",
+      voiceCallMode: true,
+    });
+  };
+
+  const handleSendSpokenAudioInCall = async (audio: {
+    base64: string;
+    mimeType: string;
+  }): Promise<VoiceCallTurnResult> => {
+    return executeChatTurn("", [], {
+      interactionMode: "voice_call",
+      voiceCallMode: true,
+      audio,
+    });
+  };
+
+  const handleStartVoiceCall = useCallback(() => {
+    setIsVoiceMicMuted(false);
+    setIsVoiceCallOpen(true);
+  }, []);
+
+  const handleEndVoiceCall = useCallback(() => {
+    setIsVoiceCallOpen(false);
+    setIsVoiceMicMuted(false);
+  }, []);
+
+  const handleLiveUserTurn = useCallback((spokenText: string) => {
+    const trimmed = spokenText.trim();
+    if (!trimmed) return;
+    const targetId = activeSessionIdRef.current;
+
+    setSessions((prev) => {
+      const next = prev.map((sess) => {
+        if (sess.id !== targetId) return sess;
+        const isFirstUser =
+          sess.messages.filter((m) => m.role === "user").length === 0;
+        const nextTitle = isFirstUser
+          ? generateSessionTitle(trimmed, true, false)
+          : sess.title;
+        const userMsg: ChatMessage = {
+          id: generateUniqueId("live-u"),
+          role: "user",
+          content: trimmed,
+          timestamp: "Suara",
+        };
+        return {
+          ...sess,
+          title: nextTitle,
+          messages: [...sess.messages, userMsg],
+        };
+      });
+      saveStoredSessions(next);
+      return next;
+    });
+  }, []);
+
+  const handleLiveAssistantStream = useCallback(
+    (turnId: string, text: string) => {
+      const trimmed = text.trim();
+      if (!trimmed) return;
+      const targetId = activeSessionIdRef.current;
+      const modelBadge = selectedModelRef.current;
+
+      setSessions((prev) => {
+        const next = prev.map((sess) => {
+          if (sess.id !== targetId) return sess;
+          const existingIdx = sess.messages.findIndex((m) => m.id === turnId);
+          if (existingIdx !== -1) {
+            const updatedMsgs = sess.messages.map((m, i) =>
+              i === existingIdx ? { ...m, content: trimmed } : m
+            );
+            return { ...sess, messages: updatedMsgs };
+          }
+          const aiMsg: ChatMessage = {
+            id: turnId,
+            role: "assistant",
+            content: trimmed,
+            modelBadge,
+            timestamp: "Suara",
+          };
+          return {
+            ...sess,
+            messages: [...sess.messages, aiMsg],
+          };
+        });
+        saveStoredSessions(next);
+        return next;
+      });
+    },
+    []
+  );
+
+  const handleCreateChatNote = useCallback((note: ChatNoteArtifact) => {
+    const normalized = normalizeChatNoteArtifact(note);
+    if (!normalized) return;
+    const targetId = activeSessionIdRef.current;
+    const modelBadge = selectedModelRef.current;
+
+    setSessions((prev) => {
+      const next = prev.map((sess) => {
+        if (sess.id !== targetId) return sess;
+        const noteMsg: ChatMessage = {
+          id: generateUniqueId("note"),
+          role: "assistant",
+          content: encodeChatNoteMessage(normalized),
+          modelBadge,
+          timestamp: "Catatan",
+        };
+        return {
+          ...sess,
+          messages: [...sess.messages, noteMsg],
+        };
+      });
+      saveStoredSessions(next);
+      return next;
+    });
+  }, []);
+
+  const attachWebSourcesToMessage = useCallback(
+    (msgId: string, incomingSources: WebSourceCitation[]) => {
+      if (!msgId || !Array.isArray(incomingSources) || incomingSources.length === 0) {
+        return;
+      }
+      setMessageSourcesMap((prev) => {
+        const merged = mergeUniqueWebSources(
+          prev[msgId] || [],
+          incomingSources,
+          6
+        );
+        if (merged.length === 0) return prev;
+        const next = { ...prev, [msgId]: merged };
+        try {
+          // Keep latest 80 grounded message records in localStorage
+          const entries = Object.entries(next).slice(-80);
+          localStorage.setItem(
+            "formylab_msg_sources_v1",
+            JSON.stringify(Object.fromEntries(entries))
+          );
+        } catch {
+          // Ignore storage quota errors
+        }
+        return next;
+      });
+    },
+    []
+  );
+
+  const handleCreateGoogleDoc = useCallback((doc: GoogleDocArtifact) => {
+    const normalized = normalizeGoogleDocArtifact(doc);
+    if (!normalized) return;
+    const targetId = activeSessionIdRef.current;
+    const modelBadge = selectedModelRef.current;
+
+    setSessions((prev) => {
+      const next = prev.map((sess) => {
+        if (sess.id !== targetId) return sess;
+        const gdocMsg: ChatMessage = {
+          id: generateUniqueId("gdoc"),
+          role: "assistant",
+          content: encodeGoogleDocMessage(normalized),
+          modelBadge,
+          timestamp: "Google Docs",
+        };
+        return {
+          ...sess,
+          messages: [...sess.messages, gdocMsg],
+        };
+      });
+      saveStoredSessions(next);
+      return next;
+    });
+  }, []);
+
+  const handleUpdateGoogleDocMessage = useCallback(
+    (msgId: string, updatedDoc: GoogleDocArtifact) => {
+      const normalized = normalizeGoogleDocArtifact(updatedDoc);
+      if (!normalized) return;
+      const encoded = encodeGoogleDocMessage(normalized);
+
+      setSessions((prev) => {
+        const next = prev.map((sess) => {
+          if (!sess.messages.some((m) => m.id === msgId)) return sess;
+          return {
+            ...sess,
+            messages: sess.messages.map((m) =>
+              m.id === msgId ? { ...m, content: encoded } : m
+            ),
+          };
+        });
+        saveStoredSessions(next);
+        return next;
+      });
+    },
+    []
+  );
+
+  const handleToggleGoogleDrive = useCallback(async () => {
+    if (isConnectingDrive) return;
+    if (isDriveConnected) {
+      disconnectGoogleDrive();
+      return;
+    }
+    setIsConnectingDrive(true);
+    try {
+      await connectGoogleDrive("");
+    } catch {
+      // User closed popup or Drive OAuth unavailable; GoogleDocCard handles fallback cleanly
+    } finally {
+      setIsConnectingDrive(false);
+    }
+  }, [isConnectingDrive, isDriveConnected]);
 
   // Auto-send preselectedChatPrompt when navigated from Dashboard
   const preselectedTriggeredRef = useRef(false);
@@ -418,14 +932,14 @@ export default function ChatPage() {
     return titleMatch || contentMatch;
   });
 
-  const userInitials = userName
-    .split(/\s+/)
-    .map((w) => w[0])
-    .join("")
-    .toUpperCase()
-    .slice(0, 2) || "FL";
+  const userInitials =
+    userName
+      .split(/\s+/)
+      .map((w) => w[0])
+      .join("")
+      .toUpperCase()
+      .slice(0, 2) || "FL";
 
-  // ChatGPT-style quick starter actions for empty state
   const starterActions = [
     {
       icon: FlaskConical,
@@ -452,40 +966,49 @@ export default function ChatPage() {
     },
   ];
 
-  // Filter out the static welcome message so the ChatGPT-style centered greeting handles the empty state cleanly
   const conversationMessages = (activeSession?.messages || []).filter(
     (m) => m.id !== "msg-welcome"
   );
 
+  const latestAiRawContent =
+    activeSession?.messages
+      .filter((m) => m.role === "assistant")
+      .slice(-1)[0]?.content || "";
+  const latestAiParsedNote = parseChatNoteMessage(latestAiRawContent);
+  const latestAiParsedDoc = parseGoogleDocMessage(latestAiRawContent);
+  const latestAiContextSnippet = latestAiParsedNote
+    ? formatNoteForHistoryContext(latestAiParsedNote)
+    : latestAiParsedDoc
+      ? formatGoogleDocForHistoryContext(latestAiParsedDoc)
+      : latestAiRawContent;
+
   return (
-    <div className="h-screen w-screen overflow-hidden flex bg-[#f4faf6] text-slate-900 font-sans">
-      {/* LEFT COLLAPSIBLE SIDEBAR (CHATGPT STRUCTURE + FORMYLAB.AI EMERALD THEME) */}
+    <div className="h-screen w-screen overflow-hidden flex bg-[#ffffff] text-[#0B2B26] font-matter">
+      {/* LEFT COLLAPSIBLE SIDEBAR */}
       <aside
         className={`${
-          isSidebarOpen ? "w-[268px] border-r border-[#1c4035]" : "w-0"
-        } shrink-0 bg-[#10261f] text-emerald-50 flex flex-col justify-between transition-all duration-200 overflow-hidden select-none z-30`}
+          isSidebarOpen ? "w-[292px] border-r border-[#0B2B26]/10" : "w-0"
+        } shrink-0 bg-[#f6fbf9] text-[#2E524C] flex flex-col justify-between transition-all duration-200 overflow-hidden select-none z-30 shadow-none`}
       >
         {/* TOP SECTION OF SIDEBAR */}
-        <div className="flex-1 min-h-0 flex flex-col p-3">
-          {/* HEADER BAR: Brand Title + Search Toggle + Hide Sidebar Button */}
-          <div className="flex items-center justify-between gap-2 px-1 py-1 mb-2">
+        <div className="flex-1 min-h-0 flex flex-col p-3.5">
+          {/* HEADER BAR: BrandLogo + Search Toggle + Hide Sidebar */}
+          <div className="flex items-center justify-between gap-3 px-0.5 py-1 mb-3">
             <button
               type="button"
               onClick={() => router.push("/dashboard")}
-              className="flex items-center text-left hover:opacity-90 transition cursor-pointer min-w-0"
+              className="min-h-[44px] flex items-center text-left hover:opacity-85 transition cursor-pointer shrink-0"
               title="Kembali ke Dashboard"
             >
-              <Logo size="sm" variant="light" />
+              <BrandLogo size="sm" variant="light" />
             </button>
 
-            <div className="flex items-center gap-1 shrink-0">
+            <div className="flex items-center gap-1.5 shrink-0">
               <button
                 type="button"
                 onClick={handleToggleSearch}
-                className={`p-1.5 rounded-lg transition cursor-pointer ${
-                  isSearchOpen
-                    ? "bg-emerald-500/25 text-emerald-300"
-                    : "text-emerald-100/70 hover:text-white hover:bg-white/10"
+                className={`min-h-[44px] min-w-[44px] flex items-center justify-center p-1.5 cursor-pointer ${
+                  isSearchOpen ? "btn-glass-primary" : "btn-glass-compact"
                 }`}
                 title={
                   isSearchOpen
@@ -494,25 +1017,25 @@ export default function ChatPage() {
                 }
                 aria-label="Toggle Search Chat"
               >
-                <Search className="w-4 h-4" />
+                <Search className="w-3.5 h-3.5 text-[#0B2B26]" aria-hidden="true" />
               </button>
               <button
                 type="button"
                 onClick={() => setIsSidebarOpen(false)}
-                className="p-1.5 rounded-lg text-emerald-100/70 hover:text-white hover:bg-white/10 transition cursor-pointer"
+                className="btn-glass-compact min-h-[44px] min-w-[44px] flex items-center justify-center p-1.5 cursor-pointer"
                 title="Sembunyikan Sidebar"
                 aria-label="Hide Sidebar"
               >
-                <PanelLeftClose className="w-4 h-4" />
+                <PanelLeftClose className="w-3.5 h-3.5 text-[#0B2B26]" aria-hidden="true" />
               </button>
             </div>
           </div>
 
-          {/* COLLAPSIBLE / HIDEABLE SEARCH BAR */}
+          {/* COLLAPSIBLE SEARCH BAR */}
           {isSearchOpen && (
-            <div className="mb-2.5 px-1 animate-in fade-in duration-150">
-              <div className="flex items-center gap-2 bg-[#18362c] border border-emerald-400/25 rounded-xl px-2.5 py-1.5">
-                <Search className="w-3.5 h-3.5 text-emerald-300/80 shrink-0" />
+            <div className="mb-3 px-0.5 animate-in fade-in duration-150">
+              <div className="flex items-center gap-2 bg-white border border-[#0B2B26]/14 focus-within:border-[#0E807E] rounded-full px-3 min-h-[44px] transition-colors">
+                <Search className="w-3.5 h-3.5 text-[#0E807E] shrink-0" aria-hidden="true" />
                 <input
                   ref={searchInputRef}
                   type="text"
@@ -525,7 +1048,7 @@ export default function ChatPage() {
                     }
                   }}
                   placeholder="Cari obrolan..."
-                  className="w-full bg-transparent text-xs text-white placeholder-emerald-200/50 focus:outline-none"
+                  className="w-full bg-transparent text-xs text-[#0B2B26] placeholder-[#2E524C]/60 focus:outline-none"
                 />
                 <button
                   type="button"
@@ -533,49 +1056,54 @@ export default function ChatPage() {
                     setIsSearchOpen(false);
                     setSearchQuery("");
                   }}
-                  className="text-emerald-200/60 hover:text-white p-0.5 rounded cursor-pointer"
+                  className="text-[#2E524C] hover:text-[#0B2B26] p-1 rounded-full cursor-pointer"
                   title="Tutup bar pencarian"
                   aria-label="Close Search Bar"
                 >
-                  <X className="w-3.5 h-3.5" />
+                  <X className="w-3.5 h-3.5" aria-hidden="true" />
                 </button>
               </div>
             </div>
           )}
 
-          {/* PRIMARY NAVIGATION ACTIONS (LIKE CHATGPT SIDEBAR) */}
-          <div className="space-y-1 mb-4">
+          {/* PRIMARY NAVIGATION ACTIONS */}
+          <div className="px-2 mb-1.5">
+            <span className="eyebrow-label !text-[10px] text-[#0E807E]">
+              Workspace
+            </span>
+          </div>
+          <div className="space-y-2 mb-5">
             <button
               type="button"
               onClick={handleCreateNewSession}
-              className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl bg-[#1a3a30] hover:bg-[#21483b] text-white text-xs font-semibold transition cursor-pointer"
+              className="btn-glass-primary min-h-[44px] w-full flex items-center gap-2.5 px-3.5 py-2 text-xs cursor-pointer"
             >
-              <SquarePen className="w-4 h-4 text-emerald-300 shrink-0" />
+              <SquarePen className="w-4 h-4 text-[#0E807E] shrink-0" aria-hidden="true" />
               <span>Obrolan baru</span>
             </button>
 
             <button
               type="button"
               onClick={() => router.push("/formulate")}
-              className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl hover:bg-white/8 text-emerald-100/85 hover:text-white text-xs font-medium transition cursor-pointer"
+              className="btn-glass-compact min-h-[44px] w-full flex items-center gap-2.5 px-3.5 py-2 text-xs cursor-pointer"
             >
-              <FlaskConical className="w-4 h-4 text-emerald-400/80 shrink-0" />
+              <FlaskConical className="w-4 h-4 text-[#0E807E] shrink-0" aria-hidden="true" />
               <span>Studio Formulasi</span>
             </button>
 
             <button
               type="button"
               onClick={() => router.push("/library")}
-              className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl hover:bg-white/8 text-emerald-100/85 hover:text-white text-xs font-medium transition cursor-pointer"
+              className="btn-glass-compact min-h-[44px] w-full flex items-center gap-2.5 px-3.5 py-2 text-xs cursor-pointer"
             >
-              <BookOpen className="w-4 h-4 text-emerald-400/80 shrink-0" />
+              <BookOpen className="w-4 h-4 text-[#0E807E] shrink-0" aria-hidden="true" />
               <span>Pustaka Bahan</span>
             </button>
           </div>
 
-          {/* RECENT CHATS SECTION ("Terbaru") */}
-          <div className="px-2.5 mb-1.5 flex items-center justify-between">
-            <span className="text-[11px] font-semibold text-emerald-200/55">
+          {/* RECENT CHATS SECTION */}
+          <div className="px-2 mb-1.5 flex items-center justify-between">
+            <span className="eyebrow-label !text-[10px] text-[#0E807E]">
               {searchQuery.trim()
                 ? `Hasil Pencarian (${filteredSessions.length})`
                 : "Terbaru"}
@@ -583,9 +1111,9 @@ export default function ChatPage() {
           </div>
 
           {/* SESSION LIST */}
-          <div className="flex-1 min-h-0 overflow-y-auto space-y-0.5 pr-1">
+          <div className="flex-1 min-h-0 overflow-y-auto space-y-1 pr-0.5">
             {filteredSessions.length === 0 ? (
-              <div className="px-3 py-4 text-xs text-emerald-200/50 text-center">
+              <div className="px-3 py-4 text-xs text-[#2E524C]/75 text-center">
                 Tidak ada obrolan yang cocok.
               </div>
             ) : (
@@ -597,10 +1125,10 @@ export default function ChatPage() {
                   <div
                     key={sess.id}
                     onClick={() => handleSelectSession(sess.id)}
-                    className={`group relative px-2.5 py-2 rounded-xl text-xs transition-colors cursor-pointer flex items-center justify-between gap-2 ${
+                    className={`group relative px-3 py-2 min-h-[44px] rounded-[12px] text-xs transition-colors cursor-pointer flex items-center justify-between gap-2 ${
                       isActive
-                        ? "bg-[#1d4236] text-white font-semibold"
-                        : "text-emerald-100/80 hover:bg-white/8 hover:text-white"
+                        ? "bg-white text-[#0B2B26] font-medium border border-[#0E807E]/35"
+                        : "text-[#2E524C] hover:bg-white/75 hover:text-[#0B2B26] border border-transparent"
                     }`}
                   >
                     {isEditing ? (
@@ -613,37 +1141,37 @@ export default function ChatPage() {
                           type="text"
                           value={editingTitle}
                           onChange={(e) => setEditingTitle(e.target.value)}
-                          className="w-full text-xs px-2 py-1 rounded-lg bg-[#10261f] text-white border border-emerald-400/40 focus:outline-none"
+                          className="w-full text-xs px-2.5 py-1 rounded-[10px] bg-white text-[#0B2B26] border border-[#0E807E] focus:outline-none"
                           autoFocus
                         />
                         <button
                           type="submit"
-                          className="p-1 rounded bg-emerald-500 text-black hover:bg-emerald-400 cursor-pointer"
+                          className="btn-glass-primary p-1.5 cursor-pointer"
                           title="Simpan"
                         >
-                          <Check className="w-3 h-3" />
+                          <Check className="w-3 h-3 text-[#0E807E]" aria-hidden="true" />
                         </button>
                       </form>
                     ) : (
                       <>
                         <span className="truncate flex-1">{sess.title}</span>
 
-                        <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition shrink-0">
+                        <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition shrink-0">
                           <button
                             type="button"
                             onClick={(e) => handleStartRename(e, sess)}
-                            className="p-1 rounded hover:bg-white/15 text-emerald-200 hover:text-white cursor-pointer"
+                            className="btn-glass-compact p-1 cursor-pointer"
                             title="Ubah judul"
                           >
-                            <Pencil className="w-3 h-3" />
+                            <Pencil className="w-3 h-3 text-[#0B2B26]" aria-hidden="true" />
                           </button>
                           <button
                             type="button"
                             onClick={(e) => handleDeleteSession(e, sess.id)}
-                            className="p-1 rounded hover:bg-rose-500/25 text-emerald-200 hover:text-rose-300 cursor-pointer"
+                            className="btn-glass-danger p-1 cursor-pointer"
                             title="Hapus obrolan"
                           >
-                            <Trash2 className="w-3 h-3" />
+                            <Trash2 className="w-3 h-3" aria-hidden="true" />
                           </button>
                         </div>
                       </>
@@ -655,16 +1183,16 @@ export default function ChatPage() {
           </div>
         </div>
 
-        {/* BOTTOM USER PROFILE (LIKE CHATGPT FOOTER) */}
-        <div className="p-3 border-t border-white/10 flex items-center gap-2.5 bg-[#0d201a]">
-          <div className="w-8 h-8 rounded-full bg-emerald-600 text-white font-bold text-xs flex items-center justify-center shrink-0">
+        {/* BOTTOM USER PROFILE */}
+        <div className="p-3.5 border-t border-[#0B2B26]/10 flex items-center gap-2.5 bg-[#f6fbf9]">
+          <div className="w-8 h-8 rounded-full bg-[#eaf8f5] border border-[#0B2B26]/10 text-[#0E807E] font-medium text-xs flex items-center justify-center shrink-0">
             {userInitials}
           </div>
           <div className="min-w-0">
-            <div className="text-xs font-semibold text-white truncate">
+            <div className="text-xs font-medium text-[#0B2B26] truncate">
               {userName}
             </div>
-            <div className="text-[10px] text-emerald-300/70 truncate">
+            <div className="text-[10px] text-[#2E524C] truncate">
               R&amp;D Workspace
             </div>
           </div>
@@ -672,47 +1200,51 @@ export default function ChatPage() {
       </aside>
 
       {/* EXPANSIVE MAIN CHAT ROOM VIEWPORT */}
-      <main className="flex-1 flex flex-col h-full min-w-0 bg-[#f4faf6] relative">
-        {/* MINIMAL TOP BAR (LIKE CHATGPT HEADER) */}
-        <header className="shrink-0 h-13 px-4 sm:px-6 flex items-center justify-between border-b border-emerald-950/8 bg-[#f4faf6]/90 backdrop-blur-md z-20">
+      <main className="flex-1 flex flex-col h-full min-w-0 bg-[#ffffff] relative">
+        {/* MINIMAL TOP BAR */}
+        <header className="shrink-0 h-16 px-4 sm:px-6 flex items-center justify-between border-b border-[#0B2B26]/10 bg-white/90 backdrop-blur-md z-20">
           <div className="flex items-center gap-2 min-w-0">
             {!isSidebarOpen && (
-              <div className="flex items-center gap-1 mr-1">
+              <div className="flex items-center gap-1.5 mr-1">
                 <button
                   type="button"
                   onClick={() => setIsSidebarOpen(true)}
-                  className="p-2 rounded-xl hover:bg-emerald-950/8 text-[#12382f] transition cursor-pointer"
+                  className="btn-glass-compact min-h-[44px] min-w-[44px] flex items-center justify-center p-2 cursor-pointer"
                   title="Tampilkan Sidebar Riwayat"
                   aria-label="Open Sidebar"
                 >
-                  <PanelLeftOpen className="w-4 h-4" />
+                  <PanelLeftOpen className="w-4 h-4 text-[#0B2B26]" aria-hidden="true" />
                 </button>
                 <button
                   type="button"
                   onClick={handleCreateNewSession}
-                  className="p-2 rounded-xl hover:bg-emerald-950/8 text-[#12382f] transition cursor-pointer"
+                  className="btn-glass-compact min-h-[44px] min-w-[44px] flex items-center justify-center p-2 cursor-pointer"
                   title="Obrolan Baru"
                   aria-label="New Chat"
                 >
-                  <SquarePen className="w-4 h-4" />
+                  <SquarePen className="w-4 h-4 text-[#0B2B26]" aria-hidden="true" />
                 </button>
               </div>
             )}
 
             <div className="flex items-center gap-2.5 min-w-0">
-              <button
-                type="button"
-                onClick={() => router.push("/dashboard")}
-                className="flex items-center hover:opacity-90 transition cursor-pointer shrink-0"
-                title="Kembali ke Dashboard"
-              >
-                <Logo size="sm" />
-              </button>
-              <span className="text-slate-300">·</span>
-              <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-600 truncate">
+              {!isSidebarOpen && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => router.push("/dashboard")}
+                    className="min-h-[44px] flex items-center hover:opacity-85 transition cursor-pointer shrink-0"
+                    title="Kembali ke Dashboard"
+                  >
+                    <BrandLogo size="sm" variant="light" />
+                  </button>
+                  <span className="text-[#0B2B26]/25">·</span>
+                </>
+              )}
+              <span className="inline-flex items-center gap-1.5 text-xs font-medium text-[#2E524C] truncate">
                 <ModelIcon
                   modelId={activeModelOption.id}
-                  className="w-3.5 h-3.5"
+                  className="w-3.5 h-3.5 text-[#0E807E]"
                   idSuffix="top-header"
                 />
                 <span>{activeModelOption.name}</span>
@@ -721,6 +1253,44 @@ export default function ChatPage() {
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
+            {isDriveConfigured && (
+              <button
+                type="button"
+                onClick={handleToggleGoogleDrive}
+                disabled={isConnectingDrive}
+                className={`min-h-[44px] px-3 py-1.5 text-xs inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap transition-all ${
+                  isDriveConnected
+                    ? "rounded-full bg-[#e6f6f2] hover:bg-[#daf2ec] border border-[#0E807E]/30 text-[#0B2B26] font-medium"
+                    : "btn-glass-compact text-[#2E524C]"
+                }`}
+                title={
+                  isDriveConnected
+                    ? "Google Drive terhubung (klik untuk putuskan sesi)"
+                    : "Hubungkan Google Drive agar AI bisa langsung membuat file Google Docs"
+                }
+              >
+                {isConnectingDrive ? (
+                  <Loader2
+                    className="w-3.5 h-3.5 text-[#0E807E] animate-spin"
+                    aria-hidden="true"
+                  />
+                ) : isDriveConnected ? (
+                  <span
+                    className="w-2 h-2 rounded-full bg-[#0E807E] shrink-0"
+                    aria-hidden="true"
+                  />
+                ) : (
+                  <Cloud
+                    className="w-3.5 h-3.5 text-[#0E807E] shrink-0"
+                    aria-hidden="true"
+                  />
+                )}
+                <span className="hidden sm:inline">
+                  {isDriveConnected ? "Drive Terhubung" : "Hubungkan Drive"}
+                </span>
+              </button>
+            )}
+
             {conversationMessages.length > 0 && (
               <button
                 type="button"
@@ -741,48 +1311,54 @@ export default function ChatPage() {
                     saveStoredSessions(updated);
                   }
                 }}
-                className="text-xs text-slate-500 hover:text-rose-700 font-medium px-2.5 py-1.5 rounded-lg hover:bg-emerald-950/5 transition cursor-pointer whitespace-nowrap"
+                className="btn-glass-danger min-h-[44px] text-xs px-3.5 py-1.5 cursor-pointer whitespace-nowrap"
               >
-                Bersihkan Chat
+                <span>Bersihkan Chat</span>
               </button>
             )}
 
             <button
               type="button"
               onClick={() => router.push("/dashboard")}
-              className="px-3 py-1.5 rounded-xl bg-white hover:bg-emerald-50 text-[#12382f] border border-emerald-950/12 text-xs font-semibold transition cursor-pointer shadow-2xs whitespace-nowrap"
+              className="btn-glass-secondary min-h-[44px] px-3.5 py-1.5 text-xs cursor-pointer whitespace-nowrap"
             >
-              ← Dashboard
+              <span>← Dashboard</span>
             </button>
           </div>
         </header>
 
-        {/* STATE 1: NEW / EMPTY CHAT -> CENTERED CHATGPT WELCOME ROOM (LIKE SCREENSHOT 4) */}
+        {/* STATE 1: NEW / EMPTY CHAT */}
         {isNewEmptyChat ? (
-          <div className="flex-1 flex flex-col items-center justify-center px-4 sm:px-6 pb-10 overflow-y-auto">
+          <div className="flex-1 flex flex-col items-center justify-center px-4 sm:px-6 pb-12 overflow-y-auto">
             <div className="w-full max-w-2xl mx-auto flex flex-col items-center">
-              {/* DYNAMIC PERSONALIZED GREETING WITH USER NAME */}
+              <span className="text-[11px] font-medium uppercase tracking-[0.14em] text-[#0E807E] mb-3">
+                AI Cosmetic Chemist Co-Pilot
+              </span>
+
+              {/* DYNAMIC PERSONALIZED GREETING */}
               <h1
                 key={greetingIndex}
-                className="text-2xl sm:text-3xl font-bold text-[#12382f] text-center tracking-tight mb-6 animate-in fade-in duration-300"
+                className="text-2xl sm:text-[34px] font-medium text-[#0B2B26] text-center tracking-[-0.03em] leading-[1.16] mb-7 text-balance animate-in fade-in duration-300"
               >
                 {dynamicGreetings[greetingIndex]}
               </h1>
 
-              {/* COMPACT BLACK CHATGPT PILL BAR */}
+              {/* COMPOSER BAR */}
               <div className="w-full mb-5">
                 <ChatComposerBar
                   selectedModel={selectedModel}
                   onSelectModel={handleSelectModel}
-                  onSend={(t, att) => handleSendMessage(t, att, false)}
-                  onStartVoiceCall={() => setIsVoiceCallOpen(true)}
+                  onSend={(t, att, opts) =>
+                    handleSendMessage(t, att, opts || false)
+                  }
+                  onStartVoiceCall={handleStartVoiceCall}
                   isLoading={isLoading}
                   placeholder="Tanya formylab.ai apa saja..."
                 />
               </div>
 
-              {/* CLEAN CHATGPT-STYLE STARTER ACTION LIST */}
-              <div className="w-full max-w-xl grid grid-cols-1 sm:grid-cols-2 gap-2">
+              {/* STARTER ACTION PILLS — Optical Glass Compact */}
+              <div className="w-full max-w-xl grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                 {starterActions.map((item, idx) => {
                   const IconComp = item.icon;
                   return (
@@ -790,9 +1366,9 @@ export default function ChatPage() {
                       key={idx}
                       type="button"
                       onClick={() => handleSendMessage(item.prompt, [])}
-                      className="flex items-center gap-3 px-3.5 py-2.5 rounded-2xl bg-white/80 hover:bg-white border border-emerald-950/10 text-left text-xs font-medium text-slate-700 hover:text-[#12382f] transition cursor-pointer shadow-2xs"
+                      className="btn-glass-compact min-h-[44px] flex items-center gap-3 px-4 py-3 text-left text-xs cursor-pointer"
                     >
-                      <IconComp className="w-4 h-4 text-[#0f766e] shrink-0" />
+                      <IconComp className="w-4 h-4 text-[#0E807E] shrink-0" aria-hidden="true" />
                       <span className="truncate">{item.label}</span>
                     </button>
                   );
@@ -801,13 +1377,28 @@ export default function ChatPage() {
             </div>
           </div>
         ) : (
-          /* STATE 2: ACTIVE CONVERSATION -> EXPANSIVE FULL-HEIGHT READING ROOM + COMPACT BOTTOM BLACK PILL BAR */
+          /* STATE 2: ACTIVE CONVERSATION (INCLUDING INLINE AI VOICE MODE) */
           <>
             <div
               ref={messagesContainerRef}
-              className="flex-1 min-h-0 overflow-y-auto px-4 sm:px-6 py-6"
+              className="flex-1 min-h-0 overflow-y-auto px-4 sm:px-6 py-7"
             >
-              <div className="max-w-3xl lg:max-w-4xl mx-auto w-full space-y-6 pb-4">
+              <div
+                className={`max-w-3xl lg:max-w-4xl mx-auto w-full space-y-6 ${
+                  isVoiceCallOpen ? "pb-36 sm:pb-40" : "pb-4"
+                }`}
+              >
+                {conversationMessages.length === 0 && isVoiceCallOpen && (
+                  <div className="py-12 text-center">
+                    <p className="text-sm font-medium text-[#0B2B26]">
+                      Mode Suara AI aktif di room chat
+                    </p>
+                    <p className="mt-1 text-xs text-[#2E524C]">
+                      Langsung bicara atau minta dibuatkan catatan &amp; tabel — percakapan akan mengalir otomatis di sini.
+                    </p>
+                  </div>
+                )}
+
                 {conversationMessages.map((msg, msgIdx) => {
                   const isUser = msg.role === "user";
                   const msgModelOpt = getModelOption(
@@ -820,19 +1411,19 @@ export default function ChatPage() {
                         key={`${msg.id}-${msgIdx}`}
                         className="flex justify-end"
                       >
-                        <div className="max-w-[82%] sm:max-w-[75%] rounded-3xl rounded-tr-sm bg-[#12382f] text-white px-4 py-3 shadow-2xs text-[14.5px] leading-relaxed">
+                        <div className="max-w-[82%] sm:max-w-[74%] rounded-[16px] bg-[#0B2B26] text-white px-4 py-3 text-[14.5px] leading-relaxed shadow-none">
                           {msg.attachments && msg.attachments.length > 0 && (
                             <div className="space-y-2 mb-2.5">
                               {msg.attachments.map((att) => (
                                 <div
                                   key={att.id}
-                                  className="rounded-2xl p-2.5 bg-white/10 border border-white/15 text-white"
+                                  className="rounded-[12px] p-2.5 bg-white/10 border border-white/15 text-white"
                                 >
                                   {att.isVoiceNote ? (
-                                    <div className="flex flex-col gap-1">
-                                      <div className="flex items-center justify-between gap-2 text-xs font-bold">
+                                    <div className="flex flex-col gap-1.5">
+                                      <div className="flex items-center justify-between gap-2 text-xs font-medium">
                                         <span>🎤 {att.name}</span>
-                                        <span className="text-[10px] opacity-75">
+                                        <span className="text-[10px] text-white/75 font-mono tabular-nums">
                                           {att.sizeLabel}
                                         </span>
                                       </div>
@@ -840,29 +1431,37 @@ export default function ChatPage() {
                                         <audio
                                           src={att.dataUrl}
                                           controls
-                                          className="w-full h-8 mt-1"
+                                          className="w-full h-8 mt-0.5"
                                         />
+                                      )}
+                                      {att.textPreview && (
+                                        <div className="mt-1 pt-1.5 border-t border-white/15 text-xs text-white/90">
+                                          <span className="text-[10px] uppercase tracking-[0.08em] text-[#47C4A5] font-medium block mb-0.5">
+                                            Transkrip Suara:
+                                          </span>
+                                          <span>&ldquo;{att.textPreview}&rdquo;</span>
+                                        </div>
                                       )}
                                     </div>
                                   ) : att.mimeType.startsWith("image/") &&
                                     att.dataUrl ? (
-                                    <div className="space-y-1">
+                                    <div className="space-y-1.5">
                                       {/* eslint-disable-next-line @next/next/no-img-element */}
                                       <img
                                         src={att.dataUrl}
                                         alt={att.name}
-                                        className="max-h-52 rounded-xl object-contain border border-white/15"
+                                        className="max-h-56 rounded-[10px] object-contain border border-white/15"
                                       />
-                                      <div className="text-xs font-semibold truncate">
+                                      <div className="text-xs font-medium truncate">
                                         📎 {att.name} ({att.sizeLabel})
                                       </div>
                                     </div>
                                   ) : (
                                     <div className="flex items-center justify-between gap-2 text-xs">
-                                      <span className="font-bold truncate">
+                                      <span className="font-medium truncate">
                                         📄 {att.name}
                                       </span>
-                                      <span className="text-[10px] opacity-75 shrink-0">
+                                      <span className="text-[10px] text-white/75 shrink-0">
                                         {att.sizeLabel}
                                       </span>
                                     </div>
@@ -871,7 +1470,63 @@ export default function ChatPage() {
                               ))}
                             </div>
                           )}
-                          <FormattedChatText content={msg.content} />
+                          <FormattedChatText content={msg.content} tone="on-dark" />
+                        </div>
+                      </div>
+                    );
+                  }
+
+                  const parsedNote = parseChatNoteMessage(msg.content);
+                  if (parsedNote) {
+                    return (
+                      <div
+                        key={`${msg.id}-${msgIdx}`}
+                        className="flex items-start gap-3.5 justify-start"
+                      >
+                        <div className="w-8 h-8 rounded-full flex items-center justify-center shrink-0 bg-[#f4fbf8] border border-[#0B2B26]/10 text-[#0E807E] mt-0.5 shadow-none">
+                          <ModelIcon
+                            modelId={msgModelOpt.id}
+                            className="w-4 h-4"
+                            idSuffix={`note-${msg.id}-${msgIdx}`}
+                          />
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <ChatNoteCard
+                            note={parsedNote}
+                            onSaveToGoogleDocs={(noteItem) =>
+                              handleCreateGoogleDoc({
+                                title: noteItem.title,
+                                markdownContent: noteItem.markdownContent,
+                                status: "draft",
+                              })
+                            }
+                          />
+                        </div>
+                      </div>
+                    );
+                  }
+
+                  const parsedGoogleDoc = parseGoogleDocMessage(msg.content);
+                  if (parsedGoogleDoc) {
+                    return (
+                      <div
+                        key={`${msg.id}-${msgIdx}`}
+                        className="flex items-start gap-3.5 justify-start"
+                      >
+                        <div className="w-8 h-8 rounded-full flex items-center justify-center shrink-0 bg-[#f4fbf8] border border-[#0B2B26]/10 text-[#0E807E] mt-0.5 shadow-none">
+                          <ModelIcon
+                            modelId={msgModelOpt.id}
+                            className="w-4 h-4"
+                            idSuffix={`gdoc-${msg.id}-${msgIdx}`}
+                          />
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <GoogleDocCard
+                            doc={parsedGoogleDoc}
+                            onDocUpdated={(nextDoc) =>
+                              handleUpdateGoogleDocMessage(msg.id, nextDoc)
+                            }
+                          />
                         </div>
                       </div>
                     );
@@ -882,7 +1537,7 @@ export default function ChatPage() {
                       key={`${msg.id}-${msgIdx}`}
                       className="flex items-start gap-3.5 justify-start"
                     >
-                      <div className="w-8 h-8 rounded-full flex items-center justify-center shrink-0 bg-[#12382f] text-white shadow-2xs mt-0.5">
+                      <div className="w-8 h-8 rounded-full flex items-center justify-center shrink-0 bg-[#f4fbf8] border border-[#0B2B26]/10 text-[#0E807E] mt-0.5 shadow-none">
                         <ModelIcon
                           modelId={msgModelOpt.id}
                           className="w-4 h-4"
@@ -890,16 +1545,48 @@ export default function ChatPage() {
                         />
                       </div>
 
-                      <div className="flex-1 min-w-0 bg-white rounded-3xl rounded-tl-sm px-5 py-4 border border-emerald-950/10 shadow-2xs text-slate-800">
-                        <div className="flex items-center gap-2 mb-1.5 text-xs text-slate-500">
-                          <span className="font-bold text-[#12382f]">
+                      <div className="flex-1 min-w-0 bg-[#f8fdfb] rounded-[16px] px-5 py-4 border border-[#0B2B26]/10 text-[#0B2B26] shadow-none">
+                        <div className="flex items-center gap-2 mb-2 text-xs text-[#2E524C]">
+                          <span className="font-medium text-[#0B2B26]">
                             {msgModelOpt.name}
                           </span>
-                          <span>·</span>
+                          <span aria-hidden="true">·</span>
                           <span>{msg.timestamp}</span>
                         </div>
 
-                        <FormattedChatText content={msg.content} />
+                        <FormattedChatText content={msg.content} tone="light" />
+
+                        {messageSourcesMap[msg.id] &&
+                          messageSourcesMap[msg.id].length > 0 && (
+                            <div
+                              className="mt-3 pt-2.5 border-t border-[#0B2B26]/8 flex flex-wrap items-center gap-1.5"
+                              aria-label="Sumber verifikasi internet"
+                            >
+                              <span className="inline-flex items-center gap-1 text-[10.5px] font-medium text-[#2E524C]/80 mr-0.5">
+                                <Globe
+                                  className="w-3 h-3 text-[#0E807E]"
+                                  aria-hidden="true"
+                                />
+                                <span>Sumber:</span>
+                              </span>
+                              {messageSourcesMap[msg.id].map((src, sIdx) => (
+                                <a
+                                  key={`${src.url}-${sIdx}`}
+                                  href={src.url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  title={src.title}
+                                  className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-medium text-[#0B2B26] hover:text-[#0E807E] bg-white/75 hover:bg-white border border-[#0B2B26]/12 hover:border-[#0E807E]/35 backdrop-blur-md shadow-[inset_0_1px_1px_rgba(255,255,255,0.9)] transition-all max-w-[200px]"
+                                >
+                                  <span className="truncate">{src.domain}</span>
+                                  <ExternalLink
+                                    className="w-2.5 h-2.5 text-[#0E807E] shrink-0"
+                                    aria-hidden="true"
+                                  />
+                                </a>
+                              ))}
+                            </div>
+                          )}
 
                         <InteractiveMessageActions
                           messageId={msg.id}
@@ -908,11 +1595,21 @@ export default function ChatPage() {
                             activeSession?.title || "",
                             ...conversationMessages
                               .slice(Math.max(0, msgIdx - 3), msgIdx)
-                              .map((m) => m.content),
+                              .map((m) => {
+                                const noteCtx = parseChatNoteMessage(m.content);
+                                if (noteCtx) {
+                                  return formatNoteForHistoryContext(noteCtx);
+                                }
+                                const docCtx = parseGoogleDocMessage(m.content);
+                                return docCtx
+                                  ? formatGoogleDocForHistoryContext(docCtx)
+                                  : m.content;
+                              }),
                           ]
                             .filter(Boolean)
                             .join("\n")}
                           attachments={msg.attachments}
+                          activePillars={messagePillarsMap[msg.id]}
                           voice={voice}
                           onQuickFollowUp={(promptText) =>
                             handleSendMessage(promptText, [])
@@ -925,30 +1622,61 @@ export default function ChatPage() {
 
                 {isLoading && (
                   <div className="flex items-center gap-3.5 justify-start">
-                    <div className="w-8 h-8 rounded-full bg-[#12382f] text-white flex items-center justify-center shrink-0">
-                      <Sparkles className="w-4 h-4 animate-spin" />
+                    <div className="w-8 h-8 rounded-full bg-[#f4fbf8] border border-[#0B2B26]/10 text-[#0E807E] flex items-center justify-center shrink-0 shadow-none">
+                      <Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" />
                     </div>
-                    <div className="bg-white px-4 py-2.5 rounded-2xl text-xs font-medium text-[#12382f] border border-emerald-950/10">
-                      {activeModelOption.name} sedang menyusun jawaban...
+                    <div className="bg-[#f8fdfb] px-4 py-2.5 rounded-[16px] text-xs font-medium text-[#0E807E] border border-[#0B2B26]/10 shadow-none">
+                      {loadingMode === "voice_note"
+                        ? "Mendengarkan & mentranskrip Voice Note..."
+                        : loadingMode === "vision"
+                          ? "Menganalisis foto dengan Computer Vision..."
+                          : `${activeModelOption.name} sedang menyusun jawaban...`}
                     </div>
                   </div>
                 )}
 
                 {errorMessage && (
-                  <div className="p-3.5 rounded-2xl bg-red-50 border border-red-200 text-red-700 text-xs font-medium">
+                  <div className="p-3.5 rounded-[16px] bg-[#fef2f2] border border-[#b91c1c]/20 text-[#b91c1c] text-xs font-medium shadow-none">
                     ⚠️ {errorMessage}
                   </div>
                 )}
               </div>
             </div>
 
-            {/* PINNED COMPACT BLACK PILL CHAT COMPOSER AT BOTTOM */}
-            <div className="shrink-0 w-full max-w-3xl lg:max-w-4xl mx-auto px-4 pb-3 pt-1">
+            {/* PINNED COMPOSER AT BOTTOM + FLOATING INLINE 3D PARTICLE SPHERE */}
+            <div className="relative shrink-0 w-full max-w-3xl lg:max-w-4xl mx-auto px-4 sm:px-6 pb-4 pt-2 bg-white">
+              {isVoiceCallOpen && (
+                <div className="pointer-events-none absolute bottom-full left-0 right-0 flex justify-center pb-2 z-20">
+                  <LiveVoiceCallModal
+                    isOpen={isVoiceCallOpen}
+                    onClose={handleEndVoiceCall}
+                    voice={voice}
+                    isMicMuted={isVoiceMicMuted}
+                    modelName={activeModelOption.name}
+                    isAiThinking={isLoading}
+                    latestAiReply={latestAiContextSnippet}
+                    onSendSpokenPrompt={handleSendSpokenPromptInCall}
+                    onSendSpokenAudio={handleSendSpokenAudioInCall}
+                    onLiveUserTurn={handleLiveUserTurn}
+                    onLiveAssistantStream={handleLiveAssistantStream}
+                    onLiveWebSources={attachWebSourcesToMessage}
+                    onCreateChatNote={handleCreateChatNote}
+                    onCreateGoogleDoc={handleCreateGoogleDoc}
+                  />
+                </div>
+              )}
+
               <ChatComposerBar
                 selectedModel={selectedModel}
                 onSelectModel={handleSelectModel}
-                onSend={(t, att) => handleSendMessage(t, att, false)}
-                onStartVoiceCall={() => setIsVoiceCallOpen(true)}
+                onSend={(t, att, opts) =>
+                  handleSendMessage(t, att, opts || false)
+                }
+                onStartVoiceCall={handleStartVoiceCall}
+                isVoiceActive={isVoiceCallOpen}
+                isVoiceMicMuted={isVoiceMicMuted}
+                onToggleVoiceMicMute={() => setIsVoiceMicMuted((prev) => !prev)}
+                onEndVoiceCall={handleEndVoiceCall}
                 isLoading={isLoading}
                 compact
                 placeholder="Tanya formylab.ai apa saja..."
@@ -957,23 +1685,6 @@ export default function ChatPage() {
           </>
         )}
       </main>
-
-      {/* LIVE TWO-WAY VOICE CALL MODAL ("SEPERTI TELEPONAN DENGAN USER") */}
-      <LiveVoiceCallModal
-        isOpen={isVoiceCallOpen}
-        onClose={() => setIsVoiceCallOpen(false)}
-        voice={voice}
-        modelName={activeModelOption.name}
-        isAiThinking={isLoading}
-        latestAiReply={
-          activeSession?.messages
-            .filter((m) => m.role === "assistant")
-            .slice(-1)[0]?.content || ""
-        }
-        onSendSpokenPrompt={(spokenText) =>
-          handleSendMessage(spokenText, [], true)
-        }
-      />
     </div>
   );
 }

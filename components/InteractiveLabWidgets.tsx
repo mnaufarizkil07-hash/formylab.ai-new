@@ -66,37 +66,39 @@ export default function InteractiveLabWidgets({
   const waterWeightGrams = ((waterPhasePct / 100) * batchGrams).toFixed(2);
 
   return (
-    <div className="mt-3 pt-3 border-t border-slate-200/80 bg-slate-50/90 rounded-2xl p-3.5 text-slate-800">
+    <div className="mt-3.5 bg-[#f4fbf8] border border-[#0B2B26]/10 rounded-[16px] p-4 text-[#2E524C] shadow-none">
       {/* HEADER & MODE SWITCHER */}
       <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
-        <div className="flex items-center gap-1.5 text-xs font-extrabold text-[#234e42]">
-          <Sliders className="w-3.5 h-3.5 text-emerald-700" />
+        <div className="flex items-center gap-1.5 text-xs font-medium text-[#0B2B26]">
+          <Sliders aria-hidden="true" className="w-3.5 h-3.5 text-[#0E807E]" />
           <span>Interactive Analytical Lab Widget</span>
         </div>
 
-        <div className="flex items-center gap-1 bg-white p-1 rounded-xl border border-slate-200">
+        <div className="flex items-center gap-1.5">
           <button
             type="button"
+            aria-pressed={activeTab === "hlb"}
             onClick={() => setActiveTab("hlb")}
-            className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition cursor-pointer whitespace-nowrap shrink-0 flex items-center gap-1 ${
+            className={`min-h-[44px] px-3.5 py-1.5 rounded-full text-[11px] font-medium cursor-pointer whitespace-nowrap shrink-0 inline-flex items-center gap-1.5 ${
               activeTab === "hlb"
-                ? "bg-[#234e42] text-white"
-                : "text-slate-600 hover:text-slate-900"
+                ? "btn-glass-primary"
+                : "btn-glass-compact"
             }`}
           >
-            <FlaskConical className="w-3 h-3" />
+            <FlaskConical aria-hidden="true" className="w-3.5 h-3.5 text-[#0E807E]" />
             <span>Kalkulator HLB</span>
           </button>
           <button
             type="button"
+            aria-pressed={activeTab === "batch"}
             onClick={() => setActiveTab("batch")}
-            className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition cursor-pointer whitespace-nowrap shrink-0 flex items-center gap-1 ${
+            className={`min-h-[44px] px-3.5 py-1.5 rounded-full text-[11px] font-medium cursor-pointer whitespace-nowrap shrink-0 inline-flex items-center gap-1.5 ${
               activeTab === "batch"
-                ? "bg-[#234e42] text-white"
-                : "text-slate-600 hover:text-slate-900"
+                ? "btn-glass-primary"
+                : "btn-glass-compact"
             }`}
           >
-            <Scale className="w-3 h-3" />
+            <Scale aria-hidden="true" className="w-3.5 h-3.5 text-[#0E807E]" />
             <span>Batch &amp; Massa (g)</span>
           </button>
         </div>
@@ -105,16 +107,16 @@ export default function InteractiveLabWidgets({
       {activeTab === "hlb" ? (
         <div className="space-y-3 text-xs">
           <div>
-            <label className="block text-[11px] font-bold text-slate-600 mb-1">
+            <label className="block text-[11px] font-medium text-[#2E524C] mb-1">
               Sistem Pasangan Surfaktan (High HLB + Low HLB):
             </label>
             <select
               value={pairIdx}
               onChange={(e) => setPairIdx(Number(e.target.value))}
-              className="w-full p-2 rounded-xl border border-slate-200 bg-white text-xs font-semibold text-slate-800"
+              className="w-full min-h-[44px] p-2.5 rounded-[12px] border border-[#0B2B26]/14 bg-white text-xs font-medium text-[#0B2B26] focus:outline-none focus:border-[#0E807E] focus-visible:ring-2 focus-visible:ring-[#0E807E]"
             >
               {SURFACTANT_PAIRS.map((p, idx) => (
-                <option key={p.id} value={idx}>
+                <option key={p.id} value={idx} className="bg-white text-[#0B2B26]">
                   {p.label}
                 </option>
               ))}
@@ -122,12 +124,12 @@ export default function InteractiveLabWidgets({
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <div className="bg-white p-2.5 rounded-xl border border-slate-200">
+            <div className="bg-white p-3 rounded-[12px] border border-[#0B2B26]/10">
               <div className="flex items-center justify-between mb-1">
-                <span className="text-[11px] font-semibold text-slate-600">
+                <span className="text-[11px] font-normal text-[#2E524C]">
                   Target Required HLB:
                 </span>
-                <span className="font-mono font-bold text-emerald-700 tabular-nums">
+                <span className="font-mono font-medium text-[#0E807E] tabular-nums">
                   {targetHlb.toFixed(1)}
                 </span>
               </div>
@@ -138,16 +140,16 @@ export default function InteractiveLabWidgets({
                 step="0.1"
                 value={targetHlb}
                 onChange={(e) => setTargetHlb(parseFloat(e.target.value))}
-                className="w-full accent-[#234e42] cursor-pointer"
+                className="w-full accent-[#0E807E] cursor-pointer"
               />
             </div>
 
-            <div className="bg-white p-2.5 rounded-xl border border-slate-200">
+            <div className="bg-white p-3 rounded-[12px] border border-[#0B2B26]/10">
               <div className="flex items-center justify-between mb-1">
-                <span className="text-[11px] font-semibold text-slate-600">
+                <span className="text-[11px] font-normal text-[#2E524C]">
                   Total Emulgator (% Batch):
                 </span>
-                <span className="font-mono font-bold text-emerald-700 tabular-nums">
+                <span className="font-mono font-medium text-[#0E807E] tabular-nums">
                   {totalEmulsifierPct.toFixed(1)}%
                 </span>
               </div>
@@ -158,38 +160,38 @@ export default function InteractiveLabWidgets({
                 step="0.25"
                 value={totalEmulsifierPct}
                 onChange={(e) => setTotalEmulsifierPct(parseFloat(e.target.value))}
-                className="w-full accent-[#234e42] cursor-pointer"
+                className="w-full accent-[#0E807E] cursor-pointer"
               />
             </div>
           </div>
 
           {/* HASIL REAL-TIME */}
-          <div className="grid grid-cols-2 gap-2.5 bg-white p-3 rounded-xl border border-slate-200 font-mono">
+          <div className="grid grid-cols-2 gap-2.5 bg-white p-3.5 rounded-[12px] border border-[#0B2B26]/10">
             <div>
-              <span className="text-[10px] text-slate-400 uppercase block font-sans font-bold">
+              <span className="text-[10px] text-[#2E524C] uppercase block font-sans font-medium tracking-[0.06em]">
                 {selectedPair.highName}
               </span>
-              <span className="text-sm font-bold text-slate-900 tabular-nums">
+              <span className="text-sm font-mono font-medium text-[#0B2B26] tabular-nums">
                 {hlbCalc.highDosagePct}%{" "}
               </span>
-              <span className="text-[11px] text-emerald-700 tabular-nums">
+              <span className="text-[11px] font-mono text-[#0E807E] tabular-nums">
                 ({hlbCalc.fractionHighPct}% rasio)
               </span>
             </div>
             <div>
-              <span className="text-[10px] text-slate-400 uppercase block font-sans font-bold">
+              <span className="text-[10px] text-[#2E524C] uppercase block font-sans font-medium tracking-[0.06em]">
                 {selectedPair.lowName}
               </span>
-              <span className="text-sm font-bold text-slate-900 tabular-nums">
+              <span className="text-sm font-mono font-medium text-[#0B2B26] tabular-nums">
                 {hlbCalc.lowDosagePct}%{" "}
               </span>
-              <span className="text-[11px] text-emerald-700 tabular-nums">
+              <span className="text-[11px] font-mono text-[#0E807E] tabular-nums">
                 ({hlbCalc.fractionLowPct}% rasio)
               </span>
             </div>
           </div>
 
-          <div className="flex items-center justify-between gap-2 text-[11px] text-slate-600">
+          <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-[#2E524C]">
             <span>Tipe Sistem: {hlbCalc.emulsionType}</span>
             {onSendCalculatedPrompt && (
               <button
@@ -199,10 +201,10 @@ export default function InteractiveLabWidgets({
                     `Buatkan formula lengkap dengan sistem emulgator ${selectedPair.highName} ${hlbCalc.highDosagePct}% + ${selectedPair.lowName} ${hlbCalc.lowDosagePct}% (Target HLB ${hlbCalc.achievedHlb}).`
                   )
                 }
-                className="inline-flex items-center gap-1 font-bold text-[#234e42] hover:underline cursor-pointer shrink-0"
+                className="btn-glass-compact min-h-[44px] inline-flex items-center gap-1.5 px-3.5 py-2 rounded-full text-[11px] font-medium cursor-pointer shrink-0"
               >
                 <span>Gunakan Rasio Ini di Chat</span>
-                <ArrowRight className="w-3 h-3" />
+                <ArrowRight aria-hidden="true" className="w-3.5 h-3.5 text-[#0E807E]" />
               </button>
             )}
           </div>
@@ -210,12 +212,12 @@ export default function InteractiveLabWidgets({
       ) : (
         <div className="space-y-3 text-xs">
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-            <div className="bg-white p-2.5 rounded-xl border border-slate-200">
+            <div className="bg-white p-3 rounded-[12px] border border-[#0B2B26]/10">
               <div className="flex items-center justify-between mb-1">
-                <span className="text-[11px] font-semibold text-slate-600">
+                <span className="text-[11px] font-normal text-[#2E524C]">
                   Ukuran Batch:
                 </span>
-                <span className="font-mono font-bold text-emerald-700 tabular-nums">
+                <span className="font-mono font-medium text-[#0E807E] tabular-nums">
                   {batchGrams} g
                 </span>
               </div>
@@ -226,16 +228,16 @@ export default function InteractiveLabWidgets({
                 step="50"
                 value={batchGrams}
                 onChange={(e) => setBatchGrams(Number(e.target.value))}
-                className="w-full accent-[#234e42] cursor-pointer"
+                className="w-full accent-[#0E807E] cursor-pointer"
               />
             </div>
 
-            <div className="bg-white p-2.5 rounded-xl border border-slate-200">
+            <div className="bg-white p-3 rounded-[12px] border border-[#0B2B26]/10">
               <div className="flex items-center justify-between mb-1">
-                <span className="text-[11px] font-semibold text-slate-600">
+                <span className="text-[11px] font-normal text-[#2E524C]">
                   Bahan Aktif (%):
                 </span>
-                <span className="font-mono font-bold text-emerald-700 tabular-nums">
+                <span className="font-mono font-medium text-[#0E807E] tabular-nums">
                   {activeConcentrationPct.toFixed(1)}%
                 </span>
               </div>
@@ -248,16 +250,16 @@ export default function InteractiveLabWidgets({
                 onChange={(e) =>
                   setActiveConcentrationPct(parseFloat(e.target.value))
                 }
-                className="w-full accent-[#234e42] cursor-pointer"
+                className="w-full accent-[#0E807E] cursor-pointer"
               />
             </div>
 
-            <div className="bg-white p-2.5 rounded-xl border border-slate-200">
+            <div className="bg-white p-3 rounded-[12px] border border-[#0B2B26]/10">
               <div className="flex items-center justify-between mb-1">
-                <span className="text-[11px] font-semibold text-slate-600">
+                <span className="text-[11px] font-normal text-[#2E524C]">
                   Fase Minyak (%):
                 </span>
-                <span className="font-mono font-bold text-emerald-700 tabular-nums">
+                <span className="font-mono font-medium text-[#0E807E] tabular-nums">
                   {oilPhasePct.toFixed(1)}%
                 </span>
               </div>
@@ -268,33 +270,33 @@ export default function InteractiveLabWidgets({
                 step="1.0"
                 value={oilPhasePct}
                 onChange={(e) => setOilPhasePct(parseFloat(e.target.value))}
-                className="w-full accent-[#234e42] cursor-pointer"
+                className="w-full accent-[#0E807E] cursor-pointer"
               />
             </div>
           </div>
 
-          <div className="grid grid-cols-3 gap-2 bg-white p-3 rounded-xl border border-slate-200 font-mono">
+          <div className="grid grid-cols-3 gap-2 bg-white p-3.5 rounded-[12px] border border-[#0B2B26]/10">
             <div>
-              <span className="text-[10px] text-slate-400 uppercase block font-sans font-bold">
+              <span className="text-[10px] text-[#2E524C] uppercase block font-sans font-medium tracking-[0.06em]">
                 Fase Air ({waterPhasePct.toFixed(1)}%)
               </span>
-              <span className="text-sm font-bold text-slate-900 tabular-nums">
+              <span className="text-sm font-mono font-medium text-[#0B2B26] tabular-nums">
                 {waterWeightGrams} g
               </span>
             </div>
             <div>
-              <span className="text-[10px] text-slate-400 uppercase block font-sans font-bold">
+              <span className="text-[10px] text-[#2E524C] uppercase block font-sans font-medium tracking-[0.06em]">
                 Fase Minyak ({oilPhasePct.toFixed(1)}%)
               </span>
-              <span className="text-sm font-bold text-slate-900 tabular-nums">
+              <span className="text-sm font-mono font-medium text-[#0B2B26] tabular-nums">
                 {oilWeightGrams} g
               </span>
             </div>
             <div>
-              <span className="text-[10px] text-slate-400 uppercase block font-sans font-bold">
+              <span className="text-[10px] text-[#2E524C] uppercase block font-sans font-medium tracking-[0.06em]">
                 Bahan Aktif ({activeConcentrationPct.toFixed(1)}%)
               </span>
-              <span className="text-sm font-bold text-emerald-700 tabular-nums">
+              <span className="text-sm font-mono font-medium text-[#0E807E] tabular-nums">
                 {activeWeightGrams} g
               </span>
             </div>

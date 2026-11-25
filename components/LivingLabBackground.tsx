@@ -43,25 +43,25 @@ export default function LivingLabBackground({
     window.addEventListener("resize", handleResize, { passive: true });
     window.addEventListener("scroll", handleScroll, { passive: true });
 
-    const palette = ["#a4cf4a", "#00f5d4", "#38bdf8", "#2dd4bf"];
-    const nodes = Array.from({ length: 22 }, (_, idx) => ({
+    const palette = ["#3FC6C5", "#47C4A5", "#89D78C", "#82CB82"];
+    const nodes = Array.from({ length: 20 }, (_, idx) => ({
       x: ((idx * 239) % Math.max(width - 80, 600)) + 40,
       y: ((idx * 173) % Math.max(height - 80, 500)) + 40,
-      vx: ((idx % 5) - 2) * 0.16 || 0.14,
-      vy: ((idx % 7) - 3) * 0.14 || -0.12,
-      r: (idx % 3) + 3.0,
+      vx: ((idx % 5) - 2) * 0.14 || 0.12,
+      vy: ((idx % 7) - 3) * 0.12 || -0.1,
+      r: (idx % 3) + 2.0,
       color: palette[idx % palette.length],
     }));
 
-    const maxDist = 160;
+    const maxDist = 150;
     const maxDistSq = maxDist * maxDist;
 
     const drawFrame = () => {
       ctx.clearRect(0, 0, width, height);
 
-      // Batch connecting lines first with minimal state changes
-      ctx.lineWidth = 1.15;
-      ctx.strokeStyle = "rgba(0, 225, 195, 0.22)";
+      // Subtle clinical molecular lattice lines in Mint Teal
+      ctx.lineWidth = 0.85;
+      ctx.strokeStyle = "rgba(63, 198, 197, 0.16)";
       ctx.beginPath();
       for (let i = 0; i < nodes.length; i++) {
         const p = nodes[i];
@@ -78,7 +78,7 @@ export default function LivingLabBackground({
       }
       ctx.stroke();
 
-      // Update positions and draw nodes
+      // Update positions and draw subtle pastel clinical nodes
       for (let i = 0; i < nodes.length; i++) {
         const p = nodes[i];
         p.x += p.vx;
@@ -88,12 +88,12 @@ export default function LivingLabBackground({
         if (p.y < 0 || p.y > height) p.vy *= -1;
 
         ctx.fillStyle = p.color;
-        ctx.globalAlpha = 0.2;
+        ctx.globalAlpha = 0.12;
         ctx.beginPath();
-        ctx.arc(p.x, p.y, p.r * 2.2, 0, Math.PI * 2);
+        ctx.arc(p.x, p.y, p.r * 2.1, 0, Math.PI * 2);
         ctx.fill();
 
-        ctx.globalAlpha = 0.88;
+        ctx.globalAlpha = 0.35;
         ctx.beginPath();
         ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
         ctx.fill();
@@ -101,13 +101,11 @@ export default function LivingLabBackground({
       ctx.globalAlpha = 1;
     };
 
-    // Draw initial frame immediately
     drawFrame();
 
     let lastTime = 0;
     const loop = (now: number) => {
       animationFrameId = requestAnimationFrame(loop);
-      // Pause canvas redraws completely while user is actively scrolling or tab is hidden
       if (isScrolling || document.hidden) return;
       if (now - lastTime < 50) return;
       lastTime = now;
@@ -124,22 +122,19 @@ export default function LivingLabBackground({
     };
   }, [variant]);
 
-  const isObsidian = variant === "obsidian";
-
   return (
     <div
-      className="fixed inset-0 pointer-events-none z-0 overflow-hidden"
+      className="fixed inset-0 pointer-events-none z-0 overflow-hidden bg-[#f8fdfb]"
       style={{
         contain: "strict",
-        background: isObsidian
-          ? "radial-gradient(circle at 15% 15%, rgba(45, 212, 191, 0.14), transparent 45%), radial-gradient(circle at 85% 40%, rgba(16, 185, 129, 0.12), transparent 50%), linear-gradient(135deg, #071310 0%, #0c211b 50%, #081713 100%)"
-          : "radial-gradient(circle at 12% 12%, rgba(94, 234, 212, 0.28), transparent 42%), radial-gradient(circle at 88% 35%, rgba(52, 211, 153, 0.22), transparent 48%), radial-gradient(circle at 30% 88%, rgba(103, 232, 249, 0.2), transparent 45%), linear-gradient(135deg, #e6f7ec 0%, #d2f1dc 50%, #bde8cc 100%)",
+        background:
+          "radial-gradient(circle at 12% 14%, rgba(63, 198, 197, 0.10), transparent 44%), radial-gradient(circle at 88% 28%, rgba(137, 215, 140, 0.11), transparent 46%), radial-gradient(circle at 50% 92%, rgba(217, 237, 145, 0.10), transparent 45%), #f8fdfb",
       }}
       aria-hidden="true"
     >
-      {/* Architectural SVG isometric lab grid mesh */}
+      {/* Subtle architectural laboratory grid mesh on crisp Light canvas */}
       <svg
-        className="absolute inset-0 w-full h-full opacity-[0.2]"
+        className="absolute inset-0 w-full h-full opacity-[0.42]"
         xmlns="http://www.w3.org/2000/svg"
       >
         <defs>
@@ -152,16 +147,16 @@ export default function LivingLabBackground({
             <path
               d="M 56 0 L 0 0 0 56"
               fill="none"
-              stroke={isObsidian ? "#34d399" : "#164e41"}
+              stroke="#47C4A5"
               strokeWidth="0.6"
-              strokeOpacity="0.3"
+              strokeOpacity="0.18"
             />
             <circle
               cx="56"
               cy="56"
-              r="1.2"
-              fill={isObsidian ? "#34d399" : "#164e41"}
-              fillOpacity="0.35"
+              r="1.1"
+              fill="#3FC6C5"
+              fillOpacity="0.22"
             />
           </pattern>
         </defs>
