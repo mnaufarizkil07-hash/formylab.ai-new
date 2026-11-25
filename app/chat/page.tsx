@@ -74,10 +74,7 @@ import {
   saveStoredSessions,
 } from "../../lib/chatStorage";
 import { ACTIVE_USER_STORAGE_KEY, UserAccount } from "../../lib/auth";
-import {
-  LIVE_USER_LISTENING_PLACEHOLDER,
-  getScopedChatStorageKey,
-} from "../../components/liveVoiceHelpers";
+import { getScopedChatStorageKey } from "../../components/liveVoiceHelpers";
 
 export default function ChatPage() {
   const router = useRouter();
@@ -860,7 +857,6 @@ export default function ChatPage() {
       const trimmed = spokenText.trim();
       if (!turnId || !trimmed) return;
       const targetId = activeSessionIdRef.current;
-      const isPlaceholder = trimmed === LIVE_USER_LISTENING_PLACEHOLDER;
 
       // Stream directly into React state (ZERO localStorage I/O until turnComplete)
       setSessions((prev) =>
@@ -875,19 +871,17 @@ export default function ChatPage() {
               updatedMsgs.filter((m) => m.role === "user").length === 1;
             return {
               ...sess,
-              title:
-                !isPlaceholder && isOnlyUserMsg
-                  ? generateSessionTitle(trimmed, true, false)
-                  : sess.title,
+              title: isOnlyUserMsg
+                ? generateSessionTitle(trimmed, true, false)
+                : sess.title,
               messages: updatedMsgs,
             };
           }
           const isFirstUser =
             sess.messages.filter((m) => m.role === "user").length === 0;
-          const nextTitle =
-            !isPlaceholder && isFirstUser
-              ? generateSessionTitle(trimmed, true, false)
-              : sess.title;
+          const nextTitle = isFirstUser
+            ? generateSessionTitle(trimmed, true, false)
+            : sess.title;
           const userMsg: ChatMessage = {
             id: turnId,
             role: "user",

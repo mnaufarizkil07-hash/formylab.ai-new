@@ -6,12 +6,7 @@ import {
   Modality,
   StartSensitivity,
   Tool,
-  Type,
 } from "@google/genai";
-import {
-  CREATE_CHAT_NOTE_TOOL_DECLARATION,
-  CREATE_GOOGLE_DOC_TOOL_DECLARATION,
-} from "../../../components/chatNoteUtils";
 import {
   LiveVoiceName,
   buildLiveVoiceSystemInstruction,
@@ -19,8 +14,8 @@ import {
 
 /**
  * Native Audio Live models ordered for instant Vercel-compatible browser connections:
- * Gemini 2.5 Flash Native Audio models support Ephemeral Tokens, Google Search grounding,
- * responsive VAD, and `thinkingConfig: { thinkingBudget: 0 }` for sub-second TTFA.
+ * Gemini 2.5 Flash Native Audio models support Ephemeral Tokens, responsive Native Server VAD,
+ * `thinkingConfig: { thinkingBudget: 0 }`, and optional Google Search grounding.
  * `gemini-3.8-live` is included as a live audio fallback (without `thinkingConfig`).
  */
 const LIVE_NATIVE_AUDIO_MODELS = [
@@ -31,14 +26,14 @@ const LIVE_NATIVE_AUDIO_MODELS = [
 
 const ALLOWED_VOICES = new Set<LiveVoiceName>(["Aoede", "Zephyr"]);
 
-// Server VAD enabled with maximum sensitivity + non-destructive client `audioStreamEnd: true` flush
+// 100% Pure Native Server VAD (NO manual audioStreamEnd / activityStart / activityEnd)
 const SDK_SERVER_VAD_CONFIG = {
   automaticActivityDetection: {
     disabled: false,
     startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
     endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_HIGH,
     prefixPaddingMs: 100,
-    silenceDurationMs: 200,
+    silenceDurationMs: 250,
   },
   activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
 };
@@ -49,85 +44,13 @@ const WS_SERVER_VAD_CONFIG = {
     startOfSpeechSensitivity: "START_SENSITIVITY_HIGH",
     endOfSpeechSensitivity: "END_SENSITIVITY_HIGH",
     prefixPaddingMs: 100,
-    silenceDurationMs: 200,
+    silenceDurationMs: 250,
   },
   activityHandling: "START_OF_ACTIVITY_INTERRUPTS",
 };
 
-const SDK_ARTIFACT_FUNCTION_TOOL: Tool = {
-  functionDeclarations: [
-    {
-      name: CREATE_CHAT_NOTE_TOOL_DECLARATION.name,
-      description: CREATE_CHAT_NOTE_TOOL_DECLARATION.description,
-      parameters: {
-        type: Type.OBJECT,
-        properties: {
-          title: {
-            type: Type.STRING,
-            description:
-              CREATE_CHAT_NOTE_TOOL_DECLARATION.parameters.properties.title
-                .description,
-          },
-          format: {
-            type: Type.STRING,
-            enum: ["paragraph", "table", "mixed"],
-            description:
-              CREATE_CHAT_NOTE_TOOL_DECLARATION.parameters.properties.format
-                .description,
-          },
-          markdownContent: {
-            type: Type.STRING,
-            description:
-              CREATE_CHAT_NOTE_TOOL_DECLARATION.parameters.properties
-                .markdownContent.description,
-          },
-        },
-        required: ["title", "format", "markdownContent"],
-      },
-    },
-    {
-      name: CREATE_GOOGLE_DOC_TOOL_DECLARATION.name,
-      description: CREATE_GOOGLE_DOC_TOOL_DECLARATION.description,
-      parameters: {
-        type: Type.OBJECT,
-        properties: {
-          title: {
-            type: Type.STRING,
-            description:
-              CREATE_GOOGLE_DOC_TOOL_DECLARATION.parameters.properties.title
-                .description,
-          },
-          markdownContent: {
-            type: Type.STRING,
-            description:
-              CREATE_GOOGLE_DOC_TOOL_DECLARATION.parameters.properties
-                .markdownContent.description,
-          },
-        },
-        required: ["title", "markdownContent"],
-      },
-    },
-  ],
-};
-
-// Native Google Search grounding + Note/Google Docs tool declarations
-const SDK_HYBRID_LIVE_TOOLS: Tool[] = [
-  { googleSearch: {} },
-  SDK_ARTIFACT_FUNCTION_TOOL,
-];
-
+// ONLY attached when the user explicitly toggles Search ON (zero custom function declarations!)
 const SDK_SEARCH_ONLY_TOOLS: Tool[] = [{ googleSearch: {} }];
-
-const WS_HYBRID_LIVE_TOOLS = [
-  { googleSearch: {} },
-  {
-    functionDeclarations: [
-      CREATE_CHAT_NOTE_TOOL_DECLARATION,
-      CREATE_GOOGLE_DOC_TOOL_DECLARATION,
-    ],
-  },
-];
-
 const WS_SEARCH_ONLY_TOOLS = [{ googleSearch: {} }];
 
 export async function POST(req: NextRequest) {
@@ -146,8 +69,8 @@ export async function POST(req: NextRequest) {
 
     let recentContext = "";
     let requestedVoice: LiveVoiceName = "Aoede";
+    let enableSearch = false;
     let excludeModelSet = new Set<string>();
-    let searchOnlyTools = false;
     let disableThinkingConfig = false;
     let disableCustomVad = false;
 
@@ -162,6 +85,9 @@ export async function POST(req: NextRequest) {
       ) {
         requestedVoice = body.voiceName as LiveVoiceName;
       }
+      if (body?.enableSearch === true) {
+        enableSearch = true;
+      }
       if (Array.isArray(body?.excludeModels)) {
         const known = new Set<string>(LIVE_NATIVE_AUDIO_MODELS);
         excludeModelSet = new Set(
@@ -172,7 +98,6 @@ export async function POST(req: NextRequest) {
             )
         );
       }
-      if (body?.searchOnlyTools === true) searchOnlyTools = true;
       if (body?.disableThinkingConfig === true) disableThinkingConfig = true;
       if (body?.disableCustomVad === true) disableCustomVad = true;
     } catch {
@@ -194,7 +119,10 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const systemInstruction = buildLiveVoiceSystemInstruction(recentContext);
+    const systemInstruction = buildLiveVoiceSystemInstruction(
+      recentContext,
+      enableSearch
+    );
 
     const ai = new GoogleGenAI({
       apiKey,
@@ -231,70 +159,13 @@ export async function POST(req: NextRequest) {
       const thinkingPatch = supportsZeroThinkingBudget
         ? { thinkingConfig: { thinkingBudget: 0 } }
         : {};
-      const vadMode = "auto_stream_end" as const;
-      const wsRealtimeConfig = WS_SERVER_VAD_CONFIG;
       const vadPatch = disableCustomVad
         ? {}
         : { realtimeInputConfig: SDK_SERVER_VAD_CONFIG };
+      const sdkToolsPatch = enableSearch ? { tools: SDK_SEARCH_ONLY_TOOLS } : {};
+      const wsTools = enableSearch ? WS_SEARCH_ONLY_TOOLS : undefined;
 
-      // Tier 1: Constrained Ephemeral Token with Google Search + Artifact tools
-      if (!searchOnlyTools) {
-        try {
-          const tokenRes = await ai.authTokens.create({
-            config: {
-              uses: 1,
-              expireTime,
-              newSessionExpireTime,
-              liveConnectConstraints: {
-                model: modelId,
-                config: {
-                  responseModalities: [Modality.AUDIO],
-                  speechConfig: {
-                    voiceConfig: {
-                      prebuiltVoiceConfig: {
-                        voiceName: requestedVoice,
-                      },
-                    },
-                  },
-                  systemInstruction,
-                  tools: SDK_HYBRID_LIVE_TOOLS,
-                  inputAudioTranscription: {},
-                  outputAudioTranscription: {},
-                  ...thinkingPatch,
-                  ...vadPatch,
-                },
-              },
-            },
-          });
-
-          if (tokenRes?.name) {
-            return NextResponse.json({
-              success: true,
-              token: tokenRes.name,
-              model: modelId,
-              voiceName: requestedVoice,
-              systemInstruction,
-              tools: WS_HYBRID_LIVE_TOOLS,
-              thinkingConfig: supportsZeroThinkingBudget
-                ? { thinkingBudget: 0 }
-                : undefined,
-              realtimeInputConfig: disableCustomVad
-                ? undefined
-                : wsRealtimeConfig,
-              vadMode,
-              toolMode: "hybrid",
-              expireTime,
-              remainingCandidatesCount,
-            });
-          }
-        } catch (err: unknown) {
-          attemptErrors.push(
-            `[${modelId}:hybrid] ${err instanceof Error ? err.message : String(err)}`
-          );
-        }
-      }
-
-      // Tier 2: Constrained Ephemeral Token with pure Google Search grounding (`[{ googleSearch: {} }]`)
+      // Tier 1: Constrained Ephemeral Token with Pure Voice (default) or Google Search (when Search toggle ON)
       try {
         const tokenRes = await ai.authTokens.create({
           config: {
@@ -313,9 +184,9 @@ export async function POST(req: NextRequest) {
                   },
                 },
                 systemInstruction,
-                tools: SDK_SEARCH_ONLY_TOOLS,
                 inputAudioTranscription: {},
                 outputAudioTranscription: {},
+                ...sdkToolsPatch,
                 ...thinkingPatch,
                 ...vadPatch,
               },
@@ -329,27 +200,26 @@ export async function POST(req: NextRequest) {
             token: tokenRes.name,
             model: modelId,
             voiceName: requestedVoice,
+            enableSearch,
             systemInstruction,
-            tools: WS_SEARCH_ONLY_TOOLS,
+            ...(wsTools ? { tools: wsTools } : {}),
             thinkingConfig: supportsZeroThinkingBudget
               ? { thinkingBudget: 0 }
               : undefined,
             realtimeInputConfig: disableCustomVad
               ? undefined
-              : wsRealtimeConfig,
-            vadMode,
-            toolMode: "google_search",
+              : WS_SERVER_VAD_CONFIG,
             expireTime,
             remainingCandidatesCount,
           });
         }
       } catch (err: unknown) {
         attemptErrors.push(
-          `[${modelId}:search] ${err instanceof Error ? err.message : String(err)}`
+          `[${modelId}:${enableSearch ? "search" : "pure"}] ${err instanceof Error ? err.message : String(err)}`
         );
       }
 
-      // Tier 3: Model-only constrained token (client sends Live setup via ai.live.connect)
+      // Tier 2: Model-only constrained token (client sends Live setup via ai.live.connect)
       try {
         const tokenRes = await ai.authTokens.create({
           config: {
@@ -368,16 +238,15 @@ export async function POST(req: NextRequest) {
             token: tokenRes.name,
             model: modelId,
             voiceName: requestedVoice,
+            enableSearch,
             systemInstruction,
-            tools: WS_SEARCH_ONLY_TOOLS,
+            ...(wsTools ? { tools: wsTools } : {}),
             thinkingConfig: supportsZeroThinkingBudget
               ? { thinkingBudget: 0 }
               : undefined,
             realtimeInputConfig: disableCustomVad
               ? undefined
-              : wsRealtimeConfig,
-            vadMode,
-            toolMode: "google_search",
+              : WS_SERVER_VAD_CONFIG,
             expireTime,
             remainingCandidatesCount,
           });
