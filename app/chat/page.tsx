@@ -74,6 +74,7 @@ import {
   saveStoredSessions,
 } from "../../lib/chatStorage";
 import { ACTIVE_USER_STORAGE_KEY, UserAccount } from "../../lib/auth";
+import { getScopedChatStorageKey } from "../../components/liveVoiceHelpers";
 
 export default function ChatPage() {
   const router = useRouter();
@@ -106,6 +107,9 @@ export default function ChatPage() {
   const [messageSourcesMap, setMessageSourcesMap] = useState<
     Record<string, WebSourceCitation[]>
   >({});
+  const [messageGoogleSearchMap, setMessageGoogleSearchMap] = useState<
+    Record<string, boolean>
+  >({});
   const [errorMessage, setErrorMessage] = useState("");
 
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
@@ -120,6 +124,67 @@ export default function ChatPage() {
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const activeSessionIdRef = useRef<string>(activeSessionId);
   const selectedModelRef = useRef<AiModelId>(selectedModel);
+  const activeUserEmailRef = useRef<string | null>(null);
+
+  const persistSessions = useCallback((nextSessions: ChatSession[]) => {
+    const email = activeUserEmailRef.current;
+    if (!email) {
+      saveStoredSessions(nextSessions);
+      return;
+    }
+    const key = getScopedChatStorageKey("formylab_chat_sessions", email);
+    try {
+      localStorage.setItem(key, JSON.stringify(nextSessions));
+    } catch {
+      try {
+        const trimmed = nextSessions.map((sess) => ({
+          ...sess,
+          messages: sess.messages.map((m) => ({
+            ...m,
+            attachments: m.attachments?.map((att) => ({
+              ...att,
+              dataUrl: undefined,
+            })),
+          })),
+        }));
+        localStorage.setItem(key, JSON.stringify(trimmed));
+      } catch {
+        // Ignore storage quota errors
+      }
+    }
+  }, []);
+
+  const persistMessagePillars = useCallback(
+    (nextMap: Record<string, string[]>) => {
+      try {
+        const key = getScopedChatStorageKey(
+          "formylab_msg_pillars_v1",
+          activeUserEmailRef.current
+        );
+        const entries = Object.entries(nextMap).slice(-100);
+        localStorage.setItem(key, JSON.stringify(Object.fromEntries(entries)));
+      } catch {
+        // Ignore storage quota errors
+      }
+    },
+    []
+  );
+
+  const persistMessageGoogleSearch = useCallback(
+    (nextMap: Record<string, boolean>) => {
+      try {
+        const key = getScopedChatStorageKey(
+          "formylab_msg_gsearch_v1",
+          activeUserEmailRef.current
+        );
+        const entries = Object.entries(nextMap).slice(-100);
+        localStorage.setItem(key, JSON.stringify(Object.fromEntries(entries)));
+      } catch {
+        // Ignore storage quota errors
+      }
+    },
+    []
+  );
 
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
@@ -138,10 +203,14 @@ export default function ChatPage() {
 
   useEffect(() => {
     queueMicrotask(() => {
+      let resolvedEmail: string | null = null;
       try {
         const rawUser = localStorage.getItem(ACTIVE_USER_STORAGE_KEY);
         if (rawUser) {
           const parsedUser = JSON.parse(rawUser) as Partial<UserAccount>;
+          if (parsedUser.email && parsedUser.email.trim()) {
+            resolvedEmail = parsedUser.email.trim().toLowerCase();
+          }
           if (parsedUser.name && parsedUser.name.trim()) {
             setUserName(parsedUser.name.trim());
           } else if (parsedUser.email) {
@@ -153,14 +222,36 @@ export default function ChatPage() {
         // fallback to default name
       }
 
-      const stored = getStoredSessions();
-      if (stored.length > 0) {
-        setSessions(stored);
-        setActiveSessionId(stored[0].id);
-        setSelectedModel(getModelOption(stored[0].model).id);
+      activeUserEmailRef.current = resolvedEmail;
+
+      let loadedSessions: ChatSession[] = [];
+      if (resolvedEmail) {
+        try {
+          const scopedKey = getScopedChatStorageKey(
+            "formylab_chat_sessions",
+            resolvedEmail
+          );
+          const rawScoped = localStorage.getItem(scopedKey);
+          if (rawScoped) {
+            const parsed = JSON.parse(rawScoped);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              loadedSessions = parsed as ChatSession[];
+            }
+          }
+        } catch {
+          // Ignore malformed scoped cache
+        }
+      } else {
+        loadedSessions = getStoredSessions();
+      }
+
+      if (loadedSessions.length > 0) {
+        setSessions(loadedSessions);
+        setActiveSessionId(loadedSessions[0].id);
+        setSelectedModel(getModelOption(loadedSessions[0].model).id);
       } else {
         const def = createDefaultSession();
-        saveStoredSessions([def]);
+        persistSessions([def]);
         setSessions([def]);
         setActiveSessionId(def.id);
       }
@@ -169,7 +260,15 @@ export default function ChatPage() {
       setIsDriveConnected(isGoogleDriveConnected());
 
       try {
-        const rawSources = localStorage.getItem("formylab_msg_sources_v1");
+        const sourcesKey = getScopedChatStorageKey(
+          "formylab_msg_sources_v1",
+          resolvedEmail
+        );
+        const rawSources =
+          localStorage.getItem(sourcesKey) ||
+          (!resolvedEmail
+            ? localStorage.getItem("formylab_msg_sources_v1")
+            : null);
         if (rawSources) {
           const parsed = JSON.parse(rawSources) as Record<string, unknown>;
           if (parsed && typeof parsed === "object") {
@@ -192,6 +291,59 @@ export default function ChatPage() {
       } catch {
         // Ignore malformed source cache
       }
+
+      try {
+        const pillarsKey = getScopedChatStorageKey(
+          "formylab_msg_pillars_v1",
+          resolvedEmail
+        );
+        const rawPillars = localStorage.getItem(pillarsKey);
+        if (rawPillars) {
+          const parsed = JSON.parse(rawPillars) as Record<string, unknown>;
+          if (parsed && typeof parsed === "object") {
+            const restored: Record<string, string[]> = {};
+            for (const [msgKey, val] of Object.entries(parsed)) {
+              if (Array.isArray(val)) {
+                const clean = val.filter(
+                  (item): item is string => typeof item === "string" && item.trim().length > 0
+                );
+                if (clean.length > 0) {
+                  restored[msgKey] = clean;
+                }
+              }
+            }
+            if (Object.keys(restored).length > 0) {
+              setMessagePillarsMap(restored);
+            }
+          }
+        }
+      } catch {
+        // Ignore malformed pillars cache
+      }
+
+      try {
+        const gsearchKey = getScopedChatStorageKey(
+          "formylab_msg_gsearch_v1",
+          resolvedEmail
+        );
+        const rawGsearch = localStorage.getItem(gsearchKey);
+        if (rawGsearch) {
+          const parsed = JSON.parse(rawGsearch) as Record<string, unknown>;
+          if (parsed && typeof parsed === "object") {
+            const restored: Record<string, boolean> = {};
+            for (const [msgKey, val] of Object.entries(parsed)) {
+              if (val === true) {
+                restored[msgKey] = true;
+              }
+            }
+            if (Object.keys(restored).length > 0) {
+              setMessageGoogleSearchMap(restored);
+            }
+          }
+        }
+      } catch {
+        // Ignore malformed Google Search cache
+      }
     });
 
     const unsubscribeDrive = subscribeGoogleDriveAuth((snapshot) => {
@@ -202,7 +354,7 @@ export default function ChatPage() {
     return () => {
       unsubscribeDrive();
     };
-  }, []);
+  }, [persistSessions]);
 
   const dynamicGreetings = [
     `Halo, ${userName}! Mulai dari mana kita hari ini?`,
@@ -260,7 +412,7 @@ export default function ChatPage() {
         s.id === activeSession.id ? { ...s, model } : s
       );
       setSessions(updated);
-      saveStoredSessions(updated);
+      persistSessions(updated);
     }
   };
 
@@ -271,7 +423,7 @@ export default function ChatPage() {
     const updated = [newSession, ...sessions];
     setSessions(updated);
     setActiveSessionId(newSession.id);
-    saveStoredSessions(updated);
+    persistSessions(updated);
     setGreetingIndex((prev) => (prev + 1) % dynamicGreetings.length);
   };
 
@@ -292,13 +444,13 @@ export default function ChatPage() {
       const def = createDefaultSession();
       setSessions([def]);
       setActiveSessionId(def.id);
-      saveStoredSessions([def]);
+      persistSessions([def]);
     } else {
       setSessions(filtered);
       if (activeSessionId === id) {
         setActiveSessionId(filtered[0].id);
       }
-      saveStoredSessions(filtered);
+      persistSessions(filtered);
     }
   };
 
@@ -315,7 +467,7 @@ export default function ChatPage() {
       s.id === sessId ? { ...s, title: editingTitle.trim() } : s
     );
     setSessions(updated);
-    saveStoredSessions(updated);
+    persistSessions(updated);
     setEditingSessionId(null);
   };
 
@@ -404,7 +556,7 @@ export default function ChatPage() {
     );
 
     setSessions(updatedSessions);
-    saveStoredSessions(updatedSessions);
+    persistSessions(updatedSessions);
     setLoadingMode(effectiveMode);
     setIsLoading(true);
 
@@ -531,10 +683,14 @@ export default function ChatPage() {
         };
 
         if (Array.isArray(data.activePillars) && data.activePillars.length > 0) {
-          setMessagePillarsMap((prev) => ({
-            ...prev,
-            [botMsgId]: data.activePillars as string[],
-          }));
+          setMessagePillarsMap((prev) => {
+            const next = {
+              ...prev,
+              [botMsgId]: data.activePillars as string[],
+            };
+            persistMessagePillars(next);
+            return next;
+          });
         }
 
         const returnedSources: WebSourceCitation[] = Array.isArray(data.sources)
@@ -589,7 +745,7 @@ export default function ChatPage() {
         );
 
         setSessions(finalSessions);
-        saveStoredSessions(finalSessions);
+        persistSessions(finalSessions);
 
         const returnedReplyAudio: VoiceCallReplyAudio | null =
           isVoiceCall &&
@@ -636,7 +792,7 @@ export default function ChatPage() {
         );
 
         setSessions(finalSessions);
-        saveStoredSessions(finalSessions);
+        persistSessions(finalSessions);
         setErrorMessage(data.error || "Gagal mendapatkan balasan dari AI.");
         return { reply: technicalErrorText };
       }
@@ -660,7 +816,7 @@ export default function ChatPage() {
       );
 
       setSessions(finalSessions);
-      saveStoredSessions(finalSessions);
+      persistSessions(finalSessions);
       setErrorMessage(networkErrorDetail);
       return { reply: null };
     } finally {
@@ -686,26 +842,6 @@ export default function ChatPage() {
     return res.reply;
   };
 
-  const handleSendSpokenPromptInCall = async (
-    spokenText: string
-  ): Promise<VoiceCallTurnResult> => {
-    return executeChatTurn(spokenText, [], {
-      interactionMode: "voice_call",
-      voiceCallMode: true,
-    });
-  };
-
-  const handleSendSpokenAudioInCall = async (audio: {
-    base64: string;
-    mimeType: string;
-  }): Promise<VoiceCallTurnResult> => {
-    return executeChatTurn("", [], {
-      interactionMode: "voice_call",
-      voiceCallMode: true,
-      audio,
-    });
-  };
-
   const handleStartVoiceCall = useCallback(() => {
     setIsVoiceMicMuted(false);
     setIsVoiceCallOpen(true);
@@ -716,40 +852,58 @@ export default function ChatPage() {
     setIsVoiceMicMuted(false);
   }, []);
 
-  const handleLiveUserTurn = useCallback((spokenText: string) => {
-    const trimmed = spokenText.trim();
-    if (!trimmed) return;
-    const targetId = activeSessionIdRef.current;
+  const handleLiveUserStream = useCallback(
+    (turnId: string, spokenText: string) => {
+      const trimmed = spokenText.trim();
+      if (!turnId || !trimmed) return;
+      const targetId = activeSessionIdRef.current;
 
-    setSessions((prev) => {
-      const next = prev.map((sess) => {
-        if (sess.id !== targetId) return sess;
-        const isFirstUser =
-          sess.messages.filter((m) => m.role === "user").length === 0;
-        const nextTitle = isFirstUser
-          ? generateSessionTitle(trimmed, true, false)
-          : sess.title;
-        const userMsg: ChatMessage = {
-          id: generateUniqueId("live-u"),
-          role: "user",
-          content: trimmed,
-          timestamp: "Suara",
-        };
-        return {
-          ...sess,
-          title: nextTitle,
-          messages: [...sess.messages, userMsg],
-        };
+      setSessions((prev) => {
+        const next = prev.map((sess) => {
+          if (sess.id !== targetId) return sess;
+          const existingIdx = sess.messages.findIndex((m) => m.id === turnId);
+          if (existingIdx !== -1) {
+            const updatedMsgs = sess.messages.map((m, i) =>
+              i === existingIdx ? { ...m, content: trimmed } : m
+            );
+            const isOnlyUserMsg =
+              updatedMsgs.filter((m) => m.role === "user").length === 1;
+            return {
+              ...sess,
+              title: isOnlyUserMsg
+                ? generateSessionTitle(trimmed, true, false)
+                : sess.title,
+              messages: updatedMsgs,
+            };
+          }
+          const isFirstUser =
+            sess.messages.filter((m) => m.role === "user").length === 0;
+          const nextTitle = isFirstUser
+            ? generateSessionTitle(trimmed, true, false)
+            : sess.title;
+          const userMsg: ChatMessage = {
+            id: turnId,
+            role: "user",
+            content: trimmed,
+            timestamp: "Suara",
+          };
+          return {
+            ...sess,
+            title: nextTitle,
+            messages: [...sess.messages, userMsg],
+          };
+        });
+        persistSessions(next);
+        return next;
       });
-      saveStoredSessions(next);
-      return next;
-    });
-  }, []);
+    },
+    [persistSessions]
+  );
 
   const handleLiveAssistantStream = useCallback(
     (turnId: string, text: string) => {
       const trimmed = text.trim();
-      if (!trimmed) return;
+      if (!turnId || !trimmed) return;
       const targetId = activeSessionIdRef.current;
       const modelBadge = selectedModelRef.current;
 
@@ -775,44 +929,102 @@ export default function ChatPage() {
             messages: [...sess.messages, aiMsg],
           };
         });
-        saveStoredSessions(next);
+        persistSessions(next);
         return next;
       });
     },
-    []
+    [persistSessions]
   );
 
-  const handleCreateChatNote = useCallback((note: ChatNoteArtifact) => {
-    const normalized = normalizeChatNoteArtifact(note);
-    if (!normalized) return;
-    const targetId = activeSessionIdRef.current;
-    const modelBadge = selectedModelRef.current;
+  const handleLiveTurnComplete = useCallback(
+    (payload: {
+      userTurnId?: string;
+      userText?: string;
+      assistantTurnId?: string;
+      assistantText?: string;
+      activePillars: string[];
+      usedGoogleSearch: boolean;
+    }) => {
+      if (payload.userTurnId && payload.userText?.trim()) {
+        handleLiveUserStream(payload.userTurnId, payload.userText);
+      }
+      if (payload.assistantTurnId && payload.assistantText?.trim()) {
+        handleLiveAssistantStream(
+          payload.assistantTurnId,
+          payload.assistantText
+        );
+      }
+      if (payload.assistantTurnId) {
+        const msgId = payload.assistantTurnId;
+        if (payload.activePillars.length > 0) {
+          setMessagePillarsMap((prev) => {
+            const next = { ...prev, [msgId]: payload.activePillars };
+            persistMessagePillars(next);
+            return next;
+          });
+        }
+        if (payload.usedGoogleSearch) {
+          setMessageGoogleSearchMap((prev) => {
+            if (prev[msgId]) return prev;
+            const next = { ...prev, [msgId]: true };
+            persistMessageGoogleSearch(next);
+            return next;
+          });
+        }
+      }
+    },
+    [
+      handleLiveAssistantStream,
+      handleLiveUserStream,
+      persistMessageGoogleSearch,
+      persistMessagePillars,
+    ]
+  );
 
-    setSessions((prev) => {
-      const next = prev.map((sess) => {
-        if (sess.id !== targetId) return sess;
-        const noteMsg: ChatMessage = {
-          id: generateUniqueId("note"),
-          role: "assistant",
-          content: encodeChatNoteMessage(normalized),
-          modelBadge,
-          timestamp: "Catatan",
-        };
-        return {
-          ...sess,
-          messages: [...sess.messages, noteMsg],
-        };
+  const handleCreateChatNote = useCallback(
+    (note: ChatNoteArtifact) => {
+      const normalized = normalizeChatNoteArtifact(note);
+      if (!normalized) return;
+      const targetId = activeSessionIdRef.current;
+      const modelBadge = selectedModelRef.current;
+
+      setSessions((prev) => {
+        const next = prev.map((sess) => {
+          if (sess.id !== targetId) return sess;
+          const noteMsg: ChatMessage = {
+            id: generateUniqueId("note"),
+            role: "assistant",
+            content: encodeChatNoteMessage(normalized),
+            modelBadge,
+            timestamp: "Catatan",
+          };
+          return {
+            ...sess,
+            messages: [...sess.messages, noteMsg],
+          };
+        });
+        persistSessions(next);
+        return next;
       });
-      saveStoredSessions(next);
-      return next;
-    });
-  }, []);
+    },
+    [persistSessions]
+  );
 
   const attachWebSourcesToMessage = useCallback(
     (msgId: string, incomingSources: WebSourceCitation[]) => {
-      if (!msgId || !Array.isArray(incomingSources) || incomingSources.length === 0) {
+      if (
+        !msgId ||
+        !Array.isArray(incomingSources) ||
+        incomingSources.length === 0
+      ) {
         return;
       }
+      setMessageGoogleSearchMap((prev) => {
+        if (prev[msgId]) return prev;
+        const next = { ...prev, [msgId]: true };
+        persistMessageGoogleSearch(next);
+        return next;
+      });
       setMessageSourcesMap((prev) => {
         const merged = mergeUniqueWebSources(
           prev[msgId] || [],
@@ -822,10 +1034,13 @@ export default function ChatPage() {
         if (merged.length === 0) return prev;
         const next = { ...prev, [msgId]: merged };
         try {
-          // Keep latest 80 grounded message records in localStorage
           const entries = Object.entries(next).slice(-80);
-          localStorage.setItem(
+          const sourcesKey = getScopedChatStorageKey(
             "formylab_msg_sources_v1",
+            activeUserEmailRef.current
+          );
+          localStorage.setItem(
+            sourcesKey,
             JSON.stringify(Object.fromEntries(entries))
           );
         } catch {
@@ -834,34 +1049,37 @@ export default function ChatPage() {
         return next;
       });
     },
-    []
+    [persistMessageGoogleSearch]
   );
 
-  const handleCreateGoogleDoc = useCallback((doc: GoogleDocArtifact) => {
-    const normalized = normalizeGoogleDocArtifact(doc);
-    if (!normalized) return;
-    const targetId = activeSessionIdRef.current;
-    const modelBadge = selectedModelRef.current;
+  const handleCreateGoogleDoc = useCallback(
+    (doc: GoogleDocArtifact) => {
+      const normalized = normalizeGoogleDocArtifact(doc);
+      if (!normalized) return;
+      const targetId = activeSessionIdRef.current;
+      const modelBadge = selectedModelRef.current;
 
-    setSessions((prev) => {
-      const next = prev.map((sess) => {
-        if (sess.id !== targetId) return sess;
-        const gdocMsg: ChatMessage = {
-          id: generateUniqueId("gdoc"),
-          role: "assistant",
-          content: encodeGoogleDocMessage(normalized),
-          modelBadge,
-          timestamp: "Google Docs",
-        };
-        return {
-          ...sess,
-          messages: [...sess.messages, gdocMsg],
-        };
+      setSessions((prev) => {
+        const next = prev.map((sess) => {
+          if (sess.id !== targetId) return sess;
+          const gdocMsg: ChatMessage = {
+            id: generateUniqueId("gdoc"),
+            role: "assistant",
+            content: encodeGoogleDocMessage(normalized),
+            modelBadge,
+            timestamp: "Google Docs",
+          };
+          return {
+            ...sess,
+            messages: [...sess.messages, gdocMsg],
+          };
+        });
+        persistSessions(next);
+        return next;
       });
-      saveStoredSessions(next);
-      return next;
-    });
-  }, []);
+    },
+    [persistSessions]
+  );
 
   const handleUpdateGoogleDocMessage = useCallback(
     (msgId: string, updatedDoc: GoogleDocArtifact) => {
@@ -879,11 +1097,11 @@ export default function ChatPage() {
             ),
           };
         });
-        saveStoredSessions(next);
+        persistSessions(next);
         return next;
       });
     },
-    []
+    [persistSessions]
   );
 
   const handleToggleGoogleDrive = useCallback(async () => {
@@ -1308,7 +1526,7 @@ export default function ChatPage() {
                       s.id === refreshed.id ? cleaned : s
                     );
                     setSessions(updated);
-                    saveStoredSessions(updated);
+                    persistSessions(updated);
                   }
                 }}
                 className="btn-glass-danger min-h-[44px] text-xs px-3.5 py-1.5 cursor-pointer whitespace-nowrap"
@@ -1385,7 +1603,7 @@ export default function ChatPage() {
             >
               <div
                 className={`max-w-3xl lg:max-w-4xl mx-auto w-full space-y-6 ${
-                  isVoiceCallOpen ? "pb-36 sm:pb-40" : "pb-4"
+                  isVoiceCallOpen ? "pb-48 sm:pb-52" : "pb-4"
                 }`}
               >
                 {conversationMessages.length === 0 && isVoiceCallOpen && (
@@ -1556,37 +1774,38 @@ export default function ChatPage() {
 
                         <FormattedChatText content={msg.content} tone="light" />
 
-                        {messageSourcesMap[msg.id] &&
-                          messageSourcesMap[msg.id].length > 0 && (
-                            <div
-                              className="mt-3 pt-2.5 border-t border-[#0B2B26]/8 flex flex-wrap items-center gap-1.5"
-                              aria-label="Sumber verifikasi internet"
-                            >
-                              <span className="inline-flex items-center gap-1 text-[10.5px] font-medium text-[#2E524C]/80 mr-0.5">
-                                <Globe
-                                  className="w-3 h-3 text-[#0E807E]"
+                        {(messageGoogleSearchMap[msg.id] ||
+                          (messageSourcesMap[msg.id] &&
+                            messageSourcesMap[msg.id].length > 0)) && (
+                          <div
+                            className="mt-3 pt-2.5 border-t border-[#0B2B26]/8 flex flex-wrap items-center gap-1.5"
+                            aria-label="Sumber verifikasi internet"
+                          >
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10.5px] font-medium bg-[#eaf8f5] text-[#0E807E] border border-[#0E807E]/20 mr-0.5">
+                              <Globe
+                                className="w-3 h-3 text-[#0E807E]"
+                                aria-hidden="true"
+                              />
+                              <span>Google Search</span>
+                            </span>
+                            {messageSourcesMap[msg.id]?.map((src, sIdx) => (
+                              <a
+                                key={`${src.url}-${sIdx}`}
+                                href={src.url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                title={src.title}
+                                className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-medium text-[#0B2B26] hover:text-[#0E807E] bg-white/75 hover:bg-white border border-[#0B2B26]/12 hover:border-[#0E807E]/35 backdrop-blur-md shadow-[inset_0_1px_1px_rgba(255,255,255,0.9)] transition-all max-w-[200px]"
+                              >
+                                <span className="truncate">{src.domain}</span>
+                                <ExternalLink
+                                  className="w-2.5 h-2.5 text-[#0E807E] shrink-0"
                                   aria-hidden="true"
                                 />
-                                <span>Sumber:</span>
-                              </span>
-                              {messageSourcesMap[msg.id].map((src, sIdx) => (
-                                <a
-                                  key={`${src.url}-${sIdx}`}
-                                  href={src.url}
-                                  target="_blank"
-                                  rel="noopener noreferrer"
-                                  title={src.title}
-                                  className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-medium text-[#0B2B26] hover:text-[#0E807E] bg-white/75 hover:bg-white border border-[#0B2B26]/12 hover:border-[#0E807E]/35 backdrop-blur-md shadow-[inset_0_1px_1px_rgba(255,255,255,0.9)] transition-all max-w-[200px]"
-                                >
-                                  <span className="truncate">{src.domain}</span>
-                                  <ExternalLink
-                                    className="w-2.5 h-2.5 text-[#0E807E] shrink-0"
-                                    aria-hidden="true"
-                                  />
-                                </a>
-                              ))}
-                            </div>
-                          )}
+                              </a>
+                            ))}
+                          </div>
+                        )}
 
                         <InteractiveMessageActions
                           messageId={msg.id}
@@ -1655,10 +1874,9 @@ export default function ChatPage() {
                     modelName={activeModelOption.name}
                     isAiThinking={isLoading}
                     latestAiReply={latestAiContextSnippet}
-                    onSendSpokenPrompt={handleSendSpokenPromptInCall}
-                    onSendSpokenAudio={handleSendSpokenAudioInCall}
-                    onLiveUserTurn={handleLiveUserTurn}
+                    onLiveUserStream={handleLiveUserStream}
                     onLiveAssistantStream={handleLiveAssistantStream}
+                    onLiveTurnComplete={handleLiveTurnComplete}
                     onLiveWebSources={attachWebSourcesToMessage}
                     onCreateChatNote={handleCreateChatNote}
                     onCreateGoogleDoc={handleCreateGoogleDoc}

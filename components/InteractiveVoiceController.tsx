@@ -1,7 +1,25 @@
 "use client";
 
 import React, { useEffect, useState, useRef, useCallback } from "react";
-import { Volume2, VolumeX, Square, Play, Pause } from "lucide-react";
+import {
+  Volume2,
+  VolumeX,
+  Square,
+  Play,
+  Pause,
+  Globe,
+  Loader2,
+  RefreshCw,
+  AlertCircle,
+} from "lucide-react";
+import {
+  GoogleGenAI,
+  Modality,
+  type LiveConnectConfig,
+  type LiveServerMessage,
+  type Session,
+  type Tool,
+} from "@google/genai";
 import { cleanMarkdownForSpeech } from "../lib/interactiveAiEngine";
 import {
   ChatNoteArtifact,
@@ -11,8 +29,20 @@ import {
   mergeUniqueWebSources,
   normalizeChatNoteArtifact,
   normalizeGoogleDocArtifact,
-  normalizeWebSourceCitation,
 } from "./chatNoteUtils";
+import {
+  LIVE_STATUS_LABELS,
+  LIVE_VOICE_OPTIONS,
+  LiveConnectionStatus,
+  LiveVoiceName,
+  base64PcmToFloat32,
+  classifyLiveVoicePillars,
+  downsampleFloat32ToInt16Pcm,
+  formatLiveConnectionError,
+  hasGoogleSearchGrounding,
+  int16PcmToBase64,
+  parsePcmSampleRate,
+} from "./liveVoiceHelpers";
 
 export interface VoiceSynthesisState {
   autoSpeakEnabled: boolean;
@@ -692,41 +722,40 @@ type LivingOrbPhase = "listening" | "thinking" | "speaking";
 interface InteractiveVoiceCallOverlayProps {
   isOpen: boolean;
   onClose: () => void;
-  voice: VoiceSynthesisState;
+  voice?: VoiceSynthesisState;
   isMicMuted?: boolean;
   recentChatContext?: string;
-  onSendSpokenPrompt: (
-    spokenText: string
-  ) => Promise<string | null | VoiceCallTurnPayload>;
-  onSendSpokenAudio?: (audio: {
-    base64: string;
-    mimeType: string;
-  }) => Promise<VoiceCallTurnPayload>;
-  onLiveUserTurn?: (text: string) => void;
+  onLiveUserStream?: (turnId: string, text: string) => void;
   onLiveAssistantStream?: (turnId: string, text: string) => void;
+  onLiveTurnComplete?: (payload: {
+    userTurnId?: string;
+    userText?: string;
+    assistantTurnId?: string;
+    assistantText?: string;
+    activePillars: string[];
+    usedGoogleSearch: boolean;
+  }) => void;
   onLiveWebSources?: (turnId: string, sources: WebSourceCitation[]) => void;
   onCreateChatNote?: (note: ChatNoteArtifact) => void;
   onCreateGoogleDoc?: (doc: GoogleDocArtifact) => void;
 }
 
-interface LiveSessionConfigResponse {
+interface LiveTokenApiResponse {
   success?: boolean;
-  fallbackMode?: boolean;
   token?: string;
   model?: string;
-  voiceName?: string;
+  voiceName?: LiveVoiceName;
   systemInstruction?: string;
-  tools?: unknown[];
-  realtimeInputConfig?: Record<string, unknown>;
-  wsUrl?: string;
-  lockedConfig?: boolean;
-  searchMode?: "hybrid" | "function_tool" | "none";
+  tools?: Tool[];
+  thinkingConfig?: LiveConnectConfig["thinkingConfig"];
+  realtimeInputConfig?: LiveConnectConfig["realtimeInputConfig"];
+  toolMode?: "hybrid" | "search_only";
   remainingCandidatesCount?: number;
-  reason?: string;
+  error?: string;
 }
 
-const LIVE_TRANSCRIPT_THROTTLE_MS = 100;
-const LIVE_FALLBACK_LOOKAHEAD_SEC = 0.02;
+const LIVE_TRANSCRIPT_THROTTLE_MS = 90;
+const LIVE_FIRST_CHUNK_LEAD_SEC = 0.02;
 
 // Short-lived in-memory cooldown for models that failed WS setup (e.g., quota 1011)
 // so subsequent voice sessions connect on the first attempt without extra round-trip latency.
@@ -752,12 +781,12 @@ function getRecentlyFailedLiveModels(): string[] {
  * and emits ultra-low-latency 30ms packets (480 samples @ 16kHz) for near-instant turn-taking.
  */
 const PCM_CAPTURE_WORKLET_CODE = `
-class FormylabPcmCaptureProcessor extends AudioWorkletProcessor {
+class FormylabLivePcmCaptureProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
     this._targetRate = 16000;
     this._ratio = Math.max(0.25, sampleRate / this._targetRate);
-    this._packetSamples = 480; // 30ms @ 16kHz (ultra-low-latency 20-40ms streaming window)
+    this._packetSamples = 480; // 30ms @ 16kHz (within 20-40ms low-latency window)
     this._out = new Int16Array(this._packetSamples);
     this._outIndex = 0;
     this._phase = 0;
@@ -811,334 +840,8 @@ class FormylabPcmCaptureProcessor extends AudioWorkletProcessor {
     return true;
   }
 }
-registerProcessor("formylab-pcm-capture-processor", FormylabPcmCaptureProcessor);
+registerProcessor("formylab-live-pcm-capture", FormylabLivePcmCaptureProcessor);
 `;
-
-/**
- * Ultra-Smooth 24kHz Ring Buffer Playback AudioWorklet:
- * - 10-second circular Float32 ring buffer (eliminates micro-gaps between chunks)
- * - Adaptive ~180ms jitter pre-buffer on new AI turn (absorbs network jitter cleanly)
- * - 5ms micro cross-fade / soft ramp on start, underrun, and barge-in clear (zero clicks/pops)
- */
-const PCM_PLAYBACK_WORKLET_CODE = `
-class FormylabPcmRingPlayerProcessor extends AudioWorkletProcessor {
-  constructor() {
-    super();
-    this._capacity = Math.max(24000 * 10, Math.ceil(sampleRate * 10));
-    this._buffer = new Float32Array(this._capacity);
-    this._readIdx = 0;
-    this._writeIdx = 0;
-    this._available = 0;
-
-    this._initialPrebufferSamples = Math.max(128, Math.round(sampleRate * 0.02)); // 20ms instant first-chunk playback
-    this._prebufferSamples = this._initialPrebufferSamples;
-    this._rebufferSamples = Math.round(sampleRate * 0.06);  // 60ms recovery pre-buffer only on mid-stream underrun
-    this._fadeSamples = Math.max(16, Math.round(sampleRate * 0.003)); // 3ms crisp click-free ramp
-
-    this._isPlaying = false;
-    this._turnComplete = true;
-    this._fadeInRemaining = 0;
-    this._fadeOutRemaining = 0;
-    this._clearAfterFadeOut = false;
-    this._lastSample = 0;
-
-    this.port.onmessage = (event) => {
-      const msg = event.data;
-      if (!msg || typeof msg !== "object") return;
-
-      if (msg.type === "clear") {
-        // Trigger 3ms soft ramp-out before flushing ring buffer for instant barge-in with zero click
-        if (this._isPlaying && this._available > 0) {
-          this._fadeOutRemaining = this._fadeSamples;
-          this._clearAfterFadeOut = true;
-        } else {
-          this._resetBuffer();
-        }
-        return;
-      }
-
-      if (msg.type === "turnComplete") {
-        this._turnComplete = true;
-        this._prebufferSamples = this._initialPrebufferSamples;
-        // Release short utterances immediately when server finishes turn
-        if (!this._isPlaying && this._available > 0 && !this._clearAfterFadeOut) {
-          this._isPlaying = true;
-          this._fadeInRemaining = this._fadeSamples;
-        } else if (!this._isPlaying && this._available === 0) {
-          this.port.postMessage({ type: "drained" });
-        }
-        return;
-      }
-
-      if (msg.type === "push" && msg.samples instanceof Float32Array) {
-        const chunk = msg.samples;
-        if (chunk.length === 0) return;
-
-        // If a previous clear fade was finishing, finish clearing cleanly for the new turn
-        if (this._clearAfterFadeOut) {
-          this._resetBuffer();
-        }
-        this._turnComplete = false;
-
-        // Prevent overflow: if incoming exceeds free space, advance read pointer cleanly
-        if (chunk.length > this._capacity - this._available) {
-          const drop = chunk.length - (this._capacity - this._available);
-          this._readIdx = (this._readIdx + drop) % this._capacity;
-          this._available = Math.max(0, this._available - drop);
-        }
-
-        const firstPart = Math.min(chunk.length, this._capacity - this._writeIdx);
-        this._buffer.set(chunk.subarray(0, firstPart), this._writeIdx);
-        const remaining = chunk.length - firstPart;
-        if (remaining > 0) {
-          this._buffer.set(chunk.subarray(firstPart), 0);
-        }
-        this._writeIdx = (this._writeIdx + chunk.length) % this._capacity;
-        this._available += chunk.length;
-
-        if (!this._isPlaying && this._available >= this._prebufferSamples) {
-          this._isPlaying = true;
-          this._fadeInRemaining = this._fadeSamples;
-        }
-      }
-    };
-  }
-
-  _resetBuffer() {
-    this._readIdx = 0;
-    this._writeIdx = 0;
-    this._available = 0;
-    this._prebufferSamples = this._initialPrebufferSamples;
-    this._isPlaying = false;
-    this._turnComplete = true;
-    this._fadeInRemaining = 0;
-    this._fadeOutRemaining = 0;
-    this._clearAfterFadeOut = false;
-    this._lastSample = 0;
-  }
-
-  process(_inputs, outputs) {
-    const output = outputs[0];
-    if (!output || !output[0]) return true;
-    const outCh = output[0];
-    const frames = outCh.length;
-
-    if (!this._isPlaying && this._fadeOutRemaining === 0) {
-      outCh.fill(0);
-      return true;
-    }
-
-    for (let i = 0; i < frames; i++) {
-      // Soft 5ms fade-out during barge-in or stop
-      if (this._fadeOutRemaining > 0) {
-        const gain = this._fadeOutRemaining / this._fadeSamples;
-        let sample = this._lastSample;
-        if (this._available > 0) {
-          sample = this._buffer[this._readIdx];
-          this._readIdx = (this._readIdx + 1) % this._capacity;
-          this._available--;
-        }
-        outCh[i] = sample * gain;
-        this._lastSample = outCh[i];
-        this._fadeOutRemaining--;
-        if (this._fadeOutRemaining === 0 && this._clearAfterFadeOut) {
-          this._resetBuffer();
-          for (let j = i + 1; j < frames; j++) outCh[j] = 0;
-          break;
-        }
-        continue;
-      }
-
-      if (this._available > 0) {
-        let sample = this._buffer[this._readIdx];
-        this._readIdx = (this._readIdx + 1) % this._capacity;
-        this._available--;
-
-        // Soft 5ms fade-in on start/resume
-        if (this._fadeInRemaining > 0) {
-          const progress = 1 - this._fadeInRemaining / this._fadeSamples;
-          sample *= progress;
-          this._fadeInRemaining--;
-        } else if (this._available < this._fadeSamples && this._turnComplete) {
-          // Gentle tail ramp on natural end of AI turn
-          sample *= this._available / this._fadeSamples;
-        }
-
-        outCh[i] = sample;
-        this._lastSample = sample;
-      } else {
-        // Buffer emptied
-        if (this._turnComplete) {
-          this._isPlaying = false;
-          this._lastSample = 0;
-          outCh[i] = 0;
-          this.port.postMessage({ type: "drained" });
-          for (let j = i + 1; j < frames; j++) outCh[j] = 0;
-          break;
-        } else {
-          // Brief network jitter underrun -> soft decay to zero & arm recovery pre-buffer
-          this._lastSample *= 0.85;
-          outCh[i] = Math.abs(this._lastSample) > 1e-4 ? this._lastSample : 0;
-          if (i === frames - 1) {
-            this._isPlaying = false;
-            this._prebufferSamples = this._rebufferSamples;
-            this._lastSample = 0;
-          }
-        }
-      }
-    }
-
-    // Mirror mono to any additional output channels
-    for (let chIdx = 1; chIdx < output.length; chIdx++) {
-      output[chIdx].set(outCh);
-    }
-
-    return true;
-  }
-}
-registerProcessor("formylab-pcm-ring-player", FormylabPcmRingPlayerProcessor);
-`;
-
-function resampleFloat32Linear(
-  input: Float32Array,
-  fromRate: number,
-  toRate: number
-): Float32Array {
-  if (!input.length || fromRate === toRate || fromRate <= 0 || toRate <= 0) {
-    return input;
-  }
-  const ratio = fromRate / toRate;
-  const outLen = Math.max(1, Math.round(input.length / ratio));
-  const out = new Float32Array(outLen);
-  for (let i = 0; i < outLen; i++) {
-    const srcPos = i * ratio;
-    const idx0 = Math.floor(srcPos);
-    const idx1 = Math.min(idx0 + 1, input.length - 1);
-    const frac = srcPos - idx0;
-    out[i] = input[idx0] + (input[idx1] - input[idx0]) * frac;
-  }
-  return out;
-}
-
-function downsampleFloat32ToInt16Pcm(
-  input: Float32Array,
-  inputSampleRate: number,
-  targetSampleRate = 16000
-): Int16Array {
-  if (!input || input.length === 0) return new Int16Array(0);
-  if (inputSampleRate === targetSampleRate || inputSampleRate <= 0) {
-    const out = new Int16Array(input.length);
-    for (let i = 0; i < input.length; i++) {
-      const s = Math.max(-1, Math.min(1, input[i]));
-      out[i] = s < 0 ? Math.round(s * 0x8000) : Math.round(s * 0x7fff);
-    }
-    return out;
-  }
-
-  const ratio = inputSampleRate / targetSampleRate;
-  const outputLength = Math.max(1, Math.floor(input.length / ratio));
-  const out = new Int16Array(outputLength);
-  for (let i = 0; i < outputLength; i++) {
-    const srcPos = i * ratio;
-    const idx0 = Math.floor(srcPos);
-    const idx1 = Math.min(idx0 + 1, input.length - 1);
-    const frac = srcPos - idx0;
-    const sample = input[idx0] * (1 - frac) + input[idx1] * frac;
-    const clamped = Math.max(-1, Math.min(1, sample));
-    out[i] =
-      clamped < 0
-        ? Math.round(clamped * 0x8000)
-        : Math.round(clamped * 0x7fff);
-  }
-  return out;
-}
-
-function int16PcmToBase64(pcm: Int16Array): string {
-  const bytes = new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength);
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    const sub = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
-    binary += String.fromCharCode(...sub);
-  }
-  return window.btoa(binary);
-}
-
-function base64PcmToFloat32(base64: string): Float32Array {
-  const clean = stripVoiceDataUrlPrefix(base64);
-  const binary = window.atob(clean);
-  const byteLen = binary.length;
-  const bytes = new Uint8Array(byteLen);
-  for (let i = 0; i < byteLen; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  const sampleCount = Math.floor(byteLen / 2);
-  const view = new DataView(bytes.buffer, bytes.byteOffset, sampleCount * 2);
-  const float32 = new Float32Array(sampleCount);
-  for (let i = 0; i < sampleCount; i++) {
-    float32[i] = view.getInt16(i * 2, true) / 32768;
-  }
-  return float32;
-}
-
-function parsePcmRateFromMime(
-  mimeType?: string,
-  fallbackRate = 24000
-): number {
-  if (!mimeType) return fallbackRate;
-  const match = mimeType.match(/rate=(\d{4,6})/i);
-  if (match) {
-    const parsed = Number(match[1]);
-    if (Number.isFinite(parsed) && parsed >= 8000 && parsed <= 96000) {
-      return parsed;
-    }
-  }
-  return fallbackRate;
-}
-
-const PREFERRED_VOICE_CALL_MIMES = [
-  "audio/webm;codecs=opus",
-  "audio/webm",
-  "audio/mp4",
-];
-
-function detectVoiceCallAudioMime(): string {
-  if (typeof window === "undefined" || typeof MediaRecorder === "undefined") {
-    return "";
-  }
-  for (const mime of PREFERRED_VOICE_CALL_MIMES) {
-    try {
-      if (
-        typeof MediaRecorder.isTypeSupported === "function" &&
-        MediaRecorder.isTypeSupported(mime)
-      ) {
-        return mime;
-      }
-    } catch {
-      // ignore
-    }
-  }
-  return "";
-}
-
-function stripVoiceDataUrlPrefix(dataUrl: string): string {
-  const idx = dataUrl.indexOf(",");
-  if (dataUrl.startsWith("data:") && idx !== -1) {
-    return dataUrl.slice(idx + 1).trim();
-  }
-  return dataUrl.replace(/^data:[^;]+;base64,/i, "").trim();
-}
-
-function base64ToArrayBuffer(base64: string): ArrayBuffer {
-  const clean = stripVoiceDataUrlPrefix(base64);
-  const binaryString = window.atob(clean);
-  const len = binaryString.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
-  }
-  return bytes.buffer;
-}
 
 function isMicPermissionDenied(err: unknown): boolean {
   if (!err) return false;
@@ -1860,52 +1563,61 @@ function LivingVoiceOrb({
 }
 
 /**
- * Inline Chat-Room AI Voice Mode:
- * - Zero full-screen blank overlay, zero modal cards, zero "Ekstrak Chat" button
- * - Floats a compact audio-reactive 3D Particle Sphere directly above the composer bar
- * - Streams every user & AI spoken turn live into the chat room + executes real `create_chat_note` tool calls
+ * Ultra-Low-Latency Inline Chat-Room Gemini Live Voice Mode:
+ * - Connects directly from the browser via `@google/genai` `ai.live.connect(...)` using a short-lived
+ *   server-minted Ephemeral Token (`/api/live-token`) — 100% Vercel compatible.
+ * - ZERO `SpeechRecognition`, ZERO HTTP REST `/api/chat`, ZERO `window.speechSynthesis` fallback.
+ * - Streams 16kHz Int16 PCM mic audio in 30ms packets via inline-Blob `AudioWorkletNode`.
+ * - Plays 24kHz PCM AI output immediately on the very first chunk via `AudioBufferSourceNode` queue
+ *   with instant barge-in (`serverContent.interrupted` -> immediate `.stop()` + queue clear).
+ * - Streams user & AI transcripts + Google Search grounding + 0ms `PILAR AI AKTIF` asynchronously
+ *   to the main chat room without ever blocking the audio thread.
  */
 export function InteractiveVoiceCallOverlay({
   isOpen,
   voice,
   isMicMuted = false,
   recentChatContext,
-  onSendSpokenPrompt,
-  onSendSpokenAudio,
-  onLiveUserTurn,
+  onLiveUserStream,
   onLiveAssistantStream,
+  onLiveTurnComplete,
   onLiveWebSources,
   onCreateChatNote,
   onCreateGoogleDoc,
 }: InteractiveVoiceCallOverlayProps) {
-  const [phase, setPhase] = useState<LivingOrbPhase>("listening");
-  const [micPermissionError, setMicPermissionError] = useState<string>("");
+  const [liveStatus, setLiveStatus] =
+    useState<LiveConnectionStatus>("connecting");
+  const [selectedVoice, setSelectedVoice] = useState<LiveVoiceName>("Aoede");
+  const [liveError, setLiveError] = useState<string>("");
 
-  // Core lifecycle & synchronization refs
+  // Core lifecycle refs (zero stale closures in audio/WS callbacks)
   const callActiveRef = useRef(false);
   const isMountedRef = useRef(true);
   const isMicMutedRef = useRef(isMicMuted);
-  const phaseRef = useRef<LivingOrbPhase>("listening");
-  const isSubmittingTurnRef = useRef(false);
-  const isFallbackAudioModeRef = useRef(false);
-  const webSpeechSilentExitCountRef = useRef(0);
-  const latestSpokenTextRef = useRef("");
+  const selectedVoiceRef = useRef<LiveVoiceName>(selectedVoice);
+  const liveStatusRef = useRef<LiveConnectionStatus>("connecting");
   const recentContextRef = useRef<string>(recentChatContext || "");
 
-  // Latest callback refs to avoid stale closures or re-creating WebSocket listeners
-  const onLiveUserTurnRef = useRef(onLiveUserTurn);
+  // Latest callback refs
+  const onLiveUserStreamRef = useRef(onLiveUserStream);
   const onLiveAssistantStreamRef = useRef(onLiveAssistantStream);
+  const onLiveTurnCompleteRef = useRef(onLiveTurnComplete);
   const onLiveWebSourcesRef = useRef(onLiveWebSources);
   const onCreateChatNoteRef = useRef(onCreateChatNote);
   const onCreateGoogleDocRef = useRef(onCreateGoogleDoc);
+  const voiceStopSpeechRef = useRef(voice?.stopSpeech);
 
   useEffect(() => {
-    onLiveUserTurnRef.current = onLiveUserTurn;
-  }, [onLiveUserTurn]);
+    onLiveUserStreamRef.current = onLiveUserStream;
+  }, [onLiveUserStream]);
 
   useEffect(() => {
     onLiveAssistantStreamRef.current = onLiveAssistantStream;
   }, [onLiveAssistantStream]);
+
+  useEffect(() => {
+    onLiveTurnCompleteRef.current = onLiveTurnComplete;
+  }, [onLiveTurnComplete]);
 
   useEffect(() => {
     onLiveWebSourcesRef.current = onLiveWebSources;
@@ -1919,1024 +1631,252 @@ export function InteractiveVoiceCallOverlay({
     onCreateGoogleDocRef.current = onCreateGoogleDoc;
   }, [onCreateGoogleDoc]);
 
-  // Gemini Live API Real-Time WebSocket & Dual-Clock AudioWorklet PCM Engine Refs
-  const isLiveModeRef = useRef(false);
-  const liveSetupReadyRef = useRef(false);
-  const liveWsRef = useRef<WebSocket | null>(null);
-  const liveConnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
-    null
-  );
+  useEffect(() => {
+    voiceStopSpeechRef.current = voice?.stopSpeech;
+  }, [voice]);
+
+  useEffect(() => {
+    recentContextRef.current = recentChatContext || "";
+  }, [recentChatContext]);
+
+  useEffect(() => {
+    selectedVoiceRef.current = selectedVoice;
+  }, [selectedVoice]);
+
+  // Gemini Live SDK Session & Dual AudioContext Refs
+  const sessionRef = useRef<Session | null>(null);
+  const sessionGenerationRef = useRef(0);
   const liveInputCtxRef = useRef<AudioContext | null>(null);
   const liveOutputCtxRef = useRef<AudioContext | null>(null);
   const liveMicStreamRef = useRef<MediaStream | null>(null);
   const liveMicSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const liveMicAnalyserRef = useRef<AnalyserNode | null>(null);
   const liveOutputAnalyserRef = useRef<AnalyserNode | null>(null);
+  const activeAnalyserRef = useRef<AnalyserNode | null>(null);
+  const speechPulseRef = useRef<number>(0);
+
   const liveWorkletNodeRef = useRef<AudioWorkletNode | null>(null);
   const liveWorkletUrlRef = useRef<string | null>(null);
-  const livePlaybackWorkletNodeRef = useRef<AudioWorkletNode | null>(null);
-  const livePlaybackWorkletUrlRef = useRef<string | null>(null);
   const liveScriptNodeRef = useRef<ScriptProcessorNode | null>(null);
   const liveSilentGainRef = useRef<GainNode | null>(null);
+
+  // Zero-Wait 24kHz AudioBufferSourceNode Streaming Queue Refs
   const liveScheduledSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const liveNextPlayTimeRef = useRef<number>(0);
   const liveTurnCompleteRef = useRef<boolean>(true);
-  const liveInputTurnTextRef = useRef<string>("");
-  const liveOutputTurnTextRef = useRef<string>("");
-  const liveAssistantTurnIdRef = useRef<string | null>(null);
-  const liveUserCommittedRef = useRef<boolean>(false);
-  const livePendingSourcesRef = useRef<WebSourceCitation[]>([]);
-  const liveTranscriptFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+
+  // Asynchronous Transcript & Google Search Grounding Refs (never block audio)
+  const userTurnIdRef = useRef<string | null>(null);
+  const userTurnTextRef = useRef<string>("");
+  const userTurnCommittedRef = useRef<boolean>(false);
+  const userFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const userLastFlushMsRef = useRef<number>(0);
+
+  const assistantTurnIdRef = useRef<string | null>(null);
+  const assistantTurnTextRef = useRef<string>("");
+  const assistantFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null
   );
-  const liveLastTranscriptFlushMsRef = useRef<number>(0);
+  const assistantLastFlushMsRef = useRef<number>(0);
 
-  // SpeechRecognition + Timers (Fast-Path Fallback)
-  const recognitionRef = useRef<{
-    onresult: unknown;
-    onerror: unknown;
-    onend: unknown;
-    start: () => void;
-    stop: () => void;
-    abort?: () => void;
-  } | null>(null);
-  const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const reListenTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const turnPendingSourcesRef = useRef<WebSourceCitation[]>([]);
+  const turnUsedGoogleSearchRef = useRef<boolean>(false);
 
-  // Web Audio API (Playback + Analyser + Mic Visualizer + Fallback MediaRecorder)
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const activeAnalyserRef = useRef<AnalyserNode | null>(null);
-  const activeSourceNodeRef = useRef<AudioBufferSourceNode | null>(null);
-  const fallbackHtmlAudioRef = useRef<HTMLAudioElement | null>(null);
-  const speechPulseRef = useRef<number>(0);
-
-  const micStreamRef = useRef<MediaStream | null>(null);
-  const micSourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const fallbackRecorderRef = useRef<MediaRecorder | null>(null);
-  const fallbackChunksRef = useRef<Blob[]>([]);
-  const fallbackStartMsRef = useRef<number>(0);
-  const vadRafRef = useRef<number>(0);
-
-  // Latest handler refs to avoid stale closures
-  const startListeningRef = useRef<() => void>(() => {});
   const startLiveSessionRef = useRef<() => Promise<void>>(async () => {});
-  const submitSpokenTextRef = useRef<(text: string) => void>(() => {});
-  const submitFallbackAudioRef = useRef<() => void>(() => {});
 
-  useEffect(() => {
-    recentContextRef.current = recentChatContext || "";
-  }, [recentChatContext]);
-
-  const updatePhase = useCallback((next: LivingOrbPhase) => {
-    phaseRef.current = next;
-    setPhase(next);
+  const updateLiveStatus = useCallback((next: LiveConnectionStatus) => {
+    liveStatusRef.current = next;
+    setLiveStatus(next);
   }, []);
 
-  const getOrCreateAudioContext = useCallback((): AudioContext | null => {
-    if (typeof window === "undefined") return null;
-    try {
-      if (
-        audioCtxRef.current &&
-        audioCtxRef.current.state !== "closed"
-      ) {
-        if (audioCtxRef.current.state === "suspended") {
-          audioCtxRef.current.resume().catch(() => {});
-        }
-        return audioCtxRef.current;
-      }
-      const AudioCtx =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext?: typeof AudioContext })
-          .webkitAudioContext;
-      if (!AudioCtx) return null;
-      const ctx = new AudioCtx();
-      audioCtxRef.current = ctx;
-      if (ctx.state === "suspended") {
-        ctx.resume().catch(() => {});
-      }
-      return ctx;
-    } catch {
-      return null;
-    }
-  }, []);
-
-  const stopAiPlayback = useCallback(() => {
-    if (activeSourceNodeRef.current) {
-      try {
-        activeSourceNodeRef.current.onended = null;
-        activeSourceNodeRef.current.stop();
-        activeSourceNodeRef.current.disconnect();
-      } catch {
-        // ignore
-      }
-      activeSourceNodeRef.current = null;
-    }
-    if (fallbackHtmlAudioRef.current) {
-      try {
-        fallbackHtmlAudioRef.current.onended = null;
-        fallbackHtmlAudioRef.current.onerror = null;
-        fallbackHtmlAudioRef.current.pause();
-        fallbackHtmlAudioRef.current.src = "";
-      } catch {
-        // ignore
-      }
-      fallbackHtmlAudioRef.current = null;
-    }
-    activeAnalyserRef.current = null;
-    voice.stopSpeech();
-  }, [voice]);
-
-  const stopMicAndRecorder = useCallback(() => {
-    if (vadRafRef.current) {
-      cancelAnimationFrame(vadRafRef.current);
-      vadRafRef.current = 0;
-    }
-    if (micSourceNodeRef.current) {
-      try {
-        micSourceNodeRef.current.disconnect();
-      } catch {
-        // ignore
-      }
-      micSourceNodeRef.current = null;
-    }
-    if (fallbackRecorderRef.current) {
-      try {
-        fallbackRecorderRef.current.ondataavailable = null;
-        fallbackRecorderRef.current.onstop = null;
-        if (fallbackRecorderRef.current.state !== "inactive") {
-          fallbackRecorderRef.current.stop();
-        }
-      } catch {
-        // ignore
-      }
-      fallbackRecorderRef.current = null;
-    }
-    if (micStreamRef.current) {
-      try {
-        micStreamRef.current.getTracks().forEach((track) => track.stop());
-      } catch {
-        // ignore
-      }
-      micStreamRef.current = null;
-    }
-    if (phaseRef.current !== "speaking") {
-      activeAnalyserRef.current = null;
-    }
-  }, []);
-
-  const stopListening = useCallback(() => {
-    if (silenceTimerRef.current) {
-      clearTimeout(silenceTimerRef.current);
-      silenceTimerRef.current = null;
-    }
-    if (reListenTimerRef.current) {
-      clearTimeout(reListenTimerRef.current);
-      reListenTimerRef.current = null;
-    }
-    if (recognitionRef.current) {
-      const rec = recognitionRef.current;
-      recognitionRef.current = null;
-      try {
-        rec.onresult = null;
-        rec.onerror = null;
-        rec.onend = null;
-        if (typeof rec.abort === "function") {
-          rec.abort();
-        } else {
-          rec.stop();
-        }
-      } catch {
-        // ignore
-      }
-    }
-    stopMicAndRecorder();
-  }, [stopMicAndRecorder]);
-
-  const closeAudioContextCleanly = useCallback(() => {
-    if (audioCtxRef.current) {
-      const ctx = audioCtxRef.current;
-      audioCtxRef.current = null;
-      try {
-        if (ctx.state !== "closed") {
-          ctx.close().catch(() => {});
-        }
-      } catch {
-        // ignore
-      }
-    }
-  }, []);
-
-  /**
-   * Plays AI neural WAV audio through Web Audio API (AudioBufferSourceNode -> AnalyserNode -> destination)
-   * so LivingVoiceOrb pulses in exact sync with the AI's voice, then automatically resumes listening after 250ms.
-   */
-  const playAiReplyAndRelisten = useCallback(
-    async (replyText: string, replyAudio?: VoiceCallReplyAudio | null) => {
-      if (!isMountedRef.current || !callActiveRef.current) return;
-
-      // Strict anti-echo: guarantee mic & SpeechRecognition are 100% off while AI speaks
-      stopListening();
-      stopAiPlayback();
-      updatePhase("speaking");
-
-      const scheduleAutoRelisten = () => {
-        activeSourceNodeRef.current = null;
-        activeAnalyserRef.current = null;
-        if (!isMountedRef.current || !callActiveRef.current) return;
-        reListenTimerRef.current = setTimeout(() => {
-          if (isMountedRef.current && callActiveRef.current) {
-            startListeningRef.current();
-          }
-        }, 120);
-      };
-
-      // Primary path: Play Gemini Native Neural WAV via Web Audio API + AnalyserNode
-      if (replyAudio?.base64) {
-        const audioCtx = getOrCreateAudioContext();
-        if (audioCtx) {
-          try {
-            if (audioCtx.state === "suspended") {
-              await audioCtx.resume();
-            }
-            const arrayBuf = base64ToArrayBuffer(replyAudio.base64);
-            const decodedBuffer = await audioCtx.decodeAudioData(
-              arrayBuf.slice(0)
-            );
-            if (!isMountedRef.current || !callActiveRef.current) return;
-
-            const sourceNode = audioCtx.createBufferSource();
-            sourceNode.buffer = decodedBuffer;
-
-            const analyser = audioCtx.createAnalyser();
-            analyser.fftSize = 256;
-            analyser.smoothingTimeConstant = 0.78;
-
-            sourceNode.connect(analyser);
-            analyser.connect(audioCtx.destination);
-
-            activeSourceNodeRef.current = sourceNode;
-            activeAnalyserRef.current = analyser;
-
-            sourceNode.onended = () => {
-              if (activeSourceNodeRef.current === sourceNode) {
-                scheduleAutoRelisten();
-              }
-            };
-
-            sourceNode.start(0);
-            return;
-          } catch {
-            // Secondary audio path if decodeAudioData fails: direct HTML Audio playback
-            try {
-              const dataUrl = `data:${replyAudio.mimeType || "audio/wav"};base64,${stripVoiceDataUrlPrefix(replyAudio.base64)}`;
-              const htmlAudio = new Audio(dataUrl);
-              fallbackHtmlAudioRef.current = htmlAudio;
-              htmlAudio.onended = () => {
-                if (fallbackHtmlAudioRef.current === htmlAudio) {
-                  fallbackHtmlAudioRef.current = null;
-                  scheduleAutoRelisten();
-                }
-              };
-              htmlAudio.onerror = () => {
-                fallbackHtmlAudioRef.current = null;
-                voice.speakMessage(
-                  `voice-call-fallback-${Date.now()}`,
-                  replyText,
-                  scheduleAutoRelisten
-                );
-              };
-              await htmlAudio.play();
-              return;
-            } catch {
-              // Fall through to browser speechSynthesis fallback below
-            }
-          }
-        }
-      }
-
-      // Fallback ONLY when replyAudio is null or unplayable
-      voice.speakMessage(
-        `voice-call-tts-${Date.now()}`,
-        replyText,
-        scheduleAutoRelisten
-      );
-    },
-    [getOrCreateAudioContext, stopAiPlayback, stopListening, updatePhase, voice]
-  );
-
-  /**
-   * Fallback MediaRecorder mode (used automatically when SpeechRecognition is unsupported/fails).
-   * Streams mic into AnalyserNode for both real-time Living Orb motion and 1.1s silence VAD.
-   */
-  const startFallbackAudioCapture = useCallback(async () => {
-    stopMicAndRecorder();
-    if (!callActiveRef.current || !isOpen) return;
-    if (isMicMutedRef.current) {
-      updatePhase("listening");
-      return;
-    }
-
-    if (
-      typeof navigator === "undefined" ||
-      !navigator.mediaDevices ||
-      typeof navigator.mediaDevices.getUserMedia !== "function"
-    ) {
-      setMicPermissionError(
-        "Izinkan akses mikrofon di browser atau buka di tab penuh, lalu ketuk Orb."
-      );
-      return;
-    }
-
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      if (!callActiveRef.current || !isOpen) {
-        stream.getTracks().forEach((t) => t.stop());
-        return;
-      }
-
-      micStreamRef.current = stream;
-      setMicPermissionError("");
-      isFallbackAudioModeRef.current = true;
-      updatePhase("listening");
-
-      const mime = detectVoiceCallAudioMime();
-      const recorder = mime
-        ? new MediaRecorder(stream, { mimeType: mime })
-        : new MediaRecorder(stream);
-
-      fallbackRecorderRef.current = recorder;
-      fallbackChunksRef.current = [];
-      fallbackStartMsRef.current = Date.now();
-
-      recorder.ondataavailable = (ev) => {
-        if (ev.data && ev.data.size > 0) {
-          fallbackChunksRef.current.push(ev.data);
-        }
-      };
-
-      recorder.start(250);
-
-      // Connect mic stream to Web Audio AnalyserNode for Orb animation + ~1.1s auto-turn VAD
-      const audioCtx = getOrCreateAudioContext();
-      if (audioCtx) {
-        try {
-          const source = audioCtx.createMediaStreamSource(stream);
-          const analyser = audioCtx.createAnalyser();
-          analyser.fftSize = 256;
-          analyser.smoothingTimeConstant = 0.78;
-          source.connect(analyser);
-
-          micSourceNodeRef.current = source;
-          activeAnalyserRef.current = analyser;
-
-          const dataArr = new Uint8Array(analyser.frequencyBinCount);
-          let hasDetectedVoice = false;
-          let lastVoiceMs = Date.now();
-
-          const monitorVad = () => {
-            if (
-              !callActiveRef.current ||
-              !fallbackRecorderRef.current ||
-              fallbackRecorderRef.current.state !== "recording"
-            ) {
-              return;
-            }
-            analyser.getByteFrequencyData(dataArr);
-            let sum = 0;
-            for (let i = 0; i < dataArr.length; i++) {
-              sum += dataArr[i];
-            }
-            const avg = sum / dataArr.length;
-
-            if (avg > 17) {
-              hasDetectedVoice = true;
-              lastVoiceMs = Date.now();
-            } else if (
-              hasDetectedVoice &&
-              Date.now() - lastVoiceMs > 650 &&
-              Date.now() - fallbackStartMsRef.current > 550
-            ) {
-              submitFallbackAudioRef.current();
-              return;
-            }
-            vadRafRef.current = requestAnimationFrame(monitorVad);
-          };
-          vadRafRef.current = requestAnimationFrame(monitorVad);
-        } catch {
-          // Tap Orb remains available if AudioContext is restricted
-        }
-      }
-    } catch (err: unknown) {
-      if (isMicPermissionDenied(err)) {
-        setMicPermissionError(
-          "Izin mikrofon ditolak. Aktifkan izin mikrofon lalu ketuk Orb."
-        );
-      } else {
-        setMicPermissionError(
-          "Mikrofon tidak terdeteksi. Periksa perangkat audio lalu ketuk Orb."
-        );
-      }
-    }
-  }, [getOrCreateAudioContext, isOpen, stopMicAndRecorder, updatePhase]);
-
-  const finishAndSubmitFallbackAudio = useCallback(async () => {
-    if (!fallbackRecorderRef.current || isSubmittingTurnRef.current) return;
-    const recorder = fallbackRecorderRef.current;
-    if (recorder.state === "inactive") return;
-
-    isSubmittingTurnRef.current = true;
-    if (vadRafRef.current) {
-      cancelAnimationFrame(vadRafRef.current);
-      vadRafRef.current = 0;
-    }
-
-    const elapsedMs = Date.now() - fallbackStartMsRef.current;
-    const rawMime = recorder.mimeType || "audio/webm";
-
-    const recordedBlob = await new Promise<Blob | null>((resolve) => {
-      recorder.onstop = () => {
-        stopMicAndRecorder();
-        if (fallbackChunksRef.current.length > 0) {
-          resolve(new Blob(fallbackChunksRef.current, { type: rawMime }));
-        } else {
-          resolve(null);
-        }
-      };
-      try {
-        recorder.stop();
-      } catch {
-        stopMicAndRecorder();
-        resolve(null);
-      }
-    });
-
-    if (elapsedMs < 450 || !recordedBlob || recordedBlob.size === 0) {
-      isSubmittingTurnRef.current = false;
-      if (isMountedRef.current && callActiveRef.current) {
-        startFallbackAudioCapture();
-      }
-      return;
-    }
-
-    const dataUrl = await new Promise<string | undefined>((resolve) => {
-      const reader = new FileReader();
-      reader.onloadend = () =>
-        resolve(typeof reader.result === "string" ? reader.result : undefined);
-      reader.onerror = () => resolve(undefined);
-      reader.readAsDataURL(recordedBlob);
-    });
-
-    if (!dataUrl || !onSendSpokenAudio) {
-      isSubmittingTurnRef.current = false;
-      if (isMountedRef.current && callActiveRef.current) {
-        startFallbackAudioCapture();
-      }
-      return;
-    }
-
-    stopAiPlayback();
-    updatePhase("thinking");
-
-    try {
-      const cleanBase64 = stripVoiceDataUrlPrefix(dataUrl);
-      const cleanMime = rawMime.split(";")[0].trim() || "audio/webm";
-
-      const result = await onSendSpokenAudio({
-        base64: cleanBase64,
-        mimeType: cleanMime,
-      });
-
-      if (!isMountedRef.current || !callActiveRef.current) return;
-
-      const replyText = result.reply?.trim() || "";
-
-      if (replyText) {
-        await playAiReplyAndRelisten(replyText, result.replyAudio);
-      } else {
-        startFallbackAudioCapture();
-      }
-    } finally {
-      isSubmittingTurnRef.current = false;
-    }
-  }, [
-    onSendSpokenAudio,
-    playAiReplyAndRelisten,
-    startFallbackAudioCapture,
-    stopAiPlayback,
-    stopMicAndRecorder,
-    updatePhase,
-  ]);
-
-  useEffect(() => {
-    submitFallbackAudioRef.current = finishAndSubmitFallbackAudio;
-  }, [finishAndSubmitFallbackAudio]);
-
-  const handleSpokenTextTurn = useCallback(
-    async (spokenText: string) => {
-      const trimmed = spokenText.trim();
-      if (!trimmed || isSubmittingTurnRef.current) return;
-
-      isSubmittingTurnRef.current = true;
-      latestSpokenTextRef.current = "";
-      stopListening();
-      stopAiPlayback();
-      updatePhase("thinking");
-
-      try {
-        const rawResult = await onSendSpokenPrompt(trimmed);
-        if (!isMountedRef.current || !callActiveRef.current) return;
-
-        const normalized: VoiceCallTurnPayload =
-          typeof rawResult === "string" || rawResult === null
-            ? { reply: rawResult }
-            : rawResult;
-
-        const replyText = normalized.reply?.trim() || "";
-
-        if (replyText) {
-          await playAiReplyAndRelisten(replyText, normalized.replyAudio);
-        } else {
-          startListeningRef.current();
-        }
-      } finally {
-        isSubmittingTurnRef.current = false;
-      }
-    },
-    [
-      onSendSpokenPrompt,
-      playAiReplyAndRelisten,
-      stopAiPlayback,
-      stopListening,
-      updatePhase,
-    ]
-  );
-
-  useEffect(() => {
-    submitSpokenTextRef.current = handleSpokenTextTurn;
-  }, [handleSpokenTextTurn]);
-
-  /**
-   * Optional parallel microphone tap for Web Audio AnalyserNode visualizer while SpeechRecognition listens.
-   * Non-blocking and safely ignored if the browser restricts concurrent audio streams.
-   */
-  const attachMicVisualizerTap = useCallback(async () => {
-    if (
-      typeof navigator === "undefined" ||
-      !navigator.mediaDevices ||
-      typeof navigator.mediaDevices.getUserMedia !== "function"
-    ) {
-      return;
-    }
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      if (
-        !callActiveRef.current ||
-        !isOpen ||
-        phaseRef.current !== "listening"
-      ) {
-        stream.getTracks().forEach((t) => t.stop());
-        return;
-      }
-      micStreamRef.current = stream;
-      const audioCtx = getOrCreateAudioContext();
-      if (!audioCtx) return;
-      const source = audioCtx.createMediaStreamSource(stream);
-      const analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 256;
-      analyser.smoothingTimeConstant = 0.8;
-      source.connect(analyser);
-      micSourceNodeRef.current = source;
-      activeAnalyserRef.current = analyser;
-    } catch {
-      // SpeechRecognition still runs smoothly with interim speech pulse fallback
-    }
-  }, [getOrCreateAudioContext, isOpen]);
-
-  const startListening = useCallback(() => {
-    stopListening();
-    if (!callActiveRef.current || !isOpen) return;
-
-    // Ensure zero AI sound before activating mic (anti-echo)
-    stopAiPlayback();
-
-    if (isMicMutedRef.current) {
-      updatePhase("listening");
-      return;
-    }
-
-    if (isFallbackAudioModeRef.current) {
-      startFallbackAudioCapture();
-      return;
-    }
-
-    setMicPermissionError("");
-    latestSpokenTextRef.current = "";
-    updatePhase("listening");
-
-    try {
-      const w = window as unknown as {
-        SpeechRecognition?: new () => {
-          lang: string;
-          continuous: boolean;
-          interimResults: boolean;
-          onresult:
-            | ((e: {
-                results: ArrayLike<ArrayLike<{ transcript: string }>>;
-              }) => void)
-            | null;
-          onerror: ((e: { error?: string }) => void) | null;
-          onend: (() => void) | null;
-          start: () => void;
-          stop: () => void;
-          abort?: () => void;
-        };
-        webkitSpeechRecognition?: new () => {
-          lang: string;
-          continuous: boolean;
-          interimResults: boolean;
-          onresult:
-            | ((e: {
-                results: ArrayLike<ArrayLike<{ transcript: string }>>;
-              }) => void)
-            | null;
-          onerror: ((e: { error?: string }) => void) | null;
-          onend: (() => void) | null;
-          start: () => void;
-          stop: () => void;
-          abort?: () => void;
-        };
-      };
-
-      const SpeechRec = w.SpeechRecognition || w.webkitSpeechRecognition;
-      if (!SpeechRec) {
-        isFallbackAudioModeRef.current = true;
-        startFallbackAudioCapture();
-        return;
-      }
-
-      const rec = new SpeechRec();
-      rec.lang = "id-ID";
-      rec.continuous = true;
-      rec.interimResults = true;
-
-      let erroredOut = false;
-
-      rec.onresult = (event) => {
-        webSpeechSilentExitCountRef.current = 0;
-        speechPulseRef.current = 0.65;
-        let combined = "";
-        for (let i = 0; i < event.results.length; i++) {
-          combined += event.results[i][0].transcript + " ";
-        }
-        const cleaned = combined.trim();
-        if (cleaned) {
-          latestSpokenTextRef.current = cleaned;
-          if (silenceTimerRef.current) {
-            clearTimeout(silenceTimerRef.current);
-          }
-          // ~650ms snappy silence detector -> responds rapidly while tolerating brief breaths
-          silenceTimerRef.current = setTimeout(() => {
-            const finalSpoken = latestSpokenTextRef.current.trim();
-            if (finalSpoken.length > 0 && !isSubmittingTurnRef.current) {
-              submitSpokenTextRef.current(finalSpoken);
-            }
-          }, 650);
-        }
-      };
-
-      rec.onerror = (event) => {
-        const errCode = event?.error || "";
-        if (errCode === "aborted" || errCode === "no-speech") {
-          return;
-        }
-        if (errCode === "not-allowed" || errCode === "service-not-allowed") {
-          erroredOut = true;
-          stopListening();
-          setMicPermissionError(
-            "Izin mikrofon ditolak. Izinkan mikrofon di browser lalu ketuk Orb."
-          );
-          return;
-        }
-        // Network / audio-capture / unsupported -> seamlessly switch to MediaRecorder fallback
-        erroredOut = true;
-        isFallbackAudioModeRef.current = true;
-        startFallbackAudioCapture();
-      };
-
-      rec.onend = () => {
-        if (recognitionRef.current !== rec) return;
-        recognitionRef.current = null;
-
-        if (
-          erroredOut ||
-          !callActiveRef.current ||
-          !isOpen ||
-          isSubmittingTurnRef.current
-        ) {
-          return;
-        }
-
-        const captured = latestSpokenTextRef.current.trim();
-        if (captured.length > 0) {
-          if (silenceTimerRef.current) {
-            clearTimeout(silenceTimerRef.current);
-            silenceTimerRef.current = null;
-          }
-          submitSpokenTextRef.current(captured);
-          return;
-        }
-
-        if (phaseRef.current === "listening") {
-          webSpeechSilentExitCountRef.current += 1;
-          if (webSpeechSilentExitCountRef.current >= 4) {
-            isFallbackAudioModeRef.current = true;
-            startFallbackAudioCapture();
-            return;
-          }
-          reListenTimerRef.current = setTimeout(() => {
-            if (
-              isMountedRef.current &&
-              callActiveRef.current &&
-              isOpen &&
-              phaseRef.current === "listening"
-            ) {
-              startListeningRef.current();
-            }
-          }, 220);
-        }
-      };
-
-      recognitionRef.current = rec;
-      rec.start();
-      attachMicVisualizerTap();
-    } catch (err: unknown) {
-      if (isMicPermissionDenied(err)) {
-        setMicPermissionError(
-          "Izin mikrofon ditolak. Izinkan mikrofon di browser lalu ketuk Orb."
-        );
-        return;
-      }
-      isFallbackAudioModeRef.current = true;
-      startFallbackAudioCapture();
-    }
-  }, [
-    attachMicVisualizerTap,
-    isOpen,
-    startFallbackAudioCapture,
-    stopAiPlayback,
-    stopListening,
-    updatePhase,
-  ]);
-
-  useEffect(() => {
-    startListeningRef.current = startListening;
-  }, [startListening]);
-
-  // =========================================================================
-  // GEMINI LIVE API REAL-TIME BIDIRECTIONAL AUDIO ENGINE (WEBSOCKET + PCM)
-  // =========================================================================
-
-  const ensureLiveAssistantTurnId = useCallback((): string => {
-    if (!liveAssistantTurnIdRef.current) {
-      liveAssistantTurnIdRef.current = `live-ai-${Date.now()}-${Math.random()
+  const ensureUserTurnId = useCallback((): string => {
+    if (!userTurnIdRef.current) {
+      userTurnIdRef.current = `live-u-${Date.now()}-${Math.random()
         .toString(36)
         .slice(2, 6)}`;
     }
-    return liveAssistantTurnIdRef.current;
+    return userTurnIdRef.current;
   }, []);
 
-  const emitPendingLiveWebSources = useCallback(
-    (turnId: string) => {
-      if (livePendingSourcesRef.current.length > 0) {
-        onLiveWebSourcesRef.current?.(turnId, [...livePendingSourcesRef.current]);
-      }
-    },
-    []
-  );
-
-  const flushThrottledAssistantTranscriptNow = useCallback(() => {
-    if (liveTranscriptFlushTimerRef.current) {
-      clearTimeout(liveTranscriptFlushTimerRef.current);
-      liveTranscriptFlushTimerRef.current = null;
+  const ensureAssistantTurnId = useCallback((): string => {
+    if (!assistantTurnIdRef.current) {
+      assistantTurnIdRef.current = `live-ai-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2, 6)}`;
     }
-    const streamingText = liveOutputTurnTextRef.current.trim();
-    if (!streamingText) return;
-    const turnId = ensureLiveAssistantTurnId();
-    liveLastTranscriptFlushMsRef.current = performance.now();
-    onLiveAssistantStreamRef.current?.(turnId, streamingText);
-    emitPendingLiveWebSources(turnId);
-  }, [emitPendingLiveWebSources, ensureLiveAssistantTurnId]);
+    return assistantTurnIdRef.current;
+  }, []);
 
-  const scheduleThrottledAssistantTranscriptFlush = useCallback(() => {
+  const flushUserTranscriptNow = useCallback(() => {
+    if (userFlushTimerRef.current) {
+      clearTimeout(userFlushTimerRef.current);
+      userFlushTimerRef.current = null;
+    }
+    const clean = userTurnTextRef.current.replace(/\s+/g, " ").trim();
+    if (!clean) return;
+    const turnId = ensureUserTurnId();
+    userLastFlushMsRef.current = performance.now();
+    queueMicrotask(() => {
+      onLiveUserStreamRef.current?.(turnId, clean);
+    });
+  }, [ensureUserTurnId]);
+
+  const scheduleUserTranscriptFlush = useCallback(() => {
     const now = performance.now();
-    const elapsed = now - liveLastTranscriptFlushMsRef.current;
+    const elapsed = now - userLastFlushMsRef.current;
     if (elapsed >= LIVE_TRANSCRIPT_THROTTLE_MS) {
-      flushThrottledAssistantTranscriptNow();
+      flushUserTranscriptNow();
       return;
     }
-    if (!liveTranscriptFlushTimerRef.current) {
+    if (!userFlushTimerRef.current) {
       const waitMs = Math.max(16, LIVE_TRANSCRIPT_THROTTLE_MS - elapsed);
-      liveTranscriptFlushTimerRef.current = setTimeout(() => {
-        liveTranscriptFlushTimerRef.current = null;
-        flushThrottledAssistantTranscriptNow();
+      userFlushTimerRef.current = setTimeout(() => {
+        userFlushTimerRef.current = null;
+        flushUserTranscriptNow();
       }, waitMs);
     }
-  }, [flushThrottledAssistantTranscriptNow]);
+  }, [flushUserTranscriptNow]);
 
-  const commitLiveUserTurnIfPending = useCallback(() => {
-    const userText = liveInputTurnTextRef.current.replace(/\s+/g, " ").trim();
-    if (!userText || liveUserCommittedRef.current) return;
-    liveUserCommittedRef.current = true;
-    liveInputTurnTextRef.current = "";
-    onLiveUserTurnRef.current?.(userText);
+  const emitPendingSourcesAsync = useCallback((turnId: string) => {
+    if (turnPendingSourcesRef.current.length === 0) return;
+    const snapshot = [...turnPendingSourcesRef.current];
+    queueMicrotask(() => {
+      onLiveWebSourcesRef.current?.(turnId, snapshot);
+    });
   }, []);
 
-  const flushLiveTurnTranscripts = useCallback(() => {
-    if (liveTranscriptFlushTimerRef.current) {
-      clearTimeout(liveTranscriptFlushTimerRef.current);
-      liveTranscriptFlushTimerRef.current = null;
+  const flushAssistantTranscriptNow = useCallback(() => {
+    if (assistantFlushTimerRef.current) {
+      clearTimeout(assistantFlushTimerRef.current);
+      assistantFlushTimerRef.current = null;
     }
-    commitLiveUserTurnIfPending();
-    const aiText = liveOutputTurnTextRef.current.replace(/\s+/g, " ").trim();
-    if (aiText) {
-      const turnId = ensureLiveAssistantTurnId();
-      onLiveAssistantStreamRef.current?.(turnId, aiText);
-      emitPendingLiveWebSources(turnId);
-    }
-    liveInputTurnTextRef.current = "";
-    liveOutputTurnTextRef.current = "";
-    liveAssistantTurnIdRef.current = null;
-    liveUserCommittedRef.current = false;
-    livePendingSourcesRef.current = [];
-  }, [commitLiveUserTurnIfPending, emitPendingLiveWebSources, ensureLiveAssistantTurnId]);
+    const clean = assistantTurnTextRef.current.replace(/\s+/g, " ").trim();
+    if (!clean) return;
+    const turnId = ensureAssistantTurnId();
+    assistantLastFlushMsRef.current = performance.now();
+    queueMicrotask(() => {
+      onLiveAssistantStreamRef.current?.(turnId, clean);
+    });
+    emitPendingSourcesAsync(turnId);
+  }, [emitPendingSourcesAsync, ensureAssistantTurnId]);
 
-  const interruptLivePlayback = useCallback(() => {
-    // Instantly flush AudioWorklet Ring Buffer (with 5ms soft ramp-out) so barge-in & close stop cleanly without clicks
-    if (livePlaybackWorkletNodeRef.current) {
-      try {
-        livePlaybackWorkletNodeRef.current.port.postMessage({ type: "clear" });
-      } catch {
-        // ignore
+  const scheduleAssistantTranscriptFlush = useCallback(() => {
+    const now = performance.now();
+    const elapsed = now - assistantLastFlushMsRef.current;
+    if (elapsed >= LIVE_TRANSCRIPT_THROTTLE_MS) {
+      flushAssistantTranscriptNow();
+      return;
+    }
+    if (!assistantFlushTimerRef.current) {
+      const waitMs = Math.max(16, LIVE_TRANSCRIPT_THROTTLE_MS - elapsed);
+      assistantFlushTimerRef.current = setTimeout(() => {
+        assistantFlushTimerRef.current = null;
+        flushAssistantTranscriptNow();
+      }, waitMs);
+    }
+  }, [flushAssistantTranscriptNow]);
+
+  const commitUserTurnIfPending = useCallback(() => {
+    if (userTurnCommittedRef.current) return;
+    const clean = userTurnTextRef.current.replace(/\s+/g, " ").trim();
+    if (!clean) return;
+    userTurnCommittedRef.current = true;
+    flushUserTranscriptNow();
+  }, [flushUserTranscriptNow]);
+
+  const finalizeCurrentTurnAsync = useCallback(() => {
+    if (userFlushTimerRef.current) {
+      clearTimeout(userFlushTimerRef.current);
+      userFlushTimerRef.current = null;
+    }
+    if (assistantFlushTimerRef.current) {
+      clearTimeout(assistantFlushTimerRef.current);
+      assistantFlushTimerRef.current = null;
+    }
+
+    const finalUserText = userTurnTextRef.current.replace(/\s+/g, " ").trim();
+    const finalUserId = finalUserText ? ensureUserTurnId() : undefined;
+
+    const finalAiText = assistantTurnTextRef.current
+      .replace(/\s+/g, " ")
+      .trim();
+    const finalAiId = finalAiText ? ensureAssistantTurnId() : undefined;
+    const usedGoogleSearch =
+      turnUsedGoogleSearchRef.current ||
+      turnPendingSourcesRef.current.length > 0;
+    const sourcesSnapshot = [...turnPendingSourcesRef.current];
+
+    // Reset turn buffers immediately so next speech turn never collides
+    userTurnIdRef.current = null;
+    userTurnTextRef.current = "";
+    userTurnCommittedRef.current = false;
+    assistantTurnIdRef.current = null;
+    assistantTurnTextRef.current = "";
+    turnPendingSourcesRef.current = [];
+    turnUsedGoogleSearchRef.current = false;
+
+    if (!finalUserText && !finalAiText) return;
+
+    // 100% asynchronous UI & localStorage persistence (0 ms audio impact)
+    queueMicrotask(() => {
+      if (finalUserId && finalUserText) {
+        onLiveUserStreamRef.current?.(finalUserId, finalUserText);
       }
-    }
+      if (finalAiId && finalAiText) {
+        onLiveAssistantStreamRef.current?.(finalAiId, finalAiText);
+      }
+      if (finalAiId && sourcesSnapshot.length > 0) {
+        onLiveWebSourcesRef.current?.(finalAiId, sourcesSnapshot);
+      }
+      const activePillars = classifyLiveVoicePillars(
+        finalUserText,
+        finalAiText,
+        usedGoogleSearch
+      );
+      onLiveTurnCompleteRef.current?.({
+        userTurnId: finalUserId,
+        userText: finalUserText || undefined,
+        assistantTurnId: finalAiId,
+        assistantText: finalAiText || undefined,
+        activePillars,
+        usedGoogleSearch,
+      });
+    });
+  }, [ensureAssistantTurnId, ensureUserTurnId]);
 
-    // Also clear any fallback AudioBufferSourceNode instances
+  /**
+   * Instant Barge-In:
+   * Immediately stops every scheduled/playing AudioBufferSourceNode, clears the queue,
+   * and resets `nextPlayTime = audioContext.currentTime` with 0ms delay.
+   */
+  const interruptLiveAudioPlayback = useCallback(() => {
     liveScheduledSourcesRef.current.forEach((node) => {
       try {
         node.onended = null;
         node.stop();
         node.disconnect();
       } catch {
-        // ignore
+        // Node already ended
       }
     });
     liveScheduledSourcesRef.current.clear();
-    liveNextPlayTimeRef.current = 0;
+
+    const outCtx = liveOutputCtxRef.current;
+    liveNextPlayTimeRef.current =
+      outCtx && outCtx.state !== "closed" ? outCtx.currentTime : 0;
     liveTurnCompleteRef.current = true;
+
     if (liveMicAnalyserRef.current) {
       activeAnalyserRef.current = liveMicAnalyserRef.current;
     }
   }, []);
 
-  const cleanupLiveSessionResources = useCallback(() => {
-    if (liveConnectTimerRef.current) {
-      clearTimeout(liveConnectTimerRef.current);
-      liveConnectTimerRef.current = null;
-    }
-    if (liveTranscriptFlushTimerRef.current) {
-      clearTimeout(liveTranscriptFlushTimerRef.current);
-      liveTranscriptFlushTimerRef.current = null;
-    }
-
-    interruptLivePlayback();
-    flushLiveTurnTranscripts();
-
-    if (liveWorkletNodeRef.current) {
-      try {
-        liveWorkletNodeRef.current.port.onmessage = null;
-        liveWorkletNodeRef.current.disconnect();
-      } catch {
-        // ignore
-      }
-      liveWorkletNodeRef.current = null;
-    }
-
-    if (liveWorkletUrlRef.current) {
-      try {
-        URL.revokeObjectURL(liveWorkletUrlRef.current);
-      } catch {
-        // ignore
-      }
-      liveWorkletUrlRef.current = null;
-    }
-
-    if (livePlaybackWorkletNodeRef.current) {
-      try {
-        livePlaybackWorkletNodeRef.current.port.onmessage = null;
-        livePlaybackWorkletNodeRef.current.disconnect();
-      } catch {
-        // ignore
-      }
-      livePlaybackWorkletNodeRef.current = null;
-    }
-
-    if (livePlaybackWorkletUrlRef.current) {
-      try {
-        URL.revokeObjectURL(livePlaybackWorkletUrlRef.current);
-      } catch {
-        // ignore
-      }
-      livePlaybackWorkletUrlRef.current = null;
-    }
-
-    if (liveScriptNodeRef.current) {
-      try {
-        liveScriptNodeRef.current.onaudioprocess = null;
-        liveScriptNodeRef.current.disconnect();
-      } catch {
-        // ignore
-      }
-      liveScriptNodeRef.current = null;
-    }
-
-    if (liveSilentGainRef.current) {
-      try {
-        liveSilentGainRef.current.disconnect();
-      } catch {
-        // ignore
-      }
-      liveSilentGainRef.current = null;
-    }
-
-    if (liveMicSourceRef.current) {
-      try {
-        liveMicSourceRef.current.disconnect();
-      } catch {
-        // ignore
-      }
-      liveMicSourceRef.current = null;
-    }
-
-    if (liveMicStreamRef.current) {
-      try {
-        liveMicStreamRef.current.getTracks().forEach((track) => track.stop());
-      } catch {
-        // ignore
-      }
-      liveMicStreamRef.current = null;
-    }
-
-    if (liveWsRef.current) {
-      const ws = liveWsRef.current;
-      liveWsRef.current = null;
-      try {
-        ws.onopen = null;
-        ws.onmessage = null;
-        ws.onerror = null;
-        ws.onclose = null;
-        if (
-          ws.readyState === WebSocket.OPEN ||
-          ws.readyState === WebSocket.CONNECTING
-        ) {
-          ws.close(1000, "Voice call ended");
-        }
-      } catch {
-        // ignore
-      }
-    }
-
-    if (liveInputCtxRef.current) {
-      const ctx = liveInputCtxRef.current;
-      liveInputCtxRef.current = null;
-      try {
-        if (ctx.state !== "closed") {
-          ctx.close().catch(() => {});
-        }
-      } catch {
-        // ignore
-      }
-    }
-
-    if (liveOutputCtxRef.current) {
-      const ctx = liveOutputCtxRef.current;
-      liveOutputCtxRef.current = null;
-      try {
-        if (ctx.state !== "closed") {
-          ctx.close().catch(() => {});
-        }
-      } catch {
-        // ignore
-      }
-    }
-
-    liveMicAnalyserRef.current = null;
-    liveOutputAnalyserRef.current = null;
-    activeAnalyserRef.current = null;
-    isLiveModeRef.current = false;
-    liveSetupReadyRef.current = false;
-  }, [flushLiveTurnTranscripts, interruptLivePlayback]);
-
-  const scheduleLivePcmOutputChunk = useCallback(
+  /**
+   * Zero-Wait 24kHz PCM Streaming Playback:
+   * Decodes each incoming Int16 LE PCM chunk immediately and schedules it on the
+   * 24kHz AudioContext timeline (`Math.max(currentTime + 0.02, nextPlayTime)`).
+   */
+  const enqueueLivePcmChunk = useCallback(
     (base64Pcm: string, mimeType?: string) => {
       const outCtx = liveOutputCtxRef.current;
       const outAnalyser = liveOutputAnalyserRef.current;
@@ -2946,45 +1886,29 @@ export function InteractiveVoiceCallOverlay({
         if (outCtx.state === "suspended") {
           outCtx.resume().catch(() => {});
         }
+
         const float32 = base64PcmToFloat32(base64Pcm);
         if (float32.length === 0) return;
 
-        const sourceRate = parsePcmRateFromMime(mimeType, 24000);
-        liveTurnCompleteRef.current = false;
-        activeAnalyserRef.current = outAnalyser;
-        if (phaseRef.current !== "speaking") {
-          updatePhase("speaking");
-        }
-
-        // Primary path: Ultra-smooth AudioWorklet Ring Buffer Player (180ms jitter pre-buffer + 5ms soft ramp)
-        const playbackWorklet = livePlaybackWorkletNodeRef.current;
-        if (playbackWorklet) {
-          const samplesForCtx =
-            Math.abs(outCtx.sampleRate - sourceRate) > 1
-              ? resampleFloat32Linear(float32, sourceRate, outCtx.sampleRate)
-              : float32;
-          const transferable = new Float32Array(samplesForCtx);
-          playbackWorklet.port.postMessage(
-            { type: "push", samples: transferable },
-            [transferable.buffer]
-          );
-          return;
-        }
-
-        // Fallback path ONLY when AudioWorklet is unavailable: AudioBufferSourceNode with >= 160ms lookahead
-        const audioBuffer = outCtx.createBuffer(1, float32.length, sourceRate);
+        const sampleRate = parsePcmSampleRate(mimeType, 24000);
+        const audioBuffer = outCtx.createBuffer(1, float32.length, sampleRate);
         audioBuffer.copyToChannel(new Float32Array(float32), 0);
 
         const sourceNode = outCtx.createBufferSource();
         sourceNode.buffer = audioBuffer;
         sourceNode.connect(outAnalyser);
 
-        const now = outCtx.currentTime;
-        const startAt =
-          liveNextPlayTimeRef.current > now + 0.01
-            ? liveNextPlayTimeRef.current
-            : now + LIVE_FALLBACK_LOOKAHEAD_SEC;
+        const startAt = Math.max(
+          outCtx.currentTime + LIVE_FIRST_CHUNK_LEAD_SEC,
+          liveNextPlayTimeRef.current
+        );
         liveNextPlayTimeRef.current = startAt + audioBuffer.duration;
+        liveTurnCompleteRef.current = false;
+
+        activeAnalyserRef.current = outAnalyser;
+        if (liveStatusRef.current !== "speaking") {
+          updateLiveStatus("speaking");
+        }
 
         liveScheduledSourcesRef.current.add(sourceNode);
         sourceNode.onended = () => {
@@ -2995,29 +1919,145 @@ export function InteractiveVoiceCallOverlay({
             isMountedRef.current &&
             callActiveRef.current
           ) {
-            liveNextPlayTimeRef.current = 0;
+            liveNextPlayTimeRef.current = outCtx.currentTime;
             activeAnalyserRef.current = liveMicAnalyserRef.current;
-            updatePhase("listening");
+            if (liveStatusRef.current !== "error") {
+              updateLiveStatus("listening");
+            }
           }
         };
 
         sourceNode.start(startAt);
       } catch {
-        // Ignore individual malformed chunk without breaking the live stream
+        // Ignore single malformed audio frame without tearing down live stream
       }
     },
-    [updatePhase]
+    [updateLiveStatus]
   );
 
-  const startLiveMicStreaming = useCallback(
-    async (ws: WebSocket, stream: MediaStream) => {
-      if (!callActiveRef.current || ws.readyState !== WebSocket.OPEN) return;
+  const cleanupLiveResources = useCallback(
+    (options?: { keepMicAndAudioCtx?: boolean }) => {
+      const keepAudio = options?.keepMicAndAudioCtx === true;
+
+      interruptLiveAudioPlayback();
+      finalizeCurrentTurnAsync();
+
+      if (sessionRef.current) {
+        const s = sessionRef.current;
+        sessionRef.current = null;
+        try {
+          s.close();
+        } catch {
+          // ignore
+        }
+      }
+
+      if (keepAudio) return;
+
+      if (liveWorkletNodeRef.current) {
+        try {
+          liveWorkletNodeRef.current.port.onmessage = null;
+          liveWorkletNodeRef.current.disconnect();
+        } catch {
+          // ignore
+        }
+        liveWorkletNodeRef.current = null;
+      }
+
+      if (liveWorkletUrlRef.current) {
+        try {
+          URL.revokeObjectURL(liveWorkletUrlRef.current);
+        } catch {
+          // ignore
+        }
+        liveWorkletUrlRef.current = null;
+      }
+
+      if (liveScriptNodeRef.current) {
+        try {
+          liveScriptNodeRef.current.onaudioprocess = null;
+          liveScriptNodeRef.current.disconnect();
+        } catch {
+          // ignore
+        }
+        liveScriptNodeRef.current = null;
+      }
+
+      if (liveSilentGainRef.current) {
+        try {
+          liveSilentGainRef.current.disconnect();
+        } catch {
+          // ignore
+        }
+        liveSilentGainRef.current = null;
+      }
+
+      if (liveMicSourceRef.current) {
+        try {
+          liveMicSourceRef.current.disconnect();
+        } catch {
+          // ignore
+        }
+        liveMicSourceRef.current = null;
+      }
+
+      if (liveMicStreamRef.current) {
+        try {
+          liveMicStreamRef.current.getTracks().forEach((track) => track.stop());
+        } catch {
+          // ignore
+        }
+        liveMicStreamRef.current = null;
+      }
+
+      if (liveInputCtxRef.current) {
+        const ctx = liveInputCtxRef.current;
+        liveInputCtxRef.current = null;
+        try {
+          if (ctx.state !== "closed") {
+            ctx.close().catch(() => {});
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      if (liveOutputCtxRef.current) {
+        const ctx = liveOutputCtxRef.current;
+        liveOutputCtxRef.current = null;
+        try {
+          if (ctx.state !== "closed") {
+            ctx.close().catch(() => {});
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      liveMicAnalyserRef.current = null;
+      liveOutputAnalyserRef.current = null;
+      activeAnalyserRef.current = null;
+    },
+    [finalizeCurrentTurnAsync, interruptLiveAudioPlayback]
+  );
+
+  /**
+   * Captures 16kHz mono PCM 16-bit audio via inline-Blob AudioWorkletNode (30ms / 480 samples)
+   * and streams continuously into the active Gemini Live SDK session.
+   */
+  const attachMicCapturePipeline = useCallback(
+    async (stream: MediaStream, generation: number) => {
+      if (!callActiveRef.current || sessionGenerationRef.current !== generation) {
+        return;
+      }
 
       const AudioCtx =
         window.AudioContext ||
         (window as unknown as { webkitAudioContext?: typeof AudioContext })
           .webkitAudioContext;
-      if (!AudioCtx) return;
+      if (!AudioCtx) {
+        throw new Error("Browser tidak mendukung Web Audio API.");
+      }
 
       let inputCtx: AudioContext;
       try {
@@ -3038,49 +2078,34 @@ export function InteractiveVoiceCallOverlay({
       micAnalyser.smoothingTimeConstant = 0.78;
       micSource.connect(micAnalyser);
       liveMicAnalyserRef.current = micAnalyser;
-      if (phaseRef.current !== "speaking") {
+      if (liveStatusRef.current !== "speaking") {
         activeAnalyserRef.current = micAnalyser;
       }
 
-      const sendInt16PcmToLiveWs = (int16: Int16Array) => {
+      const sendPcmChunkToSession = (int16: Int16Array) => {
+        const activeSession = sessionRef.current;
         if (
+          !activeSession ||
           !callActiveRef.current ||
-          !liveSetupReadyRef.current ||
+          sessionGenerationRef.current !== generation ||
           isMicMutedRef.current ||
-          liveWsRef.current !== ws ||
-          ws.readyState !== WebSocket.OPEN ||
-          ws.bufferedAmount > 64 * 1024 ||
           int16.length === 0
         ) {
           return;
         }
         const base64Audio = int16PcmToBase64(int16);
         try {
-          ws.send(
-            JSON.stringify({
-              realtimeInput: {
-                audio: {
-                  data: base64Audio,
-                  mimeType: "audio/pcm;rate=16000",
-                },
-              },
-            })
-          );
+          activeSession.sendRealtimeInput({
+            audio: {
+              data: base64Audio,
+              mimeType: "audio/pcm;rate=16000",
+            },
+          });
         } catch {
-          // Socket closed mid-frame
+          // Ignore if session closed mid-frame
         }
       };
 
-      const sendFloatChunkFallback = (floatChunk: Float32Array) => {
-        const int16 = downsampleFloat32ToInt16Pcm(
-          floatChunk,
-          inputCtx.sampleRate,
-          16000
-        );
-        sendInt16PcmToLiveWs(int16);
-      };
-
-      // Primary path: Off-main-thread AudioWorklet (downsamples to 16kHz Int16 in ~90ms packets)
       let workletAttached = false;
       if (
         typeof AudioWorkletNode !== "undefined" &&
@@ -3097,7 +2122,7 @@ export function InteractiveVoiceCallOverlay({
 
           if (
             !callActiveRef.current ||
-            liveWsRef.current !== ws ||
+            sessionGenerationRef.current !== generation ||
             inputCtx.state === "closed"
           ) {
             try {
@@ -3113,14 +2138,12 @@ export function InteractiveVoiceCallOverlay({
 
           const workletNode = new AudioWorkletNode(
             inputCtx,
-            "formylab-pcm-capture-processor"
+            "formylab-live-pcm-capture"
           );
           liveWorkletNodeRef.current = workletNode;
           workletNode.port.onmessage = (event: MessageEvent) => {
             if (event.data instanceof Int16Array) {
-              sendInt16PcmToLiveWs(event.data);
-            } else if (event.data instanceof Float32Array) {
-              sendFloatChunkFallback(event.data);
+              sendPcmChunkToSession(event.data);
             }
           };
 
@@ -3133,7 +2156,6 @@ export function InteractiveVoiceCallOverlay({
           silentGain.connect(inputCtx.destination);
           workletAttached = true;
         } catch {
-          // Fall back seamlessly to ScriptProcessorNode below
           if (liveWorkletUrlRef.current) {
             try {
               URL.revokeObjectURL(liveWorkletUrlRef.current);
@@ -3145,9 +2167,9 @@ export function InteractiveVoiceCallOverlay({
         }
       }
 
-      // Fallback path ONLY when AudioWorklet is unavailable
+      // Legacy fallback only when browser lacks AudioWorkletNode (still streams pure 16kHz PCM to Live API)
       if (!workletAttached && typeof inputCtx.createScriptProcessor === "function") {
-        const scriptNode = inputCtx.createScriptProcessor(1024, 1, 1);
+        const scriptNode = inputCtx.createScriptProcessor(512, 1, 1);
         liveScriptNodeRef.current = scriptNode;
 
         const silentGain = inputCtx.createGain();
@@ -3157,7 +2179,12 @@ export function InteractiveVoiceCallOverlay({
         scriptNode.onaudioprocess = (ev: AudioProcessingEvent) => {
           const ch0 = ev.inputBuffer.getChannelData(0);
           if (ch0 && ch0.length > 0) {
-            sendFloatChunkFallback(new Float32Array(ch0));
+            const int16 = downsampleFloat32ToInt16Pcm(
+              new Float32Array(ch0),
+              inputCtx.sampleRate,
+              16000
+            );
+            sendPcmChunkToSession(int16);
           }
         };
 
@@ -3170,76 +2197,25 @@ export function InteractiveVoiceCallOverlay({
   );
 
   const startLiveVoiceSession = useCallback(async () => {
-    cleanupLiveSessionResources();
-    stopListening();
-    stopAiPlayback();
+    const generation = ++sessionGenerationRef.current;
+    cleanupLiveResources();
+    voiceStopSpeechRef.current?.();
 
     if (!isMountedRef.current || !callActiveRef.current || !isOpen) return;
 
-    setMicPermissionError("");
-    updatePhase("listening");
+    setLiveError("");
+    updateLiveStatus("connecting");
 
-    // Helper: request short-lived Gemini Live ephemeral token from server
-    const requestLiveSessionConfig = async (opts?: {
-      excludeModels?: string[];
-      preferSimpleTools?: boolean;
-      preferNoTools?: boolean;
-      disableCustomVad?: boolean;
-    }): Promise<LiveSessionConfigResponse | null> => {
-      try {
-        const res = await fetch("/api/live-session", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            recentContext: recentContextRef.current,
-            ...(opts?.excludeModels && opts.excludeModels.length > 0
-              ? { excludeModels: opts.excludeModels }
-              : {}),
-            ...(opts?.preferSimpleTools ? { preferSimpleTools: true } : {}),
-            ...(opts?.preferNoTools ? { preferNoTools: true } : {}),
-            ...(opts?.disableCustomVad ? { disableCustomVad: true } : {}),
-          }),
-        });
-        if (res.ok) {
-          return (await res.json()) as LiveSessionConfigResponse;
-        }
-      } catch {
-        return { fallbackMode: true };
-      }
-      return { fallbackMode: true };
-    };
-
-    // 1. Fetch initial short-lived Gemini Live ephemeral token (skip models on cooldown for instant 1-shot connect)
-    const initialExcluded = getRecentlyFailedLiveModels();
-    const initialConfig = await requestLiveSessionConfig(
-      initialExcluded.length > 0 ? { excludeModels: initialExcluded } : undefined
-    );
-
-    if (!isMountedRef.current || !callActiveRef.current || !isOpen) return;
-
-    // Automatic fast-path HTTP voice fallback when Live ephemeral token isn't available
-    if (
-      !initialConfig ||
-      initialConfig.fallbackMode ||
-      !initialConfig.wsUrl ||
-      !initialConfig.token ||
-      typeof WebSocket === "undefined"
-    ) {
-      isLiveModeRef.current = false;
-      getOrCreateAudioContext();
-      startListeningRef.current();
-      return;
-    }
-
-    // 2. Request microphone stream with echo cancellation & noise suppression (once per call)
+    // 1. Acquire microphone with hardware echo cancellation, noise suppression, auto gain
     if (
       typeof navigator === "undefined" ||
       !navigator.mediaDevices ||
       typeof navigator.mediaDevices.getUserMedia !== "function"
     ) {
-      setMicPermissionError(
-        "Izinkan akses mikrofon di browser atau buka di tab penuh, lalu ketuk Orb."
+      setLiveError(
+        "Browser tidak mengizinkan akses mikrofon (butuh HTTPS / tab penuh)."
       );
+      updateLiveStatus("error");
       return;
     }
 
@@ -3255,18 +2231,20 @@ export function InteractiveVoiceCallOverlay({
       });
     } catch (err: unknown) {
       if (isMicPermissionDenied(err)) {
-        setMicPermissionError(
-          "Izin mikrofon ditolak. Izinkan mikrofon di browser lalu ketuk Orb."
-        );
+        setLiveError(formatLiveConnectionError("NotAllowedError"));
       } else {
-        setMicPermissionError(
-          "Mikrofon tidak terdeteksi. Periksa perangkat audio lalu ketuk Orb."
-        );
+        setLiveError(formatLiveConnectionError("NotFoundError"));
       }
+      updateLiveStatus("error");
       return;
     }
 
-    if (!isMountedRef.current || !callActiveRef.current || !isOpen) {
+    if (
+      !isMountedRef.current ||
+      !callActiveRef.current ||
+      !isOpen ||
+      sessionGenerationRef.current !== generation
+    ) {
       micStream.getTracks().forEach((t) => t.stop());
       return;
     }
@@ -3276,15 +2254,15 @@ export function InteractiveVoiceCallOverlay({
       track.enabled = !isMicMutedRef.current;
     });
 
-    // 3. Prepare dedicated 24kHz Output AudioContext + AnalyserNode for gapless AI speech
+    // 2. Prepare dedicated 24kHz Output AudioContext + AnalyserNode for zero-wait playback
     const AudioCtx =
       window.AudioContext ||
       (window as unknown as { webkitAudioContext?: typeof AudioContext })
         .webkitAudioContext;
     if (!AudioCtx) {
-      micStream.getTracks().forEach((t) => t.stop());
-      liveMicStreamRef.current = null;
-      startListeningRef.current();
+      cleanupLiveResources();
+      setLiveError("Browser tidak mendukung Web Audio API untuk audio Live 24kHz.");
+      updateLiveStatus("error");
       return;
     }
 
@@ -3304,613 +2282,442 @@ export function InteractiveVoiceCallOverlay({
     outAnalyser.smoothingTimeConstant = 0.78;
     outAnalyser.connect(outCtx.destination);
     liveOutputAnalyserRef.current = outAnalyser;
-    liveNextPlayTimeRef.current = 0;
+    liveNextPlayTimeRef.current = outCtx.currentTime;
     liveTurnCompleteRef.current = true;
 
-    // Attach 24kHz Ring Buffer AudioWorklet Player (100ms jitter pre-buffer + 5ms soft cross-fade)
-    if (
-      typeof AudioWorkletNode !== "undefined" &&
-      outCtx.audioWorklet &&
-      typeof outCtx.audioWorklet.addModule === "function"
-    ) {
-      try {
-        const playerBlob = new Blob([PCM_PLAYBACK_WORKLET_CODE], {
-          type: "application/javascript",
-        });
-        const playerUrl = URL.createObjectURL(playerBlob);
-        livePlaybackWorkletUrlRef.current = playerUrl;
-        await outCtx.audioWorklet.addModule(playerUrl);
-
-        if (callActiveRef.current && outCtx.state !== "closed") {
-          const playerNode = new AudioWorkletNode(
-            outCtx,
-            "formylab-pcm-ring-player"
-          );
-          playerNode.connect(outAnalyser);
-          playerNode.port.onmessage = (ev: MessageEvent) => {
-            if (
-              ev.data?.type === "drained" &&
-              liveTurnCompleteRef.current &&
-              isMountedRef.current &&
-              callActiveRef.current
-            ) {
-              activeAnalyserRef.current = liveMicAnalyserRef.current;
-              updatePhase("listening");
-            }
-          };
-          livePlaybackWorkletNodeRef.current = playerNode;
-        } else {
-          try {
-            URL.revokeObjectURL(playerUrl);
-          } catch {
-            // ignore
-          }
-          if (livePlaybackWorkletUrlRef.current === playerUrl) {
-            livePlaybackWorkletUrlRef.current = null;
-          }
-          return;
-        }
-      } catch {
-        // Cleanly falls back to lookahead AudioBufferSourceNode scheduler
-        if (livePlaybackWorkletUrlRef.current) {
-          try {
-            URL.revokeObjectURL(livePlaybackWorkletUrlRef.current);
-          } catch {
-            // ignore
-          }
-          livePlaybackWorkletUrlRef.current = null;
-        }
-      }
+    // 3. Attach 16kHz AudioWorklet mic pipeline so AnalyserNode & PCM packets are ready immediately
+    try {
+      await attachMicCapturePipeline(micStream, generation);
+    } catch (err: unknown) {
+      cleanupLiveResources();
+      setLiveError(
+        formatLiveConnectionError(
+          err instanceof Error ? err.message : String(err)
+        )
+      );
+      updateLiveStatus("error");
+      return;
     }
 
-    // 4. Open Native WebSocket to Gemini Live BidiGenerateContentConstrained with automatic multi-model failover
-    const fallbackToFastHttpVoice = () => {
-      if (!isMountedRef.current || !callActiveRef.current || !isOpen) return;
-      cleanupLiveSessionResources();
-      getOrCreateAudioContext();
-      startListeningRef.current();
+    if (
+      !isMountedRef.current ||
+      !callActiveRef.current ||
+      !isOpen ||
+      sessionGenerationRef.current !== generation
+    ) {
+      return;
+    }
+
+    // 4. Request Ephemeral Token from `/api/live-token` & open direct browser `ai.live.connect(...)`
+    const fetchLiveToken = async (opts?: {
+      excludeModels?: string[];
+      searchOnlyTools?: boolean;
+      disableThinkingConfig?: boolean;
+      disableCustomVad?: boolean;
+    }): Promise<LiveTokenApiResponse> => {
+      const res = await fetch("/api/live-token", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          voiceName: selectedVoiceRef.current,
+          recentContext: recentContextRef.current,
+          ...(opts?.excludeModels && opts.excludeModels.length > 0
+            ? { excludeModels: opts.excludeModels }
+            : {}),
+          ...(opts?.searchOnlyTools ? { searchOnlyTools: true } : {}),
+          ...(opts?.disableThinkingConfig ? { disableThinkingConfig: true } : {}),
+          ...(opts?.disableCustomVad ? { disableCustomVad: true } : {}),
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as LiveTokenApiResponse;
+      if (!res.ok || !data.success || !data.token || !data.model) {
+        return {
+          success: false,
+          error:
+            data.error ||
+            `Gagal mengambil token sesi Live (HTTP ${res.status}).`,
+        };
+      }
+      return data;
     };
 
-    const excludedModels: string[] = [...initialExcluded];
-    let attemptCount = 0;
-    const MAX_LIVE_WS_ATTEMPTS = 5;
+    const excludedModels: string[] = getRecentlyFailedLiveModels();
+    let lastErrorReason = "";
+    let lastCloseCode: number | undefined = undefined;
+    let searchOnlyTools = false;
+    let disableThinkingConfig = false;
+    let disableCustomVad = false;
 
-    const connectLiveWebSocketWithConfig = (
-      sessionConfig: LiveSessionConfigResponse
-    ) => {
+    const MAX_LIVE_ATTEMPTS = 5;
+
+    for (let attempt = 0; attempt < MAX_LIVE_ATTEMPTS; attempt++) {
       if (
         !isMountedRef.current ||
         !callActiveRef.current ||
         !isOpen ||
-        !sessionConfig.wsUrl ||
-        !sessionConfig.token
+        sessionGenerationRef.current !== generation
       ) {
-        fallbackToFastHttpVoice();
         return;
       }
 
-      attemptCount += 1;
-      isLiveModeRef.current = true;
-      liveSetupReadyRef.current = false;
+      let tokenCfg: LiveTokenApiResponse;
+      try {
+        tokenCfg = await fetchLiveToken({
+          excludeModels: excludedModels,
+          searchOnlyTools,
+          disableThinkingConfig,
+          disableCustomVad,
+        });
+      } catch (err: unknown) {
+        lastErrorReason = err instanceof Error ? err.message : String(err);
+        break;
+      }
 
-      let socketSettled = false;
-
-      const handlePreSetupFailure = async (closeCode?: number) => {
-        if (socketSettled) return;
-        socketSettled = true;
-
-        if (liveConnectTimerRef.current) {
-          clearTimeout(liveConnectTimerRef.current);
-          liveConnectTimerRef.current = null;
+      if (!tokenCfg.success || !tokenCfg.token || !tokenCfg.model) {
+        lastErrorReason =
+          tokenCfg.error || "Token Gemini Live tidak tersedia dari server.";
+        // If all cached excluded models ran out, retry once with empty exclusions
+        if (excludedModels.length > 0 && attempt === 0) {
+          excludedModels.length = 0;
+          recentlyFailedLiveModels.clear();
+          continue;
         }
+        break;
+      }
 
-        if (!isMountedRef.current || !callActiveRef.current || !isOpen) return;
-
-        // If connection already finished setup and later closed, fall back cleanly
-        if (liveSetupReadyRef.current || attemptCount >= MAX_LIVE_WS_ATTEMPTS) {
-          fallbackToFastHttpVoice();
-          return;
-        }
-
-        const failedModel = sessionConfig.model;
-        const isConfigRejection =
-          closeCode === 1007 || closeCode === 1008 || closeCode === 1003;
-
-        // If custom VAD or hybrid tools was rejected on setup, retry same model safely
-        if (isConfigRejection && failedModel) {
-          if (sessionConfig.realtimeInputConfig) {
-            const nextCfg = await requestLiveSessionConfig({
-              excludeModels: excludedModels,
-              disableCustomVad: true,
-              preferSimpleTools: sessionConfig.searchMode !== "hybrid",
-            });
-            if (
-              isMountedRef.current &&
-              callActiveRef.current &&
-              isOpen &&
-              nextCfg &&
-              !nextCfg.fallbackMode &&
-              nextCfg.wsUrl &&
-              nextCfg.token
-            ) {
-              connectLiveWebSocketWithConfig(nextCfg);
-              return;
-            }
-          } else if (sessionConfig.searchMode === "hybrid") {
-            const nextCfg = await requestLiveSessionConfig({
-              excludeModels: excludedModels,
-              preferSimpleTools: true,
-              disableCustomVad: true,
-            });
-            if (
-              isMountedRef.current &&
-              callActiveRef.current &&
-              isOpen &&
-              nextCfg &&
-              !nextCfg.fallbackMode &&
-              nextCfg.wsUrl &&
-              nextCfg.token
-            ) {
-              connectLiveWebSocketWithConfig(nextCfg);
-              return;
-            }
-          }
-        }
-
-        // Otherwise move to next Live Audio candidate model without re-requesting mic permission
-        if (failedModel && !excludedModels.includes(failedModel)) {
-          excludedModels.push(failedModel);
-          if (closeCode === 1011 || closeCode === 1008) {
-            recentlyFailedLiveModels.set(failedModel, Date.now());
-          }
-        }
-
-        if ((sessionConfig.remainingCandidatesCount ?? 0) > 0) {
-          const nextCfg = await requestLiveSessionConfig({
-            excludeModels: excludedModels,
-          });
-          if (
-            isMountedRef.current &&
-            callActiveRef.current &&
-            isOpen &&
-            nextCfg &&
-            !nextCfg.fallbackMode &&
-            nextCfg.wsUrl &&
-            nextCfg.token
-          ) {
-            connectLiveWebSocketWithConfig(nextCfg);
-            return;
-          }
-        }
-
-        fallbackToFastHttpVoice();
+      const liveConfig: LiveConnectConfig = {
+        responseModalities: [Modality.AUDIO],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: {
+              voiceName: tokenCfg.voiceName || selectedVoiceRef.current,
+            },
+          },
+        },
+        ...(tokenCfg.systemInstruction
+          ? { systemInstruction: tokenCfg.systemInstruction }
+          : {}),
+        ...(Array.isArray(tokenCfg.tools) && tokenCfg.tools.length > 0
+          ? { tools: tokenCfg.tools }
+          : {}),
+        ...(tokenCfg.thinkingConfig
+          ? { thinkingConfig: tokenCfg.thinkingConfig }
+          : {}),
+        ...(tokenCfg.realtimeInputConfig
+          ? { realtimeInputConfig: tokenCfg.realtimeInputConfig }
+          : {}),
+        inputAudioTranscription: {},
+        outputAudioTranscription: {},
       };
 
+      const ai = new GoogleGenAI({
+        apiKey: tokenCfg.token,
+        httpOptions: { apiVersion: "v1alpha" },
+      });
+
+      let connectedSession: Session | null = null;
+      let unexpectedCloseCode: number | undefined = undefined;
+      let unexpectedCloseReason = "";
+
       try {
-        const ws = new WebSocket(sessionConfig.wsUrl);
-        liveWsRef.current = ws;
-
-        // Safety watchdog: if Live handshake doesn't finish in 4s, fail over cleanly
-        liveConnectTimerRef.current = setTimeout(() => {
-          if (
-            callActiveRef.current &&
-            liveWsRef.current === ws &&
-            !liveSetupReadyRef.current
-          ) {
-            try {
-              ws.onopen = null;
-              ws.onmessage = null;
-              ws.onerror = null;
-              ws.onclose = null;
-              ws.close(1000, "Live handshake timeout");
-            } catch {
-              // ignore
-            }
-            void handlePreSetupFailure(1006);
-          }
-        }, 4000);
-
-        const liveModelPath = (sessionConfig.model || "gemini-3.8-live").startsWith(
-          "models/"
-        )
-          ? sessionConfig.model!
-          : `models/${sessionConfig.model || "gemini-3.8-live"}`;
-
-        ws.onopen = () => {
-          if (!callActiveRef.current || liveWsRef.current !== ws) return;
-          const setupPayload = {
-            setup: {
-              model: liveModelPath,
-              generationConfig: {
-                responseModalities: ["AUDIO"],
-                speechConfig: {
-                  voiceConfig: {
-                    prebuiltVoiceConfig: {
-                      voiceName: sessionConfig?.voiceName || "Aoede",
-                    },
-                  },
-                },
-              },
-              ...(sessionConfig?.systemInstruction
-                ? {
-                    systemInstruction: {
-                      parts: [{ text: sessionConfig.systemInstruction }],
-                    },
-                  }
-                : {}),
-              ...(Array.isArray(sessionConfig?.tools) &&
-              sessionConfig.tools.length > 0
-                ? { tools: sessionConfig.tools }
-                : {}),
-              ...(sessionConfig?.realtimeInputConfig
-                ? { realtimeInputConfig: sessionConfig.realtimeInputConfig }
-                : {}),
-              inputAudioTranscription: {},
-              outputAudioTranscription: {},
+        connectedSession = await ai.live.connect({
+          model: tokenCfg.model,
+          config: liveConfig,
+          callbacks: {
+            onopen: () => {
+              // WebSocket opened; setupComplete resolves ai.live.connect()
             },
-          };
-          try {
-            ws.send(JSON.stringify(setupPayload));
-          } catch {
-            void handlePreSetupFailure(1006);
-          }
-        };
+            onmessage: (message: LiveServerMessage) => {
+              if (
+                !callActiveRef.current ||
+                sessionGenerationRef.current !== generation
+              ) {
+                return;
+              }
 
-        ws.onmessage = async (event: MessageEvent) => {
-          if (!callActiveRef.current || liveWsRef.current !== ws) return;
+              // 1. Handle real-time tool calls (`create_chat_note`, `create_google_doc`)
+              const functionCalls = message.toolCall?.functionCalls;
+              if (Array.isArray(functionCalls) && functionCalls.length > 0) {
+                commitUserTurnIfPending();
+                const functionResponses: Array<{
+                  id: string;
+                  name: string;
+                  response: Record<string, unknown>;
+                }> = [];
 
-          let rawText = "";
-          try {
-            if (typeof event.data === "string") {
-              rawText = event.data;
-            } else if (event.data instanceof Blob) {
-              rawText = await event.data.text();
-            } else if (event.data instanceof ArrayBuffer) {
-              rawText = new TextDecoder().decode(event.data);
-            }
-          } catch {
-            return;
-          }
-          if (!rawText) return;
-
-          let msg: {
-            setupComplete?: unknown;
-            toolCall?: {
-              functionCalls?: Array<{
-                id?: string;
-                name?: string;
-                args?: Record<string, unknown>;
-              }>;
-            };
-            serverContent?: {
-              interrupted?: boolean;
-              turnComplete?: boolean;
-              inputTranscription?: { text?: string };
-              outputTranscription?: { text?: string };
-              groundingMetadata?: unknown;
-              modelTurn?: {
-                parts?: Array<{
-                  text?: string;
-                  inlineData?: { data?: string; mimeType?: string };
-                }>;
-              };
-            };
-          };
-          try {
-            msg = JSON.parse(rawText);
-          } catch {
-            return;
-          }
-
-          // Handshake complete -> begin continuous 16kHz PCM mic stream
-          if (msg.setupComplete !== undefined) {
-            if (liveConnectTimerRef.current) {
-              clearTimeout(liveConnectTimerRef.current);
-              liveConnectTimerRef.current = null;
-            }
-            liveSetupReadyRef.current = true;
-            updatePhase("listening");
-            await startLiveMicStreaming(ws, micStream);
-            return;
-          }
-
-          // Real Gemini Live Tool Execution (`create_chat_note`, `create_google_doc`, `web_search`)
-          if (
-            msg.toolCall?.functionCalls &&
-            Array.isArray(msg.toolCall.functionCalls) &&
-            msg.toolCall.functionCalls.length > 0
-          ) {
-            commitLiveUserTurnIfPending();
-            const functionResponses: Array<{
-              id: string;
-              name: string;
-              response: Record<string, unknown>;
-            }> = [];
-
-            for (const call of msg.toolCall.functionCalls) {
-              const callId = call.id || `tool-${Date.now()}`;
-              const callName = call.name || "unknown";
-              if (callName === "create_chat_note") {
-                const normalized = normalizeChatNoteArtifact(call.args);
-                if (normalized) {
-                  onCreateChatNoteRef.current?.(normalized);
-                  functionResponses.push({
-                    id: callId,
-                    name: callName,
-                    response: {
-                      status: "success",
-                      title: normalized.title,
-                      format: normalized.format,
-                      message: "Catatan sudah ditampilkan langsung di room chat.",
-                    },
-                  });
-                } else {
-                  functionResponses.push({
-                    id: callId,
-                    name: callName,
-                    response: {
-                      status: "error",
-                      message: "Isi catatan kosong.",
-                    },
-                  });
-                }
-              } else if (callName === "create_google_doc") {
-                const normalized = normalizeGoogleDocArtifact(call.args);
-                if (normalized) {
-                  onCreateGoogleDocRef.current?.(normalized);
-                  functionResponses.push({
-                    id: callId,
-                    name: callName,
-                    response: {
-                      status: "success",
-                      title: normalized.title,
-                      message:
-                        "Kartu Google Docs sudah ditampilkan langsung di room chat dan siap disimpan ke Google Drive.",
-                    },
-                  });
-                } else {
-                  functionResponses.push({
-                    id: callId,
-                    name: callName,
-                    response: {
-                      status: "error",
-                      message: "Isi dokumen Google Docs kosong.",
-                    },
-                  });
-                }
-              } else if (callName === "web_search") {
-                const query = String(
-                  (call.args as Record<string, unknown> | undefined)?.query ?? ""
-                ).trim();
-                if (!query) {
-                  functionResponses.push({
-                    id: callId,
-                    name: callName,
-                    response: {
-                      status: "error",
-                      message: "Kata kunci pencarian kosong.",
-                    },
-                  });
-                } else {
-                  updatePhase("thinking");
-                  try {
-                    const searchRes = await fetch("/api/web-search", {
-                      method: "POST",
-                      headers: { "Content-Type": "application/json" },
-                      body: JSON.stringify({ query }),
-                    });
-                    const searchData = await searchRes.json().catch(() => ({}));
-                    const extractedSources: WebSourceCitation[] = Array.isArray(
-                      searchData?.sources
-                    )
-                      ? (searchData.sources as unknown[])
-                          .map((item) => normalizeWebSourceCitation(item))
-                          .filter(
-                            (item): item is WebSourceCitation => item !== null
-                          )
-                      : [];
-
-                    if (extractedSources.length > 0) {
-                      livePendingSourcesRef.current = mergeUniqueWebSources(
-                        livePendingSourcesRef.current,
-                        extractedSources
-                      );
-                      if (liveAssistantTurnIdRef.current) {
-                        emitPendingLiveWebSources(liveAssistantTurnIdRef.current);
-                      }
-                    }
-
-                    if (searchData?.success && searchData?.summary) {
+                for (const call of functionCalls) {
+                  const callId = call.id || `tool-${Date.now()}`;
+                  const callName = call.name || "unknown";
+                  if (callName === "create_chat_note") {
+                    const normalized = normalizeChatNoteArtifact(call.args);
+                    if (normalized) {
+                      queueMicrotask(() => {
+                        onCreateChatNoteRef.current?.(normalized);
+                      });
                       functionResponses.push({
                         id: callId,
                         name: callName,
                         response: {
                           status: "success",
-                          query,
-                          summary: searchData.summary,
-                          sources: extractedSources.map((s) => ({
-                            domain: s.domain,
-                            title: s.title,
-                            url: s.url,
-                          })),
+                          title: normalized.title,
+                          message: "Catatan sudah ditampilkan di room chat.",
                         },
                       });
                     } else {
                       functionResponses.push({
                         id: callId,
                         name: callName,
-                        response: {
-                          status: "error",
-                          query,
-                          message:
-                            searchData?.error ||
-                            "Pencarian internet belum menemukan hasil pasti.",
-                        },
+                        response: { status: "error", message: "Catatan kosong." },
                       });
                     }
-                  } catch {
+                  } else if (callName === "create_google_doc") {
+                    const normalized = normalizeGoogleDocArtifact(call.args);
+                    if (normalized) {
+                      queueMicrotask(() => {
+                        onCreateGoogleDocRef.current?.(normalized);
+                      });
+                      functionResponses.push({
+                        id: callId,
+                        name: callName,
+                        response: {
+                          status: "success",
+                          title: normalized.title,
+                          message:
+                            "Dokumen Google Docs sudah siap di room chat.",
+                        },
+                      });
+                    } else {
+                      functionResponses.push({
+                        id: callId,
+                        name: callName,
+                        response: { status: "error", message: "Dokumen kosong." },
+                      });
+                    }
+                  } else {
                     functionResponses.push({
                       id: callId,
                       name: callName,
                       response: {
                         status: "error",
-                        query,
-                        message: "Gagal menghubungi layanan pencarian internet.",
+                        message: `Tool ${callName} tidak tersedia.`,
                       },
                     });
                   }
                 }
-              } else {
-                functionResponses.push({
-                  id: callId,
-                  name: callName,
-                  response: {
-                    status: "error",
-                    message: `Tool ${callName} tidak tersedia.`,
-                  },
-                });
-              }
-            }
 
-            if (ws.readyState === WebSocket.OPEN && functionResponses.length > 0) {
-              try {
-                ws.send(
-                  JSON.stringify({
-                    toolResponse: {
-                      functionResponses,
-                    },
-                  })
+                if (sessionRef.current && functionResponses.length > 0) {
+                  try {
+                    sessionRef.current.sendToolResponse({ functionResponses });
+                  } catch {
+                    // ignore send error on closing session
+                  }
+                }
+                return;
+              }
+
+              const content = message.serverContent;
+              if (!content) return;
+
+              // 2. Google Search grounding metadata (non-blocking)
+              if (content.groundingMetadata) {
+                if (hasGoogleSearchGrounding(content.groundingMetadata)) {
+                  turnUsedGoogleSearchRef.current = true;
+                  if (liveStatusRef.current === "listening") {
+                    updateLiveStatus("searching");
+                  }
+                }
+                const sources = extractWebSourcesFromGroundingMetadata(
+                  content.groundingMetadata,
+                  6
                 );
-              } catch {
-                // ignore send error on closing socket
+                if (sources.length > 0) {
+                  turnPendingSourcesRef.current = mergeUniqueWebSources(
+                    turnPendingSourcesRef.current,
+                    sources
+                  );
+                  if (assistantTurnIdRef.current) {
+                    emitPendingSourcesAsync(assistantTurnIdRef.current);
+                  }
+                }
               }
-            }
-            return;
-          }
 
-          const content = msg.serverContent;
-          if (!content) return;
-
-          // Native Gemini Live Google Search grounding metadata (when hybrid mode is active)
-          if (content.groundingMetadata) {
-            const nativeSources = extractWebSourcesFromGroundingMetadata(
-              content.groundingMetadata,
-              6
-            );
-            if (nativeSources.length > 0) {
-              livePendingSourcesRef.current = mergeUniqueWebSources(
-                livePendingSourcesRef.current,
-                nativeSources
-              );
-              if (liveAssistantTurnIdRef.current) {
-                emitPendingLiveWebSources(liveAssistantTurnIdRef.current);
+              // 3. Instant server-side Barge-In: user spoke over AI -> stop all active nodes immediately
+              if (content.interrupted) {
+                interruptLiveAudioPlayback();
+                finalizeCurrentTurnAsync();
+                updateLiveStatus("listening");
+                return;
               }
-            }
-          }
 
-          // True server-side Barge-In: user spoke over AI -> flush AudioWorklet ring buffer immediately
-          if (content.interrupted) {
-            interruptLivePlayback();
-            flushLiveTurnTranscripts();
-            updatePhase("listening");
-            return;
-          }
+              // 4. Streaming User Speech Transcription -> async update right-side bubble
+              if (content.inputTranscription?.text) {
+                if (liveStatusRef.current === "speaking") {
+                  interruptLiveAudioPlayback();
+                  finalizeCurrentTurnAsync();
+                  updateLiveStatus("listening");
+                }
+                if (userTurnCommittedRef.current) {
+                  userTurnCommittedRef.current = false;
+                  userTurnIdRef.current = null;
+                  userTurnTextRef.current = "";
+                }
+                userTurnTextRef.current += content.inputTranscription.text;
+                speechPulseRef.current = 0.6;
+                scheduleUserTranscriptFlush();
+              }
 
-          // Real-time user speech transcription -> accumulated & committed cleanly to right-side bubble
-          if (content.inputTranscription?.text) {
-            // Instant barge-in safeguard: if user speech transcription starts while AI is still speaking,
-            // cut AI audio output immediately rather than waiting for trailing frames
-            if (phaseRef.current === "speaking") {
-              interruptLivePlayback();
-              flushLiveTurnTranscripts();
-              updatePhase("listening");
-            }
-            if (liveUserCommittedRef.current) {
-              liveUserCommittedRef.current = false;
-              liveInputTurnTextRef.current = "";
-            }
-            liveInputTurnTextRef.current += content.inputTranscription.text;
-            speechPulseRef.current = 0.55;
-          }
+              // 5. Streaming AI Speech Transcription -> async update left-side bubble (`Auto · Suara`)
+              if (content.outputTranscription?.text) {
+                commitUserTurnIfPending();
+                assistantTurnTextRef.current += content.outputTranscription.text;
+                ensureAssistantTurnId();
+                scheduleAssistantTranscriptFlush();
+              }
 
-          // Real-time AI speech transcription -> throttled max every 120ms so React never janks audio
-          if (content.outputTranscription?.text) {
-            commitLiveUserTurnIfPending();
-            liveOutputTurnTextRef.current += content.outputTranscription.text;
-            ensureLiveAssistantTurnId();
-            scheduleThrottledAssistantTranscriptFlush();
-          }
+              // 6. Zero-Wait 24kHz PCM Output Playback (plays on chunk #1, never waits for turnComplete)
+              const parts = content.modelTurn?.parts;
+              if (Array.isArray(parts)) {
+                let receivedAudio = false;
+                for (const part of parts) {
+                  if (part.inlineData?.data) {
+                    receivedAudio = true;
+                    enqueueLivePcmChunk(
+                      part.inlineData.data,
+                      part.inlineData.mimeType
+                    );
+                  }
+                }
+                if (receivedAudio) {
+                  commitUserTurnIfPending();
+                }
+              }
 
-          // Real-time 24kHz PCM audio output chunks -> AudioWorklet Ring Buffer Player
-          const parts = content.modelTurn?.parts;
-          if (Array.isArray(parts)) {
-            let hasAudioChunk = false;
-            for (const part of parts) {
-              if (part.inlineData?.data) {
-                hasAudioChunk = true;
-                scheduleLivePcmOutputChunk(
-                  part.inlineData.data,
-                  part.inlineData.mimeType
+              // 7. Turn Complete -> finalize room chat + 0ms PILAR AI AKTIF + Google Search badge + localStorage
+              if (content.turnComplete) {
+                liveTurnCompleteRef.current = true;
+                finalizeCurrentTurnAsync();
+                if (liveScheduledSourcesRef.current.size === 0) {
+                  const ctx = liveOutputCtxRef.current;
+                  liveNextPlayTimeRef.current =
+                    ctx && ctx.state !== "closed" ? ctx.currentTime : 0;
+                  activeAnalyserRef.current = liveMicAnalyserRef.current;
+                  updateLiveStatus("listening");
+                }
+              }
+            },
+            onerror: (errEvent: ErrorEvent) => {
+              unexpectedCloseReason =
+                errEvent?.message || "WebSocket error pada sesi Live.";
+            },
+            onclose: (closeEvent: CloseEvent) => {
+              unexpectedCloseCode = closeEvent?.code;
+              unexpectedCloseReason = closeEvent?.reason || "";
+
+              // If session was already live and closed unexpectedly, show clear visible error (NO silent fallback)
+              if (
+                callActiveRef.current &&
+                sessionGenerationRef.current === generation &&
+                sessionRef.current !== null &&
+                closeEvent?.code !== 1000
+              ) {
+                sessionRef.current = null;
+                interruptLiveAudioPlayback();
+                finalizeCurrentTurnAsync();
+                setLiveError(
+                  formatLiveConnectionError(
+                    closeEvent?.reason || unexpectedCloseReason,
+                    closeEvent?.code
+                  )
                 );
+                updateLiveStatus("error");
               }
-            }
-            if (hasAudioChunk) {
-              commitLiveUserTurnIfPending();
-            }
-          }
+            },
+          },
+        });
 
-          // Turn complete -> finalize live chat bubble & signal worklet to drain remaining ring buffer
-          if (content.turnComplete) {
-            liveTurnCompleteRef.current = true;
-            flushLiveTurnTranscripts();
-            if (livePlaybackWorkletNodeRef.current) {
-              try {
-                livePlaybackWorkletNodeRef.current.port.postMessage({
-                  type: "turnComplete",
-                });
-              } catch {
-                // ignore
-              }
-            } else if (liveScheduledSourcesRef.current.size === 0) {
-              liveNextPlayTimeRef.current = 0;
-              activeAnalyserRef.current = liveMicAnalyserRef.current;
-              updatePhase("listening");
-            }
-          }
-        };
+        // Successfully connected & setupComplete received!
+        if (
+          !isMountedRef.current ||
+          !callActiveRef.current ||
+          !isOpen ||
+          sessionGenerationRef.current !== generation
+        ) {
+          connectedSession.close();
+          return;
+        }
 
-        ws.onerror = () => {
-          if (callActiveRef.current && liveWsRef.current === ws) {
-            void handlePreSetupFailure(1006);
-          }
-        };
+        sessionRef.current = connectedSession;
+        setLiveError("");
+        updateLiveStatus("listening");
+        return;
+      } catch (connectErr: unknown) {
+        const msg =
+          connectErr instanceof Error ? connectErr.message : String(connectErr);
+        const codeMatch = msg.match(/code\s+(\d{4})/i);
+        const parsedCode =
+          unexpectedCloseCode ??
+          (codeMatch ? Number.parseInt(codeMatch[1], 10) : undefined);
 
-        ws.onclose = (closeEvent) => {
-          if (callActiveRef.current && liveWsRef.current === ws) {
-            void handlePreSetupFailure(closeEvent?.code);
+        lastErrorReason = unexpectedCloseReason || msg;
+        lastCloseCode = parsedCode;
+
+        const isConfigRejection =
+          parsedCode === 1007 ||
+          parsedCode === 1008 ||
+          /invalid argument|unsupported|not supported|thinking/i.test(
+            lastErrorReason
+          );
+
+        // Clean progressive parameter adjustment on SAME Live model before switching models
+        if (isConfigRejection && !disableThinkingConfig && tokenCfg.thinkingConfig) {
+          disableThinkingConfig = true;
+          continue;
+        }
+        if (isConfigRejection && !disableCustomVad && tokenCfg.realtimeInputConfig) {
+          disableCustomVad = true;
+          continue;
+        }
+        if (isConfigRejection && !searchOnlyTools && tokenCfg.toolMode === "hybrid") {
+          searchOnlyTools = true;
+          continue;
+        }
+
+        // Otherwise exclude failed model (e.g., quota 1011 or unavailable model) and try next Live Native Audio model
+        if (tokenCfg.model && !excludedModels.includes(tokenCfg.model)) {
+          excludedModels.push(tokenCfg.model);
+          if (parsedCode === 1011 || parsedCode === 1008) {
+            recentlyFailedLiveModels.set(tokenCfg.model, Date.now());
           }
-        };
-      } catch {
-        void handlePreSetupFailure(1006);
+        }
+        searchOnlyTools = false;
+        disableThinkingConfig = false;
+        disableCustomVad = false;
       }
-    };
+    }
 
-    connectLiveWebSocketWithConfig(initialConfig);
+    // All Live Audio connection attempts failed -> show clear explicit error UI (ZERO silent fallback)
+    if (
+      isMountedRef.current &&
+      callActiveRef.current &&
+      sessionGenerationRef.current === generation
+    ) {
+      cleanupLiveResources({ keepMicAndAudioCtx: true });
+      setLiveError(formatLiveConnectionError(lastErrorReason, lastCloseCode));
+      updateLiveStatus("error");
+    }
   }, [
-    cleanupLiveSessionResources,
-    commitLiveUserTurnIfPending,
-    emitPendingLiveWebSources,
-    ensureLiveAssistantTurnId,
-    flushLiveTurnTranscripts,
-    getOrCreateAudioContext,
-    interruptLivePlayback,
+    attachMicCapturePipeline,
+    cleanupLiveResources,
+    commitUserTurnIfPending,
+    emitPendingSourcesAsync,
+    enqueueLivePcmChunk,
+    ensureAssistantTurnId,
+    finalizeCurrentTurnAsync,
+    interruptLiveAudioPlayback,
     isOpen,
-    scheduleLivePcmOutputChunk,
-    scheduleThrottledAssistantTranscriptFlush,
-    startLiveMicStreaming,
-    stopAiPlayback,
-    stopListening,
-    updatePhase,
+    scheduleAssistantTranscriptFlush,
+    scheduleUserTranscriptFlush,
+    updateLiveStatus,
   ]);
 
   useEffect(() => {
@@ -3920,27 +2727,12 @@ export function InteractiveVoiceCallOverlay({
   // Synchronize controlled mute state from ChatComposerBar
   useEffect(() => {
     isMicMutedRef.current = isMicMuted;
-    if (!isOpen || !callActiveRef.current) return;
-
-    if (isLiveModeRef.current) {
-      if (liveMicStreamRef.current) {
-        liveMicStreamRef.current.getAudioTracks().forEach((track) => {
-          track.enabled = !isMicMuted;
-        });
-      }
-      return;
+    if (liveMicStreamRef.current) {
+      liveMicStreamRef.current.getAudioTracks().forEach((track) => {
+        track.enabled = !isMicMuted;
+      });
     }
-
-    if (isMicMuted) {
-      stopListening();
-    } else if (
-      phaseRef.current !== "speaking" &&
-      phaseRef.current !== "thinking" &&
-      !isSubmittingTurnRef.current
-    ) {
-      startListeningRef.current();
-    }
-  }, [isMicMuted, isOpen, stopListening]);
+  }, [isMicMuted]);
 
   // Open / close lifecycle
   useEffect(() => {
@@ -3948,167 +2740,194 @@ export function InteractiveVoiceCallOverlay({
     callActiveRef.current = isOpen;
 
     if (!isOpen) {
+      sessionGenerationRef.current += 1;
       queueMicrotask(() => {
-        isSubmittingTurnRef.current = false;
-        isFallbackAudioModeRef.current = false;
-        webSpeechSilentExitCountRef.current = 0;
-        latestSpokenTextRef.current = "";
-        setMicPermissionError("");
-        cleanupLiveSessionResources();
-        stopListening();
-        stopAiPlayback();
-        closeAudioContextCleanly();
+        setLiveError("");
+        cleanupLiveResources();
       });
       return;
     }
 
-    // Boot directly into Real-Time Gemini Live WebSocket (with seamless fast-path fallback)
     const bootTimer = setTimeout(() => {
       if (!isMountedRef.current || !callActiveRef.current) return;
-      isSubmittingTurnRef.current = false;
-      webSpeechSilentExitCountRef.current = 0;
-      liveInputTurnTextRef.current = "";
-      liveOutputTurnTextRef.current = "";
-      liveAssistantTurnIdRef.current = null;
-      liveUserCommittedRef.current = false;
-      setMicPermissionError("");
-      startLiveSessionRef.current();
-    }, 30);
+      void startLiveSessionRef.current();
+    }, 20);
 
     return () => {
       isMountedRef.current = false;
       callActiveRef.current = false;
-      isSubmittingTurnRef.current = false;
+      sessionGenerationRef.current += 1;
       clearTimeout(bootTimer);
-      cleanupLiveSessionResources();
-      stopListening();
-      stopAiPlayback();
-      closeAudioContextCleanly();
+      cleanupLiveResources();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
 
   if (!isOpen) return null;
 
-  const handleOrbInteract = async () => {
-    // Retry mic permission if previously denied
-    if (micPermissionError) {
-      setMicPermissionError("");
-      webSpeechSilentExitCountRef.current = 0;
-      if (
-        typeof navigator !== "undefined" &&
-        navigator.mediaDevices &&
-        typeof navigator.mediaDevices.getUserMedia === "function"
-      ) {
-        try {
-          const probe = await navigator.mediaDevices.getUserMedia({
-            audio: true,
-          });
-          probe.getTracks().forEach((t) => t.stop());
-        } catch (err: unknown) {
-          if (isMicPermissionDenied(err)) {
-            setMicPermissionError(
-              "Izin mikrofon masih diblokir. Izinkan akses mikrofon browser lalu ketuk Orb."
-            );
-            return;
-          }
-        }
-      }
-      startLiveSessionRef.current();
-      return;
-    }
-
-    // Live WebSocket mode: tapping particle sphere interrupts AI playback immediately (manual barge-in)
-    if (isLiveModeRef.current) {
-      if (liveOutputCtxRef.current?.state === "suspended") {
-        liveOutputCtxRef.current.resume().catch(() => {});
-      }
-      if (liveInputCtxRef.current?.state === "suspended") {
-        liveInputCtxRef.current.resume().catch(() => {});
-      }
-      if (phase === "speaking") {
-        interruptLivePlayback();
-        flushLiveTurnTranscripts();
-        updatePhase("listening");
-      }
-      return;
-    }
-
-    getOrCreateAudioContext();
-
-    // Fallback mode barge-in: tapping sphere while AI speaks stops audio & listens
-    if (phase === "speaking") {
-      stopAiPlayback();
-      startListening();
-      return;
-    }
-
-    // Fallback mode listening: submit captured fallback audio or spoken text immediately if present
-    if (phase === "listening" && !isMicMutedRef.current) {
-      if (
-        isFallbackAudioModeRef.current &&
-        fallbackRecorderRef.current?.state === "recording"
-      ) {
-        finishAndSubmitFallbackAudio();
-        return;
-      }
-      const captured = latestSpokenTextRef.current.trim();
-      if (captured.length > 0) {
-        handleSpokenTextTurn(captured);
-        return;
-      }
-      startListening();
+  const handleVoiceChange = (nextVoice: LiveVoiceName) => {
+    if (nextVoice === selectedVoice) return;
+    selectedVoiceRef.current = nextVoice;
+    setSelectedVoice(nextVoice);
+    if (callActiveRef.current) {
+      void startLiveSessionRef.current();
     }
   };
 
-  const orbAriaLabel = micPermissionError
-    ? "Ketuk Orb untuk meminta ulang izin mikrofon"
-    : isMicMuted
-      ? "Mikrofon dibisukan"
-      : phase === "speaking"
-        ? "AI sedang berbicara, ketuk Orb untuk menyela dan langsung bicara"
-        : phase === "thinking"
-          ? "AI sedang memproses jawaban Anda"
-          : "Mendengarkan suara Anda, ketuk Orb untuk mengirim atau menyela";
+  const handleOrbInteract = () => {
+    if (liveStatus === "error") {
+      void startLiveSessionRef.current();
+      return;
+    }
+    if (liveOutputCtxRef.current?.state === "suspended") {
+      liveOutputCtxRef.current.resume().catch(() => {});
+    }
+    if (liveInputCtxRef.current?.state === "suspended") {
+      liveInputCtxRef.current.resume().catch(() => {});
+    }
+    // Manual barge-in when tapping orb while AI is speaking
+    if (liveStatus === "speaking") {
+      interruptLiveAudioPlayback();
+      finalizeCurrentTurnAsync();
+      updateLiveStatus("listening");
+    }
+  };
+
+  const orbPhase: LivingOrbPhase =
+    liveStatus === "speaking"
+      ? "speaking"
+      : liveStatus === "connecting" || liveStatus === "searching"
+        ? "thinking"
+        : "listening";
+
+  const statusText = isMicMuted
+    ? "Live · Mikrofon Dibisukan"
+    : LIVE_STATUS_LABELS[liveStatus];
+
+  const orbAriaLabel =
+    liveStatus === "error"
+      ? "Koneksi Live terputus, ketuk untuk menghubungkan ulang"
+      : isMicMuted
+        ? "Mikrofon dibisukan"
+        : liveStatus === "speaking"
+          ? "AI sedang berbicara, ketuk Orb untuk menyela"
+          : liveStatus === "searching"
+            ? "AI sedang mencari di Google"
+            : liveStatus === "connecting"
+              ? "Menghubungkan ke Gemini Live Audio"
+              : "Live aktif dan mendengarkan suara Anda";
 
   return (
     <div
-      className="pointer-events-none flex flex-col items-center justify-center select-none"
+      className="pointer-events-none flex flex-col items-center justify-center gap-1.5 select-none"
       role="region"
-      aria-label="Mode Suara AI Inline Formylab"
+      aria-label="Mode Suara Gemini Live Formylab"
+      data-live-status={liveStatus}
     >
       {/* Compact Frameless Audio-Reactive 3D Particle Sphere floating above composer */}
-      <div
-        role="button"
-        tabIndex={0}
+      <button
+        type="button"
         onClick={handleOrbInteract}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            handleOrbInteract();
-          }
-        }}
         aria-label={orbAriaLabel}
         title={orbAriaLabel}
-        className={`pointer-events-auto relative w-24 h-24 sm:w-28 sm:h-28 rounded-full cursor-pointer outline-none bg-transparent focus-visible:ring-2 focus-visible:ring-[#0E807E]/60 transition-all duration-300 active:scale-[0.95] ${
-          isMicMuted ? "opacity-55" : "opacity-100"
+        className={`pointer-events-auto relative w-24 h-24 sm:w-28 sm:h-28 rounded-full cursor-pointer outline-none bg-transparent border-0 p-0 focus-visible:ring-2 focus-visible:ring-[#0E807E]/60 transition-all duration-300 active:scale-[0.95] ${
+          isMicMuted || liveStatus === "error" ? "opacity-55" : "opacity-100"
         }`}
       >
         <LivingVoiceOrb
-          phase={phase}
+          phase={orbPhase}
           analyserRef={activeAnalyserRef}
           speechPulseRef={speechPulseRef}
         />
+      </button>
+
+      {/* Compact Live Connection Status Indicator + Voice Switcher (Aoede / Zephyr) */}
+      <div className="pointer-events-auto flex items-center gap-1.5 flex-wrap justify-center">
+        <div
+          role="status"
+          aria-live="polite"
+          className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium backdrop-blur-md border transition-colors ${
+            liveStatus === "error"
+              ? "bg-[#fef2f2]/95 text-[#b91c1c] border-[#b91c1c]/25"
+              : liveStatus === "searching"
+                ? "bg-[#eff6ff]/95 text-[#0369a1] border-[#0369a1]/25"
+                : "bg-white/90 text-[#0B2B26] border-[#0B2B26]/12"
+          }`}
+        >
+          {liveStatus === "connecting" ? (
+            <Loader2
+              className="w-3 h-3 text-[#0E807E] animate-spin shrink-0"
+              aria-hidden="true"
+            />
+          ) : liveStatus === "searching" ? (
+            <Globe
+              className="w-3 h-3 text-[#0369a1] animate-pulse shrink-0"
+              aria-hidden="true"
+            />
+          ) : liveStatus === "error" ? (
+            <AlertCircle
+              className="w-3 h-3 text-[#b91c1c] shrink-0"
+              aria-hidden="true"
+            />
+          ) : (
+            <span
+              className={`w-2 h-2 rounded-full shrink-0 ${
+                isMicMuted
+                  ? "bg-slate-400"
+                  : liveStatus === "speaking"
+                    ? "bg-[#0E807E] animate-pulse"
+                    : "bg-[#10B981] animate-pulse"
+              }`}
+              aria-hidden="true"
+            />
+          )}
+          <span className="whitespace-nowrap">{statusText}</span>
+        </div>
+
+        {/* Minimal Voice Switcher (Aoede / Zephyr) */}
+        <div
+          className="inline-flex items-center rounded-full bg-white/88 backdrop-blur-md border border-[#0B2B26]/12 p-0.5"
+          role="group"
+          aria-label="Pilih suara AI Live"
+        >
+          {LIVE_VOICE_OPTIONS.map((opt) => {
+            const active = selectedVoice === opt.id;
+            return (
+              <button
+                key={opt.id}
+                type="button"
+                onClick={() => handleVoiceChange(opt.id)}
+                title={`${opt.label} — ${opt.hint}`}
+                aria-pressed={active}
+                className={`px-2 py-0.5 rounded-full text-[10.5px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                  active
+                    ? "bg-[#0E807E] text-white"
+                    : "text-[#2E524C] hover:text-[#0B2B26]"
+                }`}
+              >
+                {opt.label}
+              </button>
+            );
+          })}
+        </div>
       </div>
 
-      {/* Micro-exception ONLY on fatal browser mic permission error */}
-      {micPermissionError && (
-        <p
-          role="status"
-          className="pointer-events-auto mt-1 text-[11px] font-medium text-[#2E524C] text-center max-w-xs leading-snug bg-white/90 backdrop-blur-md px-3 py-1 rounded-full border border-[#0B2B26]/12"
+      {/* Explicit Visible Error Banner (NEVER silently falls back to robotic TTS or REST) */}
+      {liveError && (
+        <div
+          role="alert"
+          className="pointer-events-auto mt-0.5 flex items-center gap-2 max-w-md px-3 py-1.5 rounded-xl bg-[#fef2f2]/95 border border-[#b91c1c]/25 text-[#991b1b] text-[11px] leading-snug backdrop-blur-md"
         >
-          {micPermissionError}
-        </p>
+          <span className="flex-1">{liveError}</span>
+          <button
+            type="button"
+            onClick={() => void startLiveSessionRef.current()}
+            className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-[#b91c1c] hover:bg-[#991b1b] text-white text-[10.5px] font-medium whitespace-nowrap cursor-pointer transition-colors shrink-0"
+          >
+            <RefreshCw className="w-3 h-3" aria-hidden="true" />
+            <span>Coba Lagi</span>
+          </button>
+        </div>
       )}
     </div>
   );

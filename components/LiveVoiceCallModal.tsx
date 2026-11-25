@@ -46,20 +46,21 @@ export type CallState =
 interface LiveVoiceCallModalProps {
   isOpen: boolean;
   onClose: () => void;
-  voice: VoiceSynthesisState;
+  voice?: VoiceSynthesisState;
   isMicMuted?: boolean;
   modelName?: string;
   isAiThinking?: boolean;
   latestAiReply?: string;
-  onSendSpokenPrompt: (
-    spokenText: string
-  ) => Promise<string | null | VoiceCallTurnResult>;
-  onSendSpokenAudio?: (audio: {
-    base64: string;
-    mimeType: string;
-  }) => Promise<VoiceCallTurnResult>;
-  onLiveUserTurn?: (text: string) => void;
+  onLiveUserStream?: (turnId: string, text: string) => void;
   onLiveAssistantStream?: (turnId: string, text: string) => void;
+  onLiveTurnComplete?: (payload: {
+    userTurnId?: string;
+    userText?: string;
+    assistantTurnId?: string;
+    assistantText?: string;
+    activePillars: string[];
+    usedGoogleSearch: boolean;
+  }) => void;
   onLiveWebSources?: (turnId: string, sources: WebSourceCitation[]) => void;
   onCreateChatNote?: (note: ChatNoteArtifact) => void;
   onCreateGoogleDoc?: (doc: GoogleDocArtifact) => void;
@@ -71,10 +72,9 @@ export default function LiveVoiceCallModal({
   voice,
   isMicMuted = false,
   latestAiReply,
-  onSendSpokenPrompt,
-  onSendSpokenAudio,
-  onLiveUserTurn,
+  onLiveUserStream,
   onLiveAssistantStream,
+  onLiveTurnComplete,
   onLiveWebSources,
   onCreateChatNote,
   onCreateGoogleDoc,
@@ -86,10 +86,9 @@ export default function LiveVoiceCallModal({
       voice={voice}
       isMicMuted={isMicMuted}
       recentChatContext={latestAiReply}
-      onSendSpokenPrompt={onSendSpokenPrompt}
-      onSendSpokenAudio={onSendSpokenAudio}
-      onLiveUserTurn={onLiveUserTurn}
+      onLiveUserStream={onLiveUserStream}
       onLiveAssistantStream={onLiveAssistantStream}
+      onLiveTurnComplete={onLiveTurnComplete}
       onLiveWebSources={onLiveWebSources}
       onCreateChatNote={onCreateChatNote}
       onCreateGoogleDoc={onCreateGoogleDoc}
