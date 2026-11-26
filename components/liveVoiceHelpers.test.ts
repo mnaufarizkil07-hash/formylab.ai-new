@@ -2,12 +2,21 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   LIVE_ECHO_GUARD_TAIL_MS,
+  LIVE_FSM_STATUS_LABELS,
+  LIVE_HOTSWAP_TARGET_TURN,
   LIVE_INPUT_CHUNK_SAMPLES,
+  LIVE_MAX_AUTO_RECONNECTS,
   LIVE_SPEECH_QUIET_CONFIRM_MS,
+  LIVE_STANDBY_MAX_AGE_MS,
+  LIVE_STANDBY_PREWARM_TURN,
   LIVE_STATUS_LABELS,
+  LIVE_TOOL_TIMEOUT_MS,
   LIVE_TRANSCRIPT_THROTTLE_MS,
+  LIVE_TURN_WATCHDOG_MS,
   LIVE_VOICE_OPTIONS,
   base64PcmToFloat32,
+  buildConversationMemorySummary,
+  buildLiveVoiceFunctionDeclarations,
   buildLiveVoiceSystemInstruction,
   classifyLiveVoicePillars,
   computeInt16PcmRms,
@@ -21,20 +30,128 @@ import {
   parsePcmSampleRate,
   sanitizeLiveTranscriptText,
   sanitizeLiveUserTranscript,
+  summarizeVoiceMetrics,
 } from "./liveVoiceHelpers";
+import {
+  encodeFormulaTableMessage,
+  extractFormulatorDraftFromTable,
+  formulaTableToMarkdown,
+  normalizeFormulaTableArtifact,
+  parseFormulaTableMessage,
+} from "./chatNoteUtils";
 
-test("Live Voice constants use 40ms (640-sample) chunks, 180ms Echo Guard tail, 300ms quiet profiler, 4 natural voices, and no thinking label", () => {
-  assert.equal(LIVE_INPUT_CHUNK_SAMPLES, 640); // ~40ms @ 16kHz
-  assert.equal(LIVE_TRANSCRIPT_THROTTLE_MS, 100);
-  assert.equal(LIVE_ECHO_GUARD_TAIL_MS, 180);
+test("Live Voice O(1) Hot-Swap, FSM, Echo Guard (220ms), Watchdog (5s), and Tool Timeout (12s) constants match architecture", () => {
+  assert.equal(LIVE_INPUT_CHUNK_SAMPLES, 640); // exact 40ms @ 16kHz
+  assert.equal(LIVE_TRANSCRIPT_THROTTLE_MS, 80);
+  assert.equal(LIVE_ECHO_GUARD_TAIL_MS, 220);
   assert.equal(LIVE_SPEECH_QUIET_CONFIRM_MS, 300);
+  assert.equal(LIVE_STANDBY_PREWARM_TURN, 2);
+  assert.equal(LIVE_HOTSWAP_TARGET_TURN, 3);
+  assert.equal(LIVE_STANDBY_MAX_AGE_MS, 55_000);
+  assert.equal(LIVE_TURN_WATCHDOG_MS, 5_000);
+  assert.equal(LIVE_TOOL_TIMEOUT_MS, 12_000);
+  assert.equal(LIVE_MAX_AUTO_RECONNECTS, 2);
+
   assert.deepEqual(
     LIVE_VOICE_OPTIONS.map((v) => v.id),
     ["Aoede", "Zephyr", "Kore", "Puck"]
   );
   assert.equal(LIVE_STATUS_LABELS.listening, "Live · Mendengarkan");
   assert.equal(LIVE_STATUS_LABELS.speaking, "Live · AI Berbicara");
-  assert.equal("thinking" in LIVE_STATUS_LABELS, false);
+  assert.equal(LIVE_FSM_STATUS_LABELS.LISTENING, "Live · Mendengarkan");
+  assert.equal(LIVE_FSM_STATUS_LABELS.AI_SPEAKING, "Live · AI Berbicara");
+  assert.equal(LIVE_FSM_STATUS_LABELS.TOOL_EXECUTING, "Live · Menyiapkan Aksi...");
+});
+
+test("buildLiveVoiceFunctionDeclarations provides unified tools across all voice chips and adds search_web_info only when Search is ON", () => {
+  const withoutSearch = buildLiveVoiceFunctionDeclarations(false);
+  assert.deepEqual(
+    withoutSearch.map((d) => d.name),
+    ["create_formula_table", "save_to_google_docs"]
+  );
+
+  const withSearch = buildLiveVoiceFunctionDeclarations(true);
+  assert.deepEqual(
+    withSearch.map((d) => d.name),
+    ["create_formula_table", "save_to_google_docs", "search_web_info"]
+  );
+});
+
+test("buildConversationMemorySummary keeps max 8 recent messages, expands FormulaTable cards, and caps at 350 words", () => {
+  const table = normalizeFormulaTableArtifact({
+    title: "Serum Niacinamide 5%",
+    columns: ["Bahan", "Persen"],
+    rows: [
+      ["Aqua", "90%"],
+      ["Niacinamide", "5%"],
+    ],
+  });
+  assert.ok(table);
+
+  const messages = Array.from({ length: 12 }, (_, idx) => ({
+    role: (idx % 2 === 0 ? "user" : "assistant") as "user" | "assistant",
+    content:
+      idx === 11
+        ? encodeFormulaTableMessage(table!)
+        : `Pesan ke-${idx + 1} tentang formulasi pelembap kulit sensitif.`,
+  }));
+
+  const summary = buildConversationMemorySummary(messages, 8, 350);
+  assert.equal(summary.includes("Pesan ke-1 "), false); // older than last 8
+  assert.ok(summary.includes("Pesan ke-5"));
+  assert.ok(summary.includes("Tabel Formulasi — Serum Niacinamide 5%"));
+  assert.ok(summary.split(/\s+/).length <= 350);
+});
+
+test("FormulaTableArtifact round-trip encode/parse, Markdown conversion, and Formulator draft extraction", () => {
+  const table = normalizeFormulaTableArtifact({
+    title: "Moisturizer Kulit Sensitif",
+    subtitle: "Target pH 5.3 · Tekstur gel-cream",
+    columns: ["Fase", "Bahan", "Persentase (%)", "Fungsi"],
+    rows: [
+      ["A", "Aqua", "82%", "Pelarut"],
+      ["B", "Squalane", "6%", "Emolien"],
+      ["C", "Ceramide NP", "1%", "Skin barrier"],
+    ],
+    notes: "Homogenisasi pada 70°C.",
+  });
+  assert.ok(table);
+
+  const encoded = encodeFormulaTableMessage(table!);
+  const parsed = parseFormulaTableMessage(encoded);
+  assert.ok(parsed);
+  assert.equal(parsed?.title, "Moisturizer Kulit Sensitif");
+  assert.equal(parsed?.rows.length, 3);
+
+  const md = formulaTableToMarkdown(parsed!);
+  assert.ok(md.includes("| Fase | Bahan | Persentase (%) | Fungsi |"));
+  assert.ok(md.includes("| C | Ceramide NP | 1% | Skin barrier |"));
+  assert.ok(md.includes("Homogenisasi pada 70°C."));
+
+  const draft = extractFormulatorDraftFromTable(parsed!);
+  assert.equal(draft.formulaName, "Moisturizer Kulit Sensitif");
+  assert.equal(draft.targetPh, "5.3");
+  assert.equal(draft.skinTarget, "Sensitive");
+  assert.deepEqual(draft.customIngredients, [
+    "Aqua (82%)",
+    "Squalane (6%)",
+    "Ceramide NP (1%)",
+  ]);
+});
+
+test("summarizeVoiceMetrics computes Turn #1-3 vs Turn #4+ averages and hot-swap count", () => {
+  const summary = summarizeVoiceMetrics([
+    { turn: 1, sessionIndex: 1, firstAudioMs: 500, queueDelayMs: 20, toolsCalled: "-", hotSwapped: "tidak" },
+    { turn: 2, sessionIndex: 1, firstAudioMs: 600, queueDelayMs: 22, toolsCalled: "create_formula_table", hotSwapped: "tidak" },
+    { turn: 3, sessionIndex: 1, firstAudioMs: 700, queueDelayMs: 18, toolsCalled: "-", hotSwapped: "tidak" },
+    { turn: 4, sessionIndex: 2, firstAudioMs: 520, queueDelayMs: 19, toolsCalled: "save_to_google_docs", hotSwapped: "ya" },
+    { turn: 5, sessionIndex: 2, firstAudioMs: 580, queueDelayMs: 20, toolsCalled: "-", hotSwapped: "tidak" },
+  ]);
+
+  assert.equal(summary.totalTurns, 5);
+  assert.equal(summary.avgFirstAudioTurn1To3Ms, 600);
+  assert.equal(summary.avgFirstAudioTurn4PlusMs, 550);
+  assert.equal(summary.hotSwapCount, 1);
 });
 
 test("sanitizeLiveTranscriptText & sanitizeLiveUserTranscript strip noise tags and stray leading punctuation", () => {
@@ -49,7 +166,6 @@ test("sanitizeLiveTranscriptText & sanitizeLiveUserTranscript strip noise tags a
     "Halo semuanya"
   );
 
-  // Leading punctuation from VAD onset must be stripped cleanly
   assert.equal(
     sanitizeLiveUserTranscript(". Oke, langsung buat resepnya."),
     "Oke, langsung buat resepnya."
@@ -119,25 +235,21 @@ test("parsePcmSampleRate extracts rate from mimeType or falls back cleanly", () 
   assert.equal(parsePcmSampleRate(undefined, 24000), 24000);
 });
 
-test("buildLiveVoiceSystemInstruction enforces concise 1-2 sentence spoken Indonesian style and opt-in Search", () => {
+test("buildLiveVoiceSystemInstruction enforces Module 4 natural spoken Indonesian, Unified Tools, and text memory injection", () => {
   const purePrompt = buildLiveVoiceSystemInstruction(
-    "Diskusi moisturizer ceramide",
+    "User: Halo\nAI: Halo, ada formula yang mau dibahas?",
     false
   );
-  assert.ok(purePrompt.length < 1150);
-  assert.equal(purePrompt.includes("googleSearch"), false);
-  assert.equal(purePrompt.includes("create_chat_note"), false);
-  assert.equal(purePrompt.includes("create_google_doc"), false);
   assert.ok(purePrompt.includes("1 sampai 2 kalimat"));
-  assert.ok(purePrompt.includes("Formulator"));
-  assert.ok(purePrompt.includes("Diskusi moisturizer ceramide"));
+  assert.ok(purePrompt.includes("create_formula_table"));
+  assert.ok(purePrompt.includes("save_to_google_docs"));
+  assert.ok(purePrompt.includes("[MEMORI PERCAKAPAN SEBELUMNYA]"));
+  assert.ok(purePrompt.includes("DILARANG membacakan simbol markdown"));
+  assert.ok(purePrompt.includes("JANGAN PERNAH menolak"));
 
-  const searchPrompt = buildLiveVoiceSystemInstruction(
-    "Diskusi moisturizer ceramide",
-    true
-  );
-  assert.ok(searchPrompt.includes("HANYA gunakan tool googleSearch"));
-  assert.ok(searchPrompt.includes("DILARANG membacakan simbol markdown"));
+  const searchPrompt = buildLiveVoiceSystemInstruction("", true);
+  assert.ok(searchPrompt.includes("search_web_info"));
+  assert.equal(searchPrompt.includes("[MEMORI PERCAKAPAN SEBELUMNYA]"), false);
 });
 
 test("hasGoogleSearchGrounding detects search queries or grounding chunks", () => {
@@ -182,20 +294,17 @@ test("computeInt16PcmRms and observeMicRmsForProfiler detect speech end after 30
   assert.ok(Math.abs(computeInt16PcmRms(loud) - 0.5) < 0.001);
 
   let state = createSpeechEndProfilerState();
-  // User speaks at t=1000ms and t=1040ms
   state = observeMicRmsForProfiler(state, 0.09, 1000);
   state = observeMicRmsForProfiler(state, 0.08, 1040);
   assert.equal(state.userSpeaking, true);
   assert.equal(state.lastSpeechEndedAtMs, 0);
 
-  // User goes quiet at t=1080ms; not yet 300ms quiet at t=1280ms
   state = observeMicRmsForProfiler(state, 0.004, 1080);
   state = observeMicRmsForProfiler(state, 0.004, 1280);
   assert.equal(state.userSpeaking, true);
   assert.equal(state.quietSinceMs, 1080);
   assert.equal(state.lastSpeechEndedAtMs, 0);
 
-  // At t=1380ms (300ms quiet confirmed), stamps exact quiet onset timestamp
   state = observeMicRmsForProfiler(state, 0.004, 1380);
   assert.equal(state.userSpeaking, false);
   assert.equal(state.lastSpeechEndedAtMs, 1080);

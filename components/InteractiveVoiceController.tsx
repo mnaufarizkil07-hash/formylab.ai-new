@@ -23,24 +23,40 @@ import {
 import { cleanMarkdownForSpeech } from "../lib/interactiveAiEngine";
 import {
   ChatNoteArtifact,
+  FormulaTableArtifact,
   GoogleDocArtifact,
   WebSourceCitation,
   extractWebSourcesFromGroundingMetadata,
+  formulaTableToMarkdown,
   mergeUniqueWebSources,
   normalizeChatNoteArtifact,
-  normalizeGoogleDocArtifact,
+  normalizeFormulaTableArtifact,
+  normalizeWebSourceCitation,
 } from "./chatNoteUtils";
 import {
+  createGoogleDocInDrive,
+  isGoogleDriveConnected,
+} from "../lib/googleDocsClient";
+import {
   LIVE_ECHO_GUARD_TAIL_MS,
+  LIVE_FSM_STATUS_LABELS,
+  LIVE_HOTSWAP_TARGET_TURN,
   LIVE_INPUT_CHUNK_SAMPLES,
   LIVE_INPUT_TARGET_SAMPLE_RATE,
-  LIVE_STATUS_LABELS,
+  LIVE_MAX_AUTO_RECONNECTS,
+  LIVE_STANDBY_MAX_AGE_MS,
+  LIVE_STANDBY_PREWARM_TURN,
+  LIVE_TOOL_TIMEOUT_MS,
   LIVE_TRANSCRIPT_THROTTLE_MS,
+  LIVE_TURN_WATCHDOG_MS,
   LIVE_VOICE_OPTIONS,
-  LiveConnectionStatus,
+  LiveMemoryMessage,
+  LiveVoiceFsmState,
   LiveVoiceName,
   SpeechEndProfilerState,
+  VoiceTurnMetric,
   base64PcmToFloat32,
+  buildConversationMemorySummary,
   classifyLiveVoicePillars,
   computeInt16PcmRms,
   createSpeechEndProfilerState,
@@ -52,6 +68,7 @@ import {
   parsePcmSampleRate,
   sanitizeLiveTranscriptText,
   sanitizeLiveUserTranscript,
+  summarizeVoiceMetrics,
 } from "./liveVoiceHelpers";
 
 export interface VoiceSynthesisState {
@@ -735,6 +752,7 @@ interface InteractiveVoiceCallOverlayProps {
   voice?: VoiceSynthesisState;
   isMicMuted?: boolean;
   recentChatContext?: string;
+  recentMessages?: LiveMemoryMessage[];
   onLiveUserStream?: (turnId: string, text: string) => void;
   onLiveAssistantStream?: (turnId: string, text: string) => void;
   onLiveRemoveMessage?: (turnId: string) => void;
@@ -747,6 +765,7 @@ interface InteractiveVoiceCallOverlayProps {
     usedGoogleSearch: boolean;
   }) => void;
   onLiveWebSources?: (turnId: string, sources: WebSourceCitation[]) => void;
+  onCreateFormulaTable?: (table: FormulaTableArtifact) => void;
   onCreateChatNote?: (note: ChatNoteArtifact) => void;
   onCreateGoogleDoc?: (doc: GoogleDocArtifact) => void;
 }
@@ -1575,32 +1594,89 @@ function LivingVoiceOrb({
   );
 }
 
+const MAX_VOICE_METRICS_HISTORY = 1000;
+
+function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  timeoutMessage: string
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(timeoutMessage));
+    }, timeoutMs);
+    promise.then(
+      (val) => {
+        clearTimeout(timer);
+        resolve(val);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
+function getToolStatusLabel(toolName: string): string {
+  switch (toolName) {
+    case "create_formula_table":
+      return "Live · Menyiapkan Tabel...";
+    case "save_to_google_docs":
+    case "create_google_doc":
+      return "Live · Menyimpan ke Docs...";
+    case "search_web_info":
+      return "Live · Mencari Info...";
+    case "create_chat_note":
+      return "Live · Mencatat...";
+    default:
+      return "Live · Menyiapkan Aksi...";
+  }
+}
+
+declare global {
+  interface Window {
+    __formylabVoiceStats?: () => {
+      history: VoiceTurnMetric[];
+      summary: ReturnType<typeof summarizeVoiceMetrics>;
+    };
+    __testVoiceTools?: () => {
+      tableCreated: boolean;
+      googleDocCreated: boolean;
+    };
+  }
+}
+
 /**
- * Ultra-Low-Latency Inline Chat-Room Gemini Live Voice Mode:
- * - Connects directly from the browser via `@google/genai` `ai.live.connect(...)` using a short-lived
- *   server-minted Ephemeral Token (`/api/live-token`) — 100% Vercel compatible.
- * - ZERO `SpeechRecognition`, ZERO HTTP REST `/api/chat`, ZERO `window.speechSynthesis` fallback.
- * - Streams 16kHz Int16 PCM mic audio in 30ms packets via inline-Blob `AudioWorkletNode`.
- * - Plays 24kHz PCM AI output immediately on the very first chunk via `AudioBufferSourceNode` queue
- *   with instant barge-in (`serverContent.interrupted` -> immediate `.stop()` + queue clear).
- * - Streams user & AI transcripts + Google Search grounding + 0ms `PILAR AI AKTIF` asynchronously
- *   to the main chat room without ever blocking the audio thread.
+ * O(1) Constant-Latency Inline Chat-Room Gemini Live Voice Mode:
+ * - Module 1: Dual-Session Background Hot-Swap Rotation (`activeSessionRef` + `standbySessionRef`).
+ *   Pre-warms standby at Turn #2 (or 55s age) with compact text memory only, swaps atomically (<5ms)
+ *   after Turn #3 without touching mic/AudioWorklet/AudioContext.
+ * - Module 2: Ironclad Turn FSM (`IDLE | CONNECTING | LISTENING | AI_SPEAKING | TOOL_EXECUTING | ERROR`),
+ *   220ms Smart Echo Guard tail, 5s watchdog, manual orb barge-in, 80ms throttled streaming, and
+ *   late `outputTranscription` bubble preservation.
+ * - Module 3: Unified Function Calling (`create_formula_table`, `save_to_google_docs`, conditional
+ *   `search_web_info` via `/api/live-search`) active identically across Aoede, Zephyr, Kore, Puck.
+ * - Module 5: Diagnostics ring buffer (`window.__formylabVoiceStats()`) + instant UI dry-run
+ *   (`window.__testVoiceTools()`).
  */
 export function InteractiveVoiceCallOverlay({
   isOpen,
   voice,
   isMicMuted = false,
   recentChatContext,
+  recentMessages,
   onLiveUserStream,
   onLiveAssistantStream,
   onLiveRemoveMessage,
   onLiveTurnComplete,
   onLiveWebSources,
+  onCreateFormulaTable,
   onCreateChatNote,
   onCreateGoogleDoc,
 }: InteractiveVoiceCallOverlayProps) {
-  const [liveStatus, setLiveStatus] =
-    useState<LiveConnectionStatus>("connecting");
+  const [fsmState, setFsmState] = useState<LiveVoiceFsmState>("IDLE");
+  const [toolStatusLabel, setToolStatusLabel] = useState<string>("");
   const [selectedVoice, setSelectedVoice] = useState<LiveVoiceName>("Aoede");
   const [searchEnabled, setSearchEnabled] = useState<boolean>(false);
   const [liveError, setLiveError] = useState<string>("");
@@ -1611,8 +1687,9 @@ export function InteractiveVoiceCallOverlay({
   const isMicMutedRef = useRef(isMicMuted);
   const selectedVoiceRef = useRef<LiveVoiceName>(selectedVoice);
   const searchEnabledRef = useRef<boolean>(searchEnabled);
-  const liveStatusRef = useRef<LiveConnectionStatus>("connecting");
+  const fsmStateRef = useRef<LiveVoiceFsmState>("IDLE");
   const recentContextRef = useRef<string>(recentChatContext || "");
+  const recentMessagesRef = useRef<LiveMemoryMessage[]>(recentMessages || []);
 
   // Latest callback refs
   const onLiveUserStreamRef = useRef(onLiveUserStream);
@@ -1620,6 +1697,7 @@ export function InteractiveVoiceCallOverlay({
   const onLiveRemoveMessageRef = useRef(onLiveRemoveMessage);
   const onLiveTurnCompleteRef = useRef(onLiveTurnComplete);
   const onLiveWebSourcesRef = useRef(onLiveWebSources);
+  const onCreateFormulaTableRef = useRef(onCreateFormulaTable);
   const onCreateChatNoteRef = useRef(onCreateChatNote);
   const onCreateGoogleDocRef = useRef(onCreateGoogleDoc);
   const voiceStopSpeechRef = useRef(voice?.stopSpeech);
@@ -1645,6 +1723,10 @@ export function InteractiveVoiceCallOverlay({
   }, [onLiveWebSources]);
 
   useEffect(() => {
+    onCreateFormulaTableRef.current = onCreateFormulaTable;
+  }, [onCreateFormulaTable]);
+
+  useEffect(() => {
     onCreateChatNoteRef.current = onCreateChatNote;
   }, [onCreateChatNote]);
 
@@ -1661,6 +1743,10 @@ export function InteractiveVoiceCallOverlay({
   }, [recentChatContext]);
 
   useEffect(() => {
+    recentMessagesRef.current = recentMessages || [];
+  }, [recentMessages]);
+
+  useEffect(() => {
     selectedVoiceRef.current = selectedVoice;
   }, [selectedVoice]);
 
@@ -1668,11 +1754,30 @@ export function InteractiveVoiceCallOverlay({
     searchEnabledRef.current = searchEnabled;
   }, [searchEnabled]);
 
-  // Gemini Live SDK Session & Dual AudioContext Refs
-  const sessionRef = useRef<Session | null>(null);
-  const sessionGenerationRef = useRef(0);
+  // ============================================================================
+  // MODULE 1: DUAL-SESSION HOT-SWAP REFS
+  // ============================================================================
+  const activeSessionRef = useRef<Session | null>(null);
+  const standbySessionRef = useRef<Session | null>(null);
+  const standbyReadyRef = useRef<boolean>(false);
+  const standbyPrewarmingRef = useRef<boolean>(false);
+  const activeSessionIndexRef = useRef<number>(1);
+  const standbySessionIndexRef = useRef<number>(2);
+  const activeSessionStartedAtRef = useRef<number>(0);
+  const sessionTurnCountRef = useRef<number>(0);
+  const autoReconnectCountRef = useRef<number>(0);
+
+  // Separate audio pipeline generation (bumped ONLY on full teardown) vs session generation
+  // (bumped on BOTH full teardown AND atomic hot-swap so mic/worklet stays uninterrupted during swap).
+  const audioPipelineGenerationRef = useRef<number>(0);
+  const sessionGenerationRef = useRef<number>(0);
+
   const bootTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const prewarmIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const tokenAbortControllerRef = useRef<AbortController | null>(null);
+  const standbyAbortControllerRef = useRef<AbortController | null>(null);
+
+  // Dual AudioContext & Mic Pipeline Refs
   const liveInputCtxRef = useRef<AudioContext | null>(null);
   const liveOutputCtxRef = useRef<AudioContext | null>(null);
   const liveMicStreamRef = useRef<MediaStream | null>(null);
@@ -1687,51 +1792,84 @@ export function InteractiveVoiceCallOverlay({
   const liveScriptNodeRef = useRef<ScriptProcessorNode | null>(null);
   const liveSilentGainRef = useRef<GainNode | null>(null);
 
-  // Zero-Wait 24kHz AudioBufferSourceNode Queue + Smart Echo Guard Refs
+  // ============================================================================
+  // MODULE 2: ZERO-WAIT PLAYBACK + SMART ECHO GUARD + WATCHDOG REFS
+  // ============================================================================
   const liveScheduledSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const activePlaybackNodesRef = useRef<number>(0);
   const micUnlockAtRef = useRef<number>(0);
   const echoUnlockTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const turnWatchdogTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const liveNextPlayTimeRef = useRef<number>(0);
-  const liveTurnCompleteRef = useRef<boolean>(true);
+  const isServerTurnCompleteRef = useRef<boolean>(true);
+  const activeTurnIdRef = useRef<number>(0);
 
-  // Asynchronous Transcript & Google Search Grounding Refs (never block audio)
-  const userTurnIdRef = useRef<string | null>(null);
+  // Asynchronous Transcript & Late-Fragment Preservation Refs
+  const currentUserMessageIdRef = useRef<string | null>(null);
   const userTurnTextRef = useRef<string>("");
   const userTurnCommittedRef = useRef<boolean>(false);
   const userFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const assistantTurnIdRef = useRef<string | null>(null);
+  const currentAiMessageIdRef = useRef<string | null>(null);
   const assistantTurnTextRef = useRef<string>("");
   const assistantFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null
   );
+  // Preserves the last committed AI bubble ID & text across `turnComplete` so late
+  // `outputTranscription` chunks (100-500ms after audio finishes) append to the SAME bubble
+  // until the user begins the next turn.
+  const lastCommittedAiMessageIdRef = useRef<string | null>(null);
+  const lastCommittedAiTextRef = useRef<string>("");
 
   const turnPendingSourcesRef = useRef<WebSourceCitation[]>([]);
   const turnUsedGoogleSearchRef = useRef<boolean>(false);
 
-  // Per-turn millisecond latency profiler & counter refs (read-only logging, never alters audio)
+  // ============================================================================
+  // MODULE 3: TOOL ARTIFACT REFS
+  // ============================================================================
+  const latestFormulaTableRef = useRef<FormulaTableArtifact | null>(null);
+  const pendingGoogleDocRef = useRef<GoogleDocArtifact | null>(null);
+  const turnToolsCalledRef = useRef<string[]>([]);
+
+  // ============================================================================
+  // MODULE 5: DIAGNOSTICS RING BUFFER & PROFILER REFS
+  // ============================================================================
+  const metricsHistoryRef = useRef<VoiceTurnMetric[]>([]);
   const turnCounterRef = useRef<number>(0);
   const activeTurnNumberRef = useRef<number>(0);
   const activePlaybackTurnNumberRef = useRef<number>(0);
   const loggedServerAudioForTurnRef = useRef<boolean>(false);
-  const loggedSpeakerFinishedForTurnRef = useRef<boolean>(false);
+  const loggedTurnDoneForTurnRef = useRef<boolean>(false);
+  const currentTurnFirstAudioMsRef = useRef<number>(0);
+  const currentTurnQueueDelayMsRef = useRef<number>(0);
+  const pendingHotSwapFlagForNextTurnRef = useRef<boolean>(false);
   const speechProfilerRef = useRef<SpeechEndProfilerState>(
     createSpeechEndProfilerState()
   );
   const lastSpeechEndedAtRef = useRef<number>(0);
 
+  // Forward-declared async action refs to avoid circular useCallback deps
   const startLiveSessionRef = useRef<() => Promise<void>>(async () => {});
+  const prepareStandbySessionRef = useRef<() => Promise<void>>(async () => {});
+  const performAtomicHotSwapIfReadyRef = useRef<() => boolean>(() => false);
+  const reconnectActiveSessionInPlaceRef = useRef<() => Promise<void>>(
+    async () => {}
+  );
 
-  const updateLiveStatus = useCallback((next: LiveConnectionStatus) => {
-    liveStatusRef.current = next;
-    setLiveStatus(next);
-  }, []);
+  const setFsm = useCallback(
+    (next: LiveVoiceFsmState, nextToolLabel = "") => {
+      fsmStateRef.current = next;
+      setFsmState(next);
+      setToolStatusLabel(next === "TOOL_EXECUTING" ? nextToolLabel : "");
+    },
+    []
+  );
 
   const ensureActiveTurnNumber = useCallback((): number => {
     if (activeTurnNumberRef.current === 0) {
       turnCounterRef.current += 1;
       activeTurnNumberRef.current = turnCounterRef.current;
+      activeTurnIdRef.current += 1;
     }
     return activeTurnNumberRef.current;
   }, []);
@@ -1754,32 +1892,46 @@ export function InteractiveVoiceCallOverlay({
     }
   }, []);
 
-  const ensureUserTurnId = useCallback((): string => {
-    if (!userTurnIdRef.current) {
-      userTurnIdRef.current = `live-u-${Date.now()}-${Math.random()
-        .toString(36)
-        .slice(2, 6)}`;
+  const clearTurnWatchdogTimer = useCallback(() => {
+    if (turnWatchdogTimerRef.current !== null) {
+      clearTimeout(turnWatchdogTimerRef.current);
+      turnWatchdogTimerRef.current = null;
     }
-    return userTurnIdRef.current;
   }, []);
 
-  const ensureAssistantTurnId = useCallback((): string => {
-    if (!assistantTurnIdRef.current) {
-      assistantTurnIdRef.current = `live-ai-${Date.now()}-${Math.random()
+  const clearPrewarmInterval = useCallback(() => {
+    if (prewarmIntervalRef.current !== null) {
+      clearInterval(prewarmIntervalRef.current);
+      prewarmIntervalRef.current = null;
+    }
+  }, []);
+
+  const ensureUserMessageId = useCallback((): string => {
+    if (!currentUserMessageIdRef.current) {
+      currentUserMessageIdRef.current = `live-u-${Date.now()}-${Math.random()
         .toString(36)
         .slice(2, 6)}`;
     }
-    return assistantTurnIdRef.current;
+    return currentUserMessageIdRef.current;
+  }, []);
+
+  const ensureAssistantMessageId = useCallback((): string => {
+    if (!currentAiMessageIdRef.current) {
+      currentAiMessageIdRef.current = `live-ai-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2, 6)}`;
+    }
+    return currentAiMessageIdRef.current;
   }, []);
 
   const flushUserTranscriptNow = useCallback(() => {
     const clean = sanitizeLiveUserTranscript(userTurnTextRef.current);
     if (!clean) return;
-    const turnId = ensureUserTurnId();
+    const turnId = ensureUserMessageId();
     queueMicrotask(() => {
       onLiveUserStreamRef.current?.(turnId, clean);
     });
-  }, [ensureUserTurnId]);
+  }, [ensureUserMessageId]);
 
   const scheduleUserTranscriptFlush = useCallback(() => {
     if (userFlushTimerRef.current !== null) return;
@@ -1800,12 +1952,12 @@ export function InteractiveVoiceCallOverlay({
   const flushAssistantTranscriptNow = useCallback(() => {
     const clean = sanitizeLiveTranscriptText(assistantTurnTextRef.current);
     if (!clean) return;
-    const turnId = ensureAssistantTurnId();
+    const turnId = ensureAssistantMessageId();
     queueMicrotask(() => {
       onLiveAssistantStreamRef.current?.(turnId, clean);
     });
     emitPendingSourcesAsync(turnId);
-  }, [emitPendingSourcesAsync, ensureAssistantTurnId]);
+  }, [emitPendingSourcesAsync, ensureAssistantMessageId]);
 
   const scheduleAssistantTranscriptFlush = useCallback(() => {
     if (assistantFlushTimerRef.current !== null) return;
@@ -1827,73 +1979,116 @@ export function InteractiveVoiceCallOverlay({
     flushUserTranscriptNow();
   }, [flushUserTranscriptNow]);
 
-  const finalizeCurrentTurnAsync = useCallback(() => {
-    clearTranscriptThrottleTimers();
-
-    const existingUserId = userTurnIdRef.current;
-    const finalUserText = sanitizeLiveUserTranscript(userTurnTextRef.current);
-    const finalUserId = finalUserText ? ensureUserTurnId() : undefined;
-
-    const finalAiText = sanitizeLiveTranscriptText(assistantTurnTextRef.current);
-    const finalAiId = finalAiText ? ensureAssistantTurnId() : undefined;
-    const usedGoogleSearch =
-      turnUsedGoogleSearchRef.current ||
-      turnPendingSourcesRef.current.length > 0;
-    const sourcesSnapshot = [...turnPendingSourcesRef.current];
-
-    // Reset turn buffers & per-turn server audio flag immediately so next turn never collides
-    userTurnIdRef.current = null;
-    userTurnTextRef.current = "";
-    userTurnCommittedRef.current = false;
-    assistantTurnIdRef.current = null;
-    assistantTurnTextRef.current = "";
-    turnPendingSourcesRef.current = [];
-    turnUsedGoogleSearchRef.current = false;
-    loggedServerAudioForTurnRef.current = false;
-    activeTurnNumberRef.current = 0;
-
-    if (!finalUserText && existingUserId) {
-      queueMicrotask(() => {
-        onLiveRemoveMessageRef.current?.(existingUserId);
-      });
+  const recordTurnMetric = useCallback((finishedTurnNum: number) => {
+    if (finishedTurnNum <= 0) return;
+    const toolsText =
+      turnToolsCalledRef.current.length > 0
+        ? Array.from(new Set(turnToolsCalledRef.current)).join(", ")
+        : "-";
+    const metric: VoiceTurnMetric = {
+      turn: finishedTurnNum,
+      sessionIndex: activeSessionIndexRef.current,
+      firstAudioMs: currentTurnFirstAudioMsRef.current,
+      queueDelayMs: currentTurnQueueDelayMsRef.current,
+      toolsCalled: toolsText,
+      hotSwapped: pendingHotSwapFlagForNextTurnRef.current ? "ya" : "tidak",
+    };
+    metricsHistoryRef.current.push(metric);
+    if (metricsHistoryRef.current.length > MAX_VOICE_METRICS_HISTORY) {
+      metricsHistoryRef.current.shift();
     }
+    pendingHotSwapFlagForNextTurnRef.current = false;
+    currentTurnFirstAudioMsRef.current = 0;
+    currentTurnQueueDelayMsRef.current = 0;
+    turnToolsCalledRef.current = [];
+  }, []);
 
-    if (!finalUserText && !finalAiText) return;
+  const finalizeCurrentTurnAsync = useCallback(
+    (options?: { clearLateAiTarget?: boolean }) => {
+      clearTranscriptThrottleTimers();
 
-    // 100% asynchronous UI & localStorage persistence (runs only on turnComplete/interrupted; 0 ms audio impact)
-    queueMicrotask(() => {
-      if (finalUserId && finalUserText) {
-        onLiveUserStreamRef.current?.(finalUserId, finalUserText);
-      }
-      if (finalAiId && finalAiText) {
-        onLiveAssistantStreamRef.current?.(finalAiId, finalAiText);
-      }
-      if (finalAiId && sourcesSnapshot.length > 0) {
-        onLiveWebSourcesRef.current?.(finalAiId, sourcesSnapshot);
-      }
-      const activePillars = classifyLiveVoicePillars(
-        finalUserText,
-        finalAiText,
-        usedGoogleSearch
+      const existingUserId = currentUserMessageIdRef.current;
+      const finalUserText = sanitizeLiveUserTranscript(userTurnTextRef.current);
+      const finalUserId = finalUserText ? ensureUserMessageId() : undefined;
+
+      const finalAiText = sanitizeLiveTranscriptText(
+        assistantTurnTextRef.current
       );
-      onLiveTurnCompleteRef.current?.({
-        userTurnId: finalUserId,
-        userText: finalUserText || undefined,
-        assistantTurnId: finalAiId,
-        assistantText: finalAiText || undefined,
-        activePillars,
-        usedGoogleSearch,
+      const finalAiId = finalAiText ? ensureAssistantMessageId() : undefined;
+      const usedGoogleSearch =
+        turnUsedGoogleSearchRef.current ||
+        turnPendingSourcesRef.current.length > 0;
+      const sourcesSnapshot = [...turnPendingSourcesRef.current];
+
+      // Remember AI bubble ID & text so late outputTranscription chunks (100-500ms after
+      // audio ends) still merge cleanly into the SAME bubble until user speaks again.
+      if (options?.clearLateAiTarget) {
+        lastCommittedAiMessageIdRef.current = null;
+        lastCommittedAiTextRef.current = "";
+      } else if (finalAiId && finalAiText) {
+        lastCommittedAiMessageIdRef.current = finalAiId;
+        lastCommittedAiTextRef.current = assistantTurnTextRef.current;
+      }
+
+      // Reset per-turn buffers immediately so next turn never collides
+      currentUserMessageIdRef.current = null;
+      userTurnTextRef.current = "";
+      userTurnCommittedRef.current = false;
+      currentAiMessageIdRef.current = null;
+      assistantTurnTextRef.current = "";
+      turnPendingSourcesRef.current = [];
+      turnUsedGoogleSearchRef.current = false;
+      loggedServerAudioForTurnRef.current = false;
+      activeTurnNumberRef.current = 0;
+
+      if (!finalUserText && existingUserId) {
+        queueMicrotask(() => {
+          onLiveRemoveMessageRef.current?.(existingUserId);
+        });
+      }
+
+      if (!finalUserText && !finalAiText) return;
+
+      queueMicrotask(() => {
+        if (finalUserId && finalUserText) {
+          onLiveUserStreamRef.current?.(finalUserId, finalUserText);
+        }
+        if (finalAiId && finalAiText) {
+          onLiveAssistantStreamRef.current?.(finalAiId, finalAiText);
+        }
+        if (finalAiId && sourcesSnapshot.length > 0) {
+          onLiveWebSourcesRef.current?.(finalAiId, sourcesSnapshot);
+        }
+        const activePillars = classifyLiveVoicePillars(
+          finalUserText,
+          finalAiText,
+          usedGoogleSearch
+        );
+        onLiveTurnCompleteRef.current?.({
+          userTurnId: finalUserId,
+          userText: finalUserText || undefined,
+          assistantTurnId: finalAiId,
+          assistantText: finalAiText || undefined,
+          activePillars,
+          usedGoogleSearch,
+        });
       });
-    });
-  }, [clearTranscriptThrottleTimers, ensureAssistantTurnId, ensureUserTurnId]);
+    },
+    [
+      clearTranscriptThrottleTimers,
+      ensureAssistantMessageId,
+      ensureUserMessageId,
+    ]
+  );
 
   /**
    * Instant Barge-In & Playback Stop:
    * Immediately stops every active AudioBufferSourceNode, resets activePlaybackNodesRef = 0,
-   * clears Echo Guard tail so mic unlocks instantly, and resets nextPlayTime = 0.
+   * clears Echo Guard tail & 5s watchdog, and resets nextPlayTime = 0.
    */
   const stopAllPlayback = useCallback(() => {
     clearEchoUnlockTimer();
+    clearTurnWatchdogTimer();
 
     liveScheduledSourcesRef.current.forEach((node) => {
       try {
@@ -1909,21 +2104,69 @@ export function InteractiveVoiceCallOverlay({
     activePlaybackNodesRef.current = 0;
     micUnlockAtRef.current = 0;
     liveNextPlayTimeRef.current = 0;
-    liveTurnCompleteRef.current = true;
+    isServerTurnCompleteRef.current = true;
 
     if (liveMicAnalyserRef.current) {
       activeAnalyserRef.current = liveMicAnalyserRef.current;
     }
-  }, [clearEchoUnlockTimer]);
+  }, [clearEchoUnlockTimer, clearTurnWatchdogTimer]);
 
   /**
-   * Smart Echo Guard Tail (180ms):
-   * Keeps mic uplink paused for 180ms after the final speaker AudioBufferSourceNode finishes
-   * so residual room echo never leaks back into Gemini Server VAD.
+   * Post-Turn Lifecycle Hook:
+   * - Logs `[VOICE S#X T#N] Turn done -> Mic unlocked`.
+   * - Records turn metric in diagnostics ring buffer.
+   * - Increments `sessionTurnCountRef`.
+   * - At Turn #2 on current session -> triggers silent background standby pre-warming.
+   * - At Turn #3+ on current session -> performs atomic O(1) hot-swap (<5ms) if standby is ready!
+   */
+  const handleTurnFullyUnlocked = useCallback(
+    (finishedTurnNum: number) => {
+      micUnlockAtRef.current = 0;
+      liveNextPlayTimeRef.current = 0;
+      activeAnalyserRef.current = liveMicAnalyserRef.current;
+
+      if (fsmStateRef.current !== "ERROR") {
+        setFsm("LISTENING");
+      }
+
+      if (finishedTurnNum > 0 && !loggedTurnDoneForTurnRef.current) {
+        loggedTurnDoneForTurnRef.current = true;
+        autoReconnectCountRef.current = 0;
+        console.log(
+          `[VOICE S#${activeSessionIndexRef.current} T#${finishedTurnNum}] Turn done -> Mic unlocked`
+        );
+        recordTurnMetric(finishedTurnNum);
+
+        sessionTurnCountRef.current += 1;
+        const turnsOnCurrentSession = sessionTurnCountRef.current;
+
+        if (
+          turnsOnCurrentSession >= LIVE_HOTSWAP_TARGET_TURN &&
+          standbyReadyRef.current &&
+          standbySessionRef.current
+        ) {
+          performAtomicHotSwapIfReadyRef.current();
+        } else if (
+          turnsOnCurrentSession >= LIVE_STANDBY_PREWARM_TURN &&
+          !standbyReadyRef.current &&
+          !standbyPrewarmingRef.current
+        ) {
+          void prepareStandbySessionRef.current();
+        }
+      }
+    },
+    [recordTurnMetric, setFsm]
+  );
+
+  /**
+   * Smart Echo Guard Tail (220ms):
+   * Unlocks mic ONLY when `isServerTurnCompleteRef === true` AND `activePlaybackNodesRef === 0`
+   * plus a 220ms room-echo safety tail.
    */
   const scheduleEchoGuardUnlock = useCallback(
     (generation: number, finishedTurnNum: number) => {
       clearEchoUnlockTimer();
+      clearTurnWatchdogTimer();
       micUnlockAtRef.current = performance.now() + LIVE_ECHO_GUARD_TAIL_MS;
 
       echoUnlockTimerRef.current = setTimeout(() => {
@@ -1935,38 +2178,59 @@ export function InteractiveVoiceCallOverlay({
         ) {
           return;
         }
-        if (activePlaybackNodesRef.current > 0) {
+        if (
+          activePlaybackNodesRef.current > 0 ||
+          !isServerTurnCompleteRef.current ||
+          fsmStateRef.current === "TOOL_EXECUTING"
+        ) {
           return;
         }
-
-        micUnlockAtRef.current = 0;
-        liveNextPlayTimeRef.current = 0;
-        activeAnalyserRef.current = liveMicAnalyserRef.current;
-
-        if (
-          finishedTurnNum > 0 &&
-          !loggedSpeakerFinishedForTurnRef.current
-        ) {
-          loggedSpeakerFinishedForTurnRef.current = true;
-          console.log(
-            `[VOICE T#${finishedTurnNum}] Speaker finished -> Mic unlocked`
-          );
-        }
-
-        if (liveStatusRef.current !== "error") {
-          updateLiveStatus("listening");
-        }
+        handleTurnFullyUnlocked(finishedTurnNum);
       }, LIVE_ECHO_GUARD_TAIL_MS);
     },
-    [clearEchoUnlockTimer, updateLiveStatus]
+    [clearEchoUnlockTimer, clearTurnWatchdogTimer, handleTurnFullyUnlocked]
+  );
+
+  /**
+   * Module 2: 5-Second Watchdog Timer:
+   * If 5 seconds pass after the final audio buffer finishes playing without receiving
+   * `turnComplete` from Gemini, logs a clear warning and force-resets FSM to `LISTENING`.
+   */
+  const armTurnWatchdog = useCallback(
+    (generation: number, turnNum: number) => {
+      clearTurnWatchdogTimer();
+      turnWatchdogTimerRef.current = setTimeout(() => {
+        turnWatchdogTimerRef.current = null;
+        if (
+          !isMountedRef.current ||
+          !callActiveRef.current ||
+          sessionGenerationRef.current !== generation
+        ) {
+          return;
+        }
+        if (
+          activePlaybackNodesRef.current > 0 ||
+          isServerTurnCompleteRef.current ||
+          fsmStateRef.current === "TOOL_EXECUTING"
+        ) {
+          return;
+        }
+        console.warn(
+          `[VOICE S#${activeSessionIndexRef.current} T#${turnNum}] Watchdog 5s: turnComplete tidak diterima — mereset FSM ke LISTENING`
+        );
+        isServerTurnCompleteRef.current = true;
+        finalizeCurrentTurnAsync();
+        handleTurnFullyUnlocked(turnNum);
+      }, LIVE_TURN_WATCHDOG_MS);
+    },
+    [clearTurnWatchdogTimer, finalizeCurrentTurnAsync, handleTurnFullyUnlocked]
   );
 
   /**
    * Zero-Wait 24kHz PCM Streaming Playback:
-   * - Tracks real active nodes via `activePlaybackNodesRef` for Smart Echo Guard.
-   * - Resets `nextPlayTime = outCtx.currentTime + 0.02` on the 1st chunk of every turn
-   *   (and whenever `nextPlayTime < currentTime`) so Turn #2+ never drifts into the future.
-   * - Emits exact millisecond profiler logs on chunk #1 of each turn.
+   * - Tracks active nodes via `activePlaybackNodesRef` for Smart Echo Guard.
+   * - Resets `nextPlayTime = outCtx.currentTime + 0.02` on chunk #1 of every turn
+   *   (and whenever `nextPlayTime < currentTime`).
    */
   const enqueueLivePcmChunk = useCallback(
     (base64Pcm: string, mimeType: string | undefined, generation: number) => {
@@ -1997,8 +2261,8 @@ export function InteractiveVoiceCallOverlay({
         sourceNode.buffer = audioBuffer;
         sourceNode.connect(outAnalyser);
 
-        // Cancel any pending echo-guard unlock timer while new chunks keep arriving
         clearEchoUnlockTimer();
+        clearTurnWatchdogTimer();
 
         const isFirstChunkOfTurn = !loggedServerAudioForTurnRef.current;
         const nowCtx = outCtx.currentTime;
@@ -2008,14 +2272,18 @@ export function InteractiveVoiceCallOverlay({
 
         const startAt = liveNextPlayTimeRef.current;
         liveNextPlayTimeRef.current = startAt + audioBuffer.duration;
-        liveTurnCompleteRef.current = false;
+        isServerTurnCompleteRef.current = false;
 
         activePlaybackNodesRef.current += 1;
         micUnlockAtRef.current = Number.POSITIVE_INFINITY;
 
         if (isFirstChunkOfTurn) {
           loggedServerAudioForTurnRef.current = true;
-          loggedSpeakerFinishedForTurnRef.current = false;
+          loggedTurnDoneForTurnRef.current = false;
+          // New AI audio turn has begun -> stop appending late text to previous turn's bubble
+          lastCommittedAiMessageIdRef.current = null;
+          lastCommittedAiTextRef.current = "";
+
           const turnNum = ensureActiveTurnNumber();
           activePlaybackTurnNumberRef.current = turnNum;
 
@@ -2031,14 +2299,13 @@ export function InteractiveVoiceCallOverlay({
             Math.round((startAt - outCtx.currentTime) * 1000)
           );
 
+          currentTurnFirstAudioMsRef.current = sinceSilenceMs;
+          currentTurnQueueDelayMsRef.current = queueDelayMs;
+
           console.log(
-            `[VOICE T#${turnNum}] Server 1st audio arrived (+${sinceSilenceMs} ms sejak diam)`
-          );
-          console.log(
-            `[VOICE T#${turnNum}] Speaker play started (queueDelay: +${queueDelayMs} ms)`
+            `[VOICE S#${activeSessionIndexRef.current} T#${turnNum}] 1st audio: +${sinceSilenceMs}ms | queue: +${queueDelayMs}ms`
           );
 
-          // Reset read-only profiler for next turn while preserving calibrated noise floor
           speechProfilerRef.current = createSpeechEndProfilerState(
             speechProfilerRef.current.noiseFloor
           );
@@ -2046,8 +2313,8 @@ export function InteractiveVoiceCallOverlay({
         }
 
         activeAnalyserRef.current = outAnalyser;
-        if (liveStatusRef.current !== "speaking") {
-          updateLiveStatus("speaking");
+        if (fsmStateRef.current !== "AI_SPEAKING") {
+          setFsm("AI_SPEAKING");
         }
 
         liveScheduledSourcesRef.current.add(sourceNode);
@@ -2064,15 +2331,15 @@ export function InteractiveVoiceCallOverlay({
             isMountedRef.current &&
             callActiveRef.current
           ) {
-            if (liveTurnCompleteRef.current) {
+            if (isServerTurnCompleteRef.current) {
               scheduleEchoGuardUnlock(
                 generation,
                 activePlaybackTurnNumberRef.current
               );
             } else {
-              // Brief guard until turnComplete or next chunk arrives
-              micUnlockAtRef.current =
-                performance.now() + LIVE_ECHO_GUARD_TAIL_MS;
+              // Keep mic locked and arm 5s watchdog until turnComplete or next audio chunk arrives
+              micUnlockAtRef.current = Number.POSITIVE_INFINITY;
+              armTurnWatchdog(generation, activePlaybackTurnNumberRef.current);
             }
           }
         };
@@ -2083,31 +2350,35 @@ export function InteractiveVoiceCallOverlay({
       }
     },
     [
+      armTurnWatchdog,
       clearEchoUnlockTimer,
+      clearTurnWatchdogTimer,
       ensureActiveTurnNumber,
       scheduleEchoGuardUnlock,
-      updateLiveStatus,
+      setFsm,
     ]
   );
 
   /**
-   * Synchronous Single-Session Clean Teardown:
-   * 1) Increments `sessionGenerationRef` so all stale callbacks/promises are ignored immediately.
-   * 2) Cancels boot/echo/transcript timers and aborts any in-flight `/api/live-token` fetch.
-   * 3) Stops all active `AudioBufferSourceNode`s (`stopAllPlayback`).
-   * 4) Disconnects `AudioWorkletNode`, stops all `MediaStream` tracks, closes input & output `AudioContext`.
-   * 5) Closes the old WebSocket `Session`.
+   * Module 1: Complete Dual-Session Teardown (`disconnectAllVoiceSessions`):
+   * Closes BOTH `activeSessionRef` and `standbySessionRef`, aborts token fetches, clears all
+   * timers, stops playback, and tears down `AudioWorkletNode`, `MediaStream`, and both `AudioContext`s.
    */
-  const disconnectLiveSession = useCallback(
-    (options?: { keepMicAndAudioCtx?: boolean }) => {
+  const disconnectAllVoiceSessions = useCallback(
+    (options?: { keepMicAndAudioCtx?: boolean; nextFsm?: LiveVoiceFsmState }) => {
       const keepAudio = options?.keepMicAndAudioCtx === true;
 
       sessionGenerationRef.current += 1;
+      if (!keepAudio) {
+        audioPipelineGenerationRef.current += 1;
+      }
 
       if (bootTimerRef.current !== null) {
         clearTimeout(bootTimerRef.current);
         bootTimerRef.current = null;
       }
+      clearPrewarmInterval();
+      clearTurnWatchdogTimer();
 
       if (tokenAbortControllerRef.current) {
         try {
@@ -2117,27 +2388,65 @@ export function InteractiveVoiceCallOverlay({
         }
         tokenAbortControllerRef.current = null;
       }
+      if (standbyAbortControllerRef.current) {
+        try {
+          standbyAbortControllerRef.current.abort();
+        } catch {
+          // ignore
+        }
+        standbyAbortControllerRef.current = null;
+      }
 
       clearTranscriptThrottleTimers();
       stopAllPlayback();
-      finalizeCurrentTurnAsync();
+      finalizeCurrentTurnAsync({ clearLateAiTarget: true });
 
       turnCounterRef.current = 0;
       activeTurnNumberRef.current = 0;
       activePlaybackTurnNumberRef.current = 0;
       loggedServerAudioForTurnRef.current = false;
-      loggedSpeakerFinishedForTurnRef.current = false;
+      loggedTurnDoneForTurnRef.current = false;
+      currentTurnFirstAudioMsRef.current = 0;
+      currentTurnQueueDelayMsRef.current = 0;
+      pendingHotSwapFlagForNextTurnRef.current = false;
+      turnToolsCalledRef.current = [];
+      sessionTurnCountRef.current = 0;
+      activeSessionIndexRef.current = 1;
+      standbySessionIndexRef.current = 2;
+      activeSessionStartedAtRef.current = 0;
+      standbyReadyRef.current = false;
+      standbyPrewarmingRef.current = false;
       speechProfilerRef.current = createSpeechEndProfilerState();
       lastSpeechEndedAtRef.current = 0;
 
-      if (sessionRef.current) {
-        const s = sessionRef.current;
-        sessionRef.current = null;
+      if (activeSessionRef.current) {
+        const s = activeSessionRef.current;
+        activeSessionRef.current = null;
         try {
           s.close();
         } catch {
           // ignore
         }
+      }
+
+      if (standbySessionRef.current) {
+        const sb = standbySessionRef.current;
+        standbySessionRef.current = null;
+        try {
+          sb.close();
+        } catch {
+          // ignore
+        }
+      }
+
+      if (options?.nextFsm) {
+        const nextFsm = options.nextFsm;
+        fsmStateRef.current = nextFsm;
+        queueMicrotask(() => {
+          if (isMountedRef.current) {
+            setFsm(nextFsm);
+          }
+        });
       }
 
       if (keepAudio) return;
@@ -2226,18 +2535,993 @@ export function InteractiveVoiceCallOverlay({
       liveOutputAnalyserRef.current = null;
       activeAnalyserRef.current = null;
     },
-    [clearTranscriptThrottleTimers, finalizeCurrentTurnAsync, stopAllPlayback]
+    [
+      clearPrewarmInterval,
+      clearTranscriptThrottleTimers,
+      clearTurnWatchdogTimer,
+      finalizeCurrentTurnAsync,
+      setFsm,
+      stopAllPlayback,
+    ]
   );
 
   /**
-   * Captures hardware-native mic audio in exact 640-sample (40ms @ 16kHz) Int16 mono PCM frames:
-   * - Smart Echo Guard: pauses mic uplink while AI speaker nodes are playing + 180ms tail.
-   * - Read-only RMS latency profiler: records `lastSpeechEndedAtRef` after 300ms quiet (NEVER alters audio
-   *   and NEVER sends manual `audioStreamEnd`).
+   * Module 3: Unified Async Tool Execution Handler (`create_formula_table`,
+   * `save_to_google_docs`, `search_web_info`, plus legacy `create_chat_note`/`create_google_doc`).
+   * - Wraps every call in `try/catch` + 12-second timeout.
+   * - Supports multiple tool calls sequentially in a single turn.
+   * - ALWAYS responds via `session.sendToolResponse({ functionResponses })` so Gemini never hangs.
+   */
+  const executeLiveToolCalls = useCallback(
+    async (
+      targetSession: Session,
+      functionCalls: NonNullable<
+        NonNullable<LiveServerMessage["toolCall"]>["functionCalls"]
+      >,
+      turnNum: number
+    ) => {
+      if (!functionCalls || functionCalls.length === 0) return;
+
+      const firstToolName = functionCalls[0]?.name || "";
+      setFsm("TOOL_EXECUTING", getToolStatusLabel(firstToolName));
+      micUnlockAtRef.current = Number.POSITIVE_INFINITY;
+      clearTurnWatchdogTimer();
+
+      const functionResponses: Array<{
+        id: string;
+        name: string;
+        response: Record<string, unknown>;
+      }> = [];
+
+      for (const call of functionCalls) {
+        const callId = call.id || `tool-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        const callName = call.name || "unknown";
+        const args = (call.args || {}) as Record<string, unknown>;
+
+        if (activeSessionRef.current !== targetSession || !callActiveRef.current) {
+          return;
+        }
+
+        setFsm("TOOL_EXECUTING", getToolStatusLabel(callName));
+
+        try {
+          const responsePayload = await withTimeout<Record<string, unknown>>(
+            (async () => {
+              if (callName === "create_formula_table") {
+                const normalized = normalizeFormulaTableArtifact(args);
+                if (!normalized) {
+                  return {
+                    status: "error",
+                    message:
+                      "Data kolom atau baris tabel tidak lengkap. Minta model menyertakan columns dan rows.",
+                  };
+                }
+                latestFormulaTableRef.current = normalized;
+                queueMicrotask(() => {
+                  onCreateFormulaTableRef.current?.(normalized);
+                });
+                return {
+                  status: "success",
+                  title: normalized.title,
+                  rowsCount: normalized.rows.length,
+                  message:
+                    "Tabel formulasi sudah berhasil ditampilkan langsung di room chat.",
+                };
+              }
+
+              if (
+                callName === "save_to_google_docs" ||
+                callName === "create_google_doc"
+              ) {
+                const title =
+                  String(args.title ?? "").trim() ||
+                  latestFormulaTableRef.current?.title ||
+                  "Dokumen Formulasi Formylab.ai";
+                let content = String(
+                  args.content ?? args.markdownContent ?? ""
+                ).trim();
+                const includeLatest =
+                  args.include_latest_table === true ||
+                  (!content && latestFormulaTableRef.current !== null);
+
+                if (includeLatest && latestFormulaTableRef.current) {
+                  const tableMd = formulaTableToMarkdown(
+                    latestFormulaTableRef.current
+                  );
+                  if (!content.includes(latestFormulaTableRef.current.title)) {
+                    content = content ? `${content}\n\n${tableMd}` : tableMd;
+                  }
+                }
+
+                if (!content) {
+                  return {
+                    status: "error",
+                    message: "Isi dokumen kosong, tidak bisa disimpan.",
+                  };
+                }
+
+                if (isGoogleDriveConnected()) {
+                  const created = await createGoogleDocInDrive({
+                    title,
+                    markdownContent: content,
+                    interactiveAuth: false,
+                  });
+                  const createdArtifact: GoogleDocArtifact = {
+                    title: created.title,
+                    markdownContent: content,
+                    status: "created",
+                    docId: created.id,
+                    docUrl: created.url,
+                  };
+                  pendingGoogleDocRef.current = null;
+                  queueMicrotask(() => {
+                    onCreateGoogleDocRef.current?.(createdArtifact);
+                  });
+                  return {
+                    status: "success",
+                    savedToDrive: true,
+                    title: created.title,
+                    docUrl: created.url,
+                    message:
+                      "Dokumen berhasil dibuat langsung di Google Drive dan link Buka Google Docs sudah tampil di chat.",
+                  };
+                }
+
+                const draftArtifact: GoogleDocArtifact = {
+                  title,
+                  markdownContent: content,
+                  status: "draft",
+                };
+                pendingGoogleDocRef.current = draftArtifact;
+                queueMicrotask(() => {
+                  onCreateGoogleDocRef.current?.(draftArtifact);
+                });
+                return {
+                  status: "pending_google_drive_auth",
+                  savedToDrive: false,
+                  title,
+                  message:
+                    "Draft Google Docs sudah tampil di room chat. Beri tahu pengguna dengan santai untuk klik tombol Hubungkan Google Drive & Simpan Sekarang di chat agar langsung tersimpan ke Drive.",
+                };
+              }
+
+              if (callName === "search_web_info") {
+                const query = String(args.query ?? "").trim();
+                if (!query) {
+                  return {
+                    status: "error",
+                    message: "Kata kunci pencarian kosong.",
+                  };
+                }
+                const res = await fetch("/api/live-search", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ query }),
+                });
+                const data = (await res.json().catch(() => ({}))) as {
+                  success?: boolean;
+                  summary?: string;
+                  sources?: unknown[];
+                  error?: string;
+                };
+                if (!res.ok || !data.success) {
+                  return {
+                    status: "error",
+                    message:
+                      data.error ||
+                      "Pencarian web sementara gagal. Sampaikan secara jujur ke pengguna.",
+                  };
+                }
+
+                turnUsedGoogleSearchRef.current = true;
+                const cleanSources: WebSourceCitation[] = Array.isArray(
+                  data.sources
+                )
+                  ? data.sources
+                      .map((s) => normalizeWebSourceCitation(s))
+                      .filter((s): s is WebSourceCitation => s !== null)
+                  : [];
+
+                if (cleanSources.length > 0) {
+                  turnPendingSourcesRef.current = mergeUniqueWebSources(
+                    turnPendingSourcesRef.current,
+                    cleanSources
+                  );
+                  if (currentAiMessageIdRef.current) {
+                    emitPendingSourcesAsync(currentAiMessageIdRef.current);
+                  }
+                }
+
+                return {
+                  status: "success",
+                  summary: data.summary || "",
+                  sources: cleanSources.map((s) => ({
+                    title: s.title,
+                    domain: s.domain,
+                    url: s.url,
+                  })),
+                };
+              }
+
+              if (callName === "create_chat_note") {
+                const normalized = normalizeChatNoteArtifact(args);
+                if (normalized) {
+                  queueMicrotask(() => {
+                    onCreateChatNoteRef.current?.(normalized);
+                  });
+                  return {
+                    status: "success",
+                    title: normalized.title,
+                    message: "Catatan sudah ditampilkan di room chat.",
+                  };
+                }
+                return { status: "error", message: "Catatan kosong." };
+              }
+
+              return {
+                status: "unsupported_tool",
+                message:
+                  "Tool tidak dikenali. Jawab langsung secara lisan dengan bahasa Indonesia yang natural.",
+              };
+            })(),
+            LIVE_TOOL_TIMEOUT_MS,
+            `Tool ${callName} melebihi batas waktu 12 detik.`
+          );
+
+          turnToolsCalledRef.current.push(callName);
+          console.log(
+            `[VOICE S#${activeSessionIndexRef.current} T#${turnNum}] Tool executed: ${callName}`
+          );
+          functionResponses.push({
+            id: callId,
+            name: callName,
+            response: responsePayload,
+          });
+        } catch (toolErr: unknown) {
+          const errMsg =
+            toolErr instanceof Error ? toolErr.message : String(toolErr);
+          console.warn(
+            `[VOICE S#${activeSessionIndexRef.current} T#${turnNum}] Tool error (${callName}):`,
+            errMsg
+          );
+          functionResponses.push({
+            id: callId,
+            name: callName,
+            response: {
+              status: "error",
+              message: `Gagal menjalankan ${callName}: ${errMsg}`,
+            },
+          });
+        }
+      }
+
+      if (
+        activeSessionRef.current === targetSession &&
+        callActiveRef.current &&
+        functionResponses.length > 0
+      ) {
+        try {
+          targetSession.sendToolResponse({ functionResponses });
+          // Wait for Gemini's spoken follow-up; arm 5s watchdog in case server produces no audio
+          isServerTurnCompleteRef.current = false;
+          armTurnWatchdog(sessionGenerationRef.current, turnNum);
+        } catch {
+          if (fsmStateRef.current === "TOOL_EXECUTING") {
+            setFsm("LISTENING");
+          }
+        }
+      }
+    },
+    [armTurnWatchdog, clearTurnWatchdogTimer, emitPendingSourcesAsync, setFsm]
+  );
+
+  /**
+   * Builds compact plain-text conversation memory (<= 8 recent messages, <= 350 words)
+   * for seamless background standby pre-warming and reconnects (NEVER carries raw audio).
+   */
+  const getCompactMemorySummary = useCallback((): string => {
+    const fromMessages = buildConversationMemorySummary(
+      recentMessagesRef.current,
+      8,
+      350
+    );
+    if (fromMessages) return fromMessages;
+    return recentContextRef.current.trim().slice(0, 1400);
+  }, []);
+
+  /**
+   * Shared Gemini Live WebSocket Session Opener (used by primary connect, background standby
+   * pre-warm, and auto-reconnect).
+   * - ALWAYS registers unified `tools` (`create_formula_table`, `save_to_google_docs`,
+   *   and conditional `search_web_info`) identically across Aoede, Zephyr, Kore, Puck.
+   * - Callbacks dynamically validate `activeSessionRef.current === mySession` so atomic
+   *   hot-swap switches control in <5ms with zero packet leaks.
+   */
+  const openGeminiLiveSession = useCallback(
+    async (params: {
+      purpose: "primary" | "standby" | "reconnect";
+      sessionIndex: number;
+      audioPipelineGen: number;
+      memorySummary: string;
+    }): Promise<{
+      session: Session;
+      voiceName: LiveVoiceName;
+      model: string;
+    }> => {
+      const { purpose, audioPipelineGen, memorySummary } = params;
+      const isStandby = purpose === "standby";
+
+      const isStillValid = () =>
+        isMountedRef.current &&
+        callActiveRef.current &&
+        audioPipelineGenerationRef.current === audioPipelineGen;
+
+      const fetchLiveToken = async (opts?: {
+        excludeModels?: string[];
+        disableThinkingConfig?: boolean;
+        disableCustomVad?: boolean;
+      }): Promise<LiveTokenApiResponse> => {
+        const abortController = new AbortController();
+        if (isStandby) {
+          standbyAbortControllerRef.current = abortController;
+        } else {
+          tokenAbortControllerRef.current = abortController;
+        }
+        try {
+          const res = await fetch("/api/live-token", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            signal: abortController.signal,
+            body: JSON.stringify({
+              voiceName: selectedVoiceRef.current,
+              enableSearch: searchEnabledRef.current,
+              memorySummary,
+              ...(opts?.excludeModels && opts.excludeModels.length > 0
+                ? { excludeModels: opts.excludeModels }
+                : {}),
+              ...(opts?.disableThinkingConfig
+                ? { disableThinkingConfig: true }
+                : {}),
+              ...(opts?.disableCustomVad ? { disableCustomVad: true } : {}),
+            }),
+          });
+          const data = (await res.json().catch(() => ({}))) as LiveTokenApiResponse;
+          if (!res.ok || !data.success || !data.token || !data.model) {
+            return {
+              success: false,
+              error:
+                data.error ||
+                `Gagal mengambil token sesi Live (HTTP ${res.status}).`,
+            };
+          }
+          return data;
+        } finally {
+          if (isStandby && standbyAbortControllerRef.current === abortController) {
+            standbyAbortControllerRef.current = null;
+          }
+          if (!isStandby && tokenAbortControllerRef.current === abortController) {
+            tokenAbortControllerRef.current = null;
+          }
+        }
+      };
+
+      const excludedModels: string[] = getRecentlyFailedLiveModels();
+      let lastErrorReason = "";
+      let lastCloseCode: number | undefined = undefined;
+      let disableThinkingConfig = false;
+      let disableCustomVad = false;
+
+      const MAX_LIVE_ATTEMPTS = 6;
+
+      for (let attempt = 0; attempt < MAX_LIVE_ATTEMPTS; attempt++) {
+        if (!isStillValid()) {
+          throw new Error("SESSION_CANCELLED");
+        }
+
+        const tokenCfg = await fetchLiveToken({
+          excludeModels: excludedModels,
+          disableThinkingConfig,
+          disableCustomVad,
+        });
+
+        if (!isStillValid()) {
+          throw new Error("SESSION_CANCELLED");
+        }
+
+        if (!tokenCfg.success || !tokenCfg.token || !tokenCfg.model) {
+          lastErrorReason =
+            tokenCfg.error || "Token Gemini Live tidak tersedia dari server.";
+          if (excludedModels.length > 0 && attempt === 0) {
+            excludedModels.length = 0;
+            recentlyFailedLiveModels.clear();
+            continue;
+          }
+          break;
+        }
+
+        const liveConfig: LiveConnectConfig = {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: {
+                voiceName: tokenCfg.voiceName || selectedVoiceRef.current,
+              },
+            },
+          },
+          ...(tokenCfg.systemInstruction
+            ? { systemInstruction: tokenCfg.systemInstruction }
+            : {}),
+          // ALWAYS register Unified Function Declarations (`create_formula_table`,
+          // `save_to_google_docs`, + conditional `search_web_info`) on EVERY voice chip!
+          ...(Array.isArray(tokenCfg.tools) && tokenCfg.tools.length > 0
+            ? { tools: tokenCfg.tools }
+            : {}),
+          ...(tokenCfg.thinkingConfig
+            ? { thinkingConfig: tokenCfg.thinkingConfig }
+            : {}),
+          ...(tokenCfg.realtimeInputConfig
+            ? { realtimeInputConfig: tokenCfg.realtimeInputConfig }
+            : {}),
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
+        };
+
+        const ai = new GoogleGenAI({
+          apiKey: tokenCfg.token,
+          httpOptions: { apiVersion: "v1alpha" },
+        });
+
+        let mySession: Session | null = null;
+        let unexpectedCloseCode: number | undefined = undefined;
+        let unexpectedCloseReason = "";
+
+        try {
+          mySession = await ai.live.connect({
+            model: tokenCfg.model,
+            config: liveConfig,
+            callbacks: {
+              onopen: () => {
+                // setupComplete resolves ai.live.connect()
+              },
+              onmessage: (message: LiveServerMessage) => {
+                if (
+                  !callActiveRef.current ||
+                  !mySession ||
+                  activeSessionRef.current !== mySession
+                ) {
+                  return;
+                }
+                const currentGen = sessionGenerationRef.current;
+
+                // 1. Unified Async Tool Calls (`create_formula_table`, `save_to_google_docs`, `search_web_info`)
+                const functionCalls = message.toolCall?.functionCalls;
+                if (Array.isArray(functionCalls) && functionCalls.length > 0) {
+                  commitUserTurnIfPending();
+                  const turnNum = ensureActiveTurnNumber();
+                  void executeLiveToolCalls(mySession, functionCalls, turnNum);
+                  return;
+                }
+
+                const content = message.serverContent;
+                if (!content) return;
+
+                // 2. Server-side Barge-In
+                if (content.interrupted) {
+                  const interruptedTurn = activePlaybackTurnNumberRef.current;
+                  stopAllPlayback();
+                  finalizeCurrentTurnAsync();
+                  handleTurnFullyUnlocked(interruptedTurn);
+                  return;
+                }
+
+                // 3. ZERO-WAIT 24kHz PCM Output Playback FIRST
+                const parts = content.modelTurn?.parts;
+                if (Array.isArray(parts)) {
+                  let receivedAudio = false;
+                  for (const part of parts) {
+                    if (part.inlineData?.data) {
+                      receivedAudio = true;
+                      enqueueLivePcmChunk(
+                        part.inlineData.data,
+                        part.inlineData.mimeType,
+                        currentGen
+                      );
+                    }
+                  }
+                  if (receivedAudio) {
+                    commitUserTurnIfPending();
+                  }
+                }
+
+                // 4. Optional grounding metadata
+                if (content.groundingMetadata) {
+                  if (hasGoogleSearchGrounding(content.groundingMetadata)) {
+                    turnUsedGoogleSearchRef.current = true;
+                  }
+                  const sources = extractWebSourcesFromGroundingMetadata(
+                    content.groundingMetadata,
+                    6
+                  );
+                  if (sources.length > 0) {
+                    turnPendingSourcesRef.current = mergeUniqueWebSources(
+                      turnPendingSourcesRef.current,
+                      sources
+                    );
+                    if (currentAiMessageIdRef.current) {
+                      emitPendingSourcesAsync(currentAiMessageIdRef.current);
+                    }
+                  }
+                }
+
+                // 5. Streaming User Speech Transcription (strip <noise> + leading punctuation; 80ms throttle)
+                if (content.inputTranscription?.text) {
+                  // User started a new utterance -> seal previous AI bubble from late fragments
+                  lastCommittedAiMessageIdRef.current = null;
+                  lastCommittedAiTextRef.current = "";
+
+                  if (userTurnCommittedRef.current) {
+                    userTurnCommittedRef.current = false;
+                    currentUserMessageIdRef.current = null;
+                    userTurnTextRef.current = "";
+                  }
+                  userTurnTextRef.current += content.inputTranscription.text;
+                  const cleanedInput = sanitizeLiveUserTranscript(
+                    userTurnTextRef.current
+                  );
+                  if (cleanedInput.length > 0) {
+                    ensureActiveTurnNumber();
+                    speechPulseRef.current = 0.6;
+                    scheduleUserTranscriptFlush();
+                  }
+                }
+
+                // 6. Streaming AI Speech Transcription (80ms throttle + late-fragment merge into SAME bubble)
+                if (content.outputTranscription?.text) {
+                  if (
+                    !currentAiMessageIdRef.current &&
+                    !assistantTurnTextRef.current &&
+                    lastCommittedAiMessageIdRef.current
+                  ) {
+                    // Late trailing outputTranscription arrived 100-500ms after turnComplete:
+                    // merge directly into the SAME AI bubble instead of splitting!
+                    lastCommittedAiTextRef.current +=
+                      content.outputTranscription.text;
+                    const mergedClean = sanitizeLiveTranscriptText(
+                      lastCommittedAiTextRef.current
+                    );
+                    const targetAiId = lastCommittedAiMessageIdRef.current;
+                    if (mergedClean && targetAiId) {
+                      queueMicrotask(() => {
+                        onLiveAssistantStreamRef.current?.(
+                          targetAiId,
+                          mergedClean
+                        );
+                      });
+                    }
+                  } else {
+                    commitUserTurnIfPending();
+                    assistantTurnTextRef.current +=
+                      content.outputTranscription.text;
+                    if (
+                      sanitizeLiveTranscriptText(assistantTurnTextRef.current)
+                        .length > 0
+                    ) {
+                      ensureActiveTurnNumber();
+                      ensureAssistantMessageId();
+                      scheduleAssistantTranscriptFlush();
+                    }
+                  }
+                }
+
+                // 7. Turn Complete -> finalize chat text & unlock mic after 220ms Echo Guard tail
+                if (content.turnComplete) {
+                  const finishedTurn =
+                    activePlaybackTurnNumberRef.current ||
+                    activeTurnNumberRef.current;
+                  isServerTurnCompleteRef.current = true;
+                  clearTurnWatchdogTimer();
+                  finalizeCurrentTurnAsync();
+
+                  if (
+                    activePlaybackNodesRef.current === 0 &&
+                    fsmStateRef.current !== "TOOL_EXECUTING"
+                  ) {
+                    if (finishedTurn > 0 && !loggedTurnDoneForTurnRef.current) {
+                      scheduleEchoGuardUnlock(currentGen, finishedTurn);
+                    } else {
+                      handleTurnFullyUnlocked(0);
+                    }
+                  }
+                }
+              },
+              onerror: (errEvent: ErrorEvent) => {
+                if (!mySession) return;
+                const reason =
+                  errEvent?.message || "WebSocket error pada sesi Live.";
+                unexpectedCloseReason = reason;
+
+                if (standbySessionRef.current === mySession) {
+                  standbySessionRef.current = null;
+                  standbyReadyRef.current = false;
+                  return;
+                }
+                if (activeSessionRef.current !== mySession) return;
+
+                console.error(
+                  `[VOICE S#${activeSessionIndexRef.current}] Error:`,
+                  reason
+                );
+              },
+              onclose: (closeEvent: CloseEvent) => {
+                if (!mySession) return;
+                unexpectedCloseCode = closeEvent?.code;
+                unexpectedCloseReason = closeEvent?.reason || "";
+
+                // Silent cleanup if a background standby session closed before swap
+                if (standbySessionRef.current === mySession) {
+                  standbySessionRef.current = null;
+                  standbyReadyRef.current = false;
+                  return;
+                }
+
+                if (activeSessionRef.current !== mySession) {
+                  return;
+                }
+
+                activeSessionRef.current = null;
+
+                if (closeEvent?.code === 1000 || !callActiveRef.current) {
+                  return;
+                }
+
+                console.warn(
+                  `[VOICE S#${activeSessionIndexRef.current}] Unexpected close:`,
+                  {
+                    code: closeEvent?.code,
+                    reason: closeEvent?.reason || "",
+                  }
+                );
+
+                stopAllPlayback();
+                finalizeCurrentTurnAsync();
+
+                // Module 1 Recovery 1: Instant failover to pre-warmed standby session if ready!
+                if (standbyReadyRef.current && standbySessionRef.current) {
+                  const swapped = performAtomicHotSwapIfReadyRef.current();
+                  if (swapped) {
+                    setFsm("LISTENING");
+                    return;
+                  }
+                }
+
+                // Module 1 Recovery 2: Seamless auto-reconnect up to 2x preserving text memory
+                if (autoReconnectCountRef.current < LIVE_MAX_AUTO_RECONNECTS) {
+                  autoReconnectCountRef.current += 1;
+                  void reconnectActiveSessionInPlaceRef.current();
+                  return;
+                }
+
+                setLiveError(
+                  formatLiveConnectionError(
+                    closeEvent?.reason || unexpectedCloseReason,
+                    closeEvent?.code
+                  )
+                );
+                setFsm("ERROR");
+              },
+            },
+          });
+
+          if (!isStillValid()) {
+            try {
+              mySession.close();
+            } catch {
+              // ignore
+            }
+            throw new Error("SESSION_CANCELLED");
+          }
+
+          return {
+            session: mySession,
+            voiceName: tokenCfg.voiceName || selectedVoiceRef.current,
+            model: tokenCfg.model,
+          };
+        } catch (connectErr: unknown) {
+          if (
+            connectErr instanceof Error &&
+            connectErr.message === "SESSION_CANCELLED"
+          ) {
+            throw connectErr;
+          }
+          if (!isStillValid()) {
+            throw new Error("SESSION_CANCELLED");
+          }
+
+          const msg =
+            connectErr instanceof Error
+              ? connectErr.message
+              : String(connectErr);
+          const codeMatch = msg.match(/code\s+(\d{4})/i);
+          const parsedCode =
+            unexpectedCloseCode ??
+            (codeMatch ? Number.parseInt(codeMatch[1], 10) : undefined);
+
+          lastErrorReason = unexpectedCloseReason || msg;
+          lastCloseCode = parsedCode;
+
+          const isConfigRejection =
+            parsedCode === 1007 ||
+            parsedCode === 1008 ||
+            /invalid argument|unsupported|not supported|thinking|activity/i.test(
+              lastErrorReason
+            );
+
+          if (
+            isConfigRejection &&
+            !disableThinkingConfig &&
+            tokenCfg.thinkingConfig
+          ) {
+            disableThinkingConfig = true;
+            continue;
+          }
+          if (
+            isConfigRejection &&
+            !disableCustomVad &&
+            tokenCfg.realtimeInputConfig
+          ) {
+            disableCustomVad = true;
+            continue;
+          }
+
+          if (tokenCfg.model && !excludedModels.includes(tokenCfg.model)) {
+            excludedModels.push(tokenCfg.model);
+            if (parsedCode === 1011 || parsedCode === 1008) {
+              recentlyFailedLiveModels.set(tokenCfg.model, Date.now());
+            }
+          }
+          disableThinkingConfig = false;
+          disableCustomVad = false;
+        }
+      }
+
+      const finalErr = new Error(
+        formatLiveConnectionError(lastErrorReason, lastCloseCode)
+      );
+      throw finalErr;
+    },
+    [
+      clearTurnWatchdogTimer,
+      commitUserTurnIfPending,
+      emitPendingSourcesAsync,
+      enqueueLivePcmChunk,
+      ensureActiveTurnNumber,
+      ensureAssistantMessageId,
+      executeLiveToolCalls,
+      finalizeCurrentTurnAsync,
+      handleTurnFullyUnlocked,
+      scheduleAssistantTranscriptFlush,
+      scheduleEchoGuardUnlock,
+      scheduleUserTranscriptFlush,
+      setFsm,
+      stopAllPlayback,
+    ]
+  );
+
+  /**
+   * Module 1: Atomic Hot-Swap (< 5ms)
+   * Switches `activeSessionRef` -> `standbySessionRef`, increments `sessionGenerationRef`,
+   * resets `sessionTurnCountRef = 0`, silently closes old WebSocket WITHOUT touching
+   * `MediaStream`, `AudioWorkletNode`, or `AudioContext`!
+   */
+  const performAtomicHotSwapIfReady = useCallback((): boolean => {
+    if (
+      !standbyReadyRef.current ||
+      !standbySessionRef.current ||
+      !callActiveRef.current
+    ) {
+      return false;
+    }
+    if (
+      !isServerTurnCompleteRef.current ||
+      activePlaybackNodesRef.current > 0 ||
+      fsmStateRef.current === "TOOL_EXECUTING"
+    ) {
+      return false;
+    }
+
+    const swapStart = performance.now();
+    const oldSession = activeSessionRef.current;
+    const fromIdx = activeSessionIndexRef.current;
+    const toIdx = standbySessionIndexRef.current;
+
+    activeSessionRef.current = standbySessionRef.current;
+    standbySessionRef.current = null;
+    standbyReadyRef.current = false;
+    activeSessionIndexRef.current = toIdx;
+    activeSessionStartedAtRef.current = Date.now();
+    sessionTurnCountRef.current = 0;
+    sessionGenerationRef.current += 1;
+    pendingHotSwapFlagForNextTurnRef.current = true;
+
+    // Close old WebSocket silently in background — mic & AudioContexts remain 100% live
+    if (oldSession) {
+      try {
+        oldSession.close();
+      } catch {
+        // ignore
+      }
+    }
+
+    const elapsedMs = performance.now() - swapStart;
+    const timingLabel =
+      elapsedMs < 5 ? "<5ms" : `${elapsedMs.toFixed(1)}ms`;
+    console.log(
+      `[VOICE] Hot-swap S#${fromIdx} -> S#${toIdx} completed in ${timingLabel}`
+    );
+    return true;
+  }, []);
+
+  /**
+   * Module 1: Silent Background Pre-Warming of `standbySessionRef`
+   * Triggered when `sessionTurnCountRef === 2` OR active session age >= 55 seconds.
+   */
+  const prepareStandbySession = useCallback(async () => {
+    if (
+      !isMountedRef.current ||
+      !callActiveRef.current ||
+      standbyReadyRef.current ||
+      standbyPrewarmingRef.current ||
+      standbySessionRef.current
+    ) {
+      return;
+    }
+
+    standbyPrewarmingRef.current = true;
+    const pipelineGen = audioPipelineGenerationRef.current;
+    const currentIdx = activeSessionIndexRef.current;
+    const nextIdx = currentIdx + 1;
+    const memoryText = getCompactMemorySummary();
+
+    try {
+      const opened = await openGeminiLiveSession({
+        purpose: "standby",
+        sessionIndex: nextIdx,
+        audioPipelineGen: pipelineGen,
+        memorySummary: memoryText,
+      });
+
+      if (
+        !isMountedRef.current ||
+        !callActiveRef.current ||
+        audioPipelineGenerationRef.current !== pipelineGen
+      ) {
+        try {
+          opened.session.close();
+        } catch {
+          // ignore
+        }
+        return;
+      }
+
+      standbySessionRef.current = opened.session;
+      standbySessionIndexRef.current = nextIdx;
+      standbyReadyRef.current = true;
+
+      console.log(
+        `[VOICE S#${currentIdx}] Standby S#${nextIdx} pre-warmed (text memory: ${memoryText.length} chars)`
+      );
+
+      // If active session already passed Turn #3 while standby was warming and is now idle, swap immediately
+      if (
+        sessionTurnCountRef.current >= LIVE_HOTSWAP_TARGET_TURN &&
+        fsmStateRef.current === "LISTENING" &&
+        isServerTurnCompleteRef.current &&
+        activePlaybackNodesRef.current === 0
+      ) {
+        performAtomicHotSwapIfReady();
+      }
+    } catch {
+      // Background pre-warm failure never disrupts the active voice session
+    } finally {
+      standbyPrewarmingRef.current = false;
+    }
+  }, [
+    getCompactMemorySummary,
+    openGeminiLiveSession,
+    performAtomicHotSwapIfReady,
+  ]);
+
+  /**
+   * Module 1: Seamless In-Place Auto-Reconnect (up to 2 retries on unexpected WS drop)
+   * Preserves mic/AudioWorklet/AudioContext and injects text memory seamlessly.
+   */
+  const reconnectActiveSessionInPlace = useCallback(async () => {
+    if (!isMountedRef.current || !callActiveRef.current) return;
+    const pipelineGen = audioPipelineGenerationRef.current;
+    const nextIdx = activeSessionIndexRef.current + 1;
+    const memoryText = getCompactMemorySummary();
+    setFsm("CONNECTING");
+
+    try {
+      const opened = await openGeminiLiveSession({
+        purpose: "reconnect",
+        sessionIndex: nextIdx,
+        audioPipelineGen: pipelineGen,
+        memorySummary: memoryText,
+      });
+
+      if (
+        !isMountedRef.current ||
+        !callActiveRef.current ||
+        audioPipelineGenerationRef.current !== pipelineGen
+      ) {
+        try {
+          opened.session.close();
+        } catch {
+          // ignore
+        }
+        return;
+      }
+
+      activeSessionRef.current = opened.session;
+      activeSessionIndexRef.current = nextIdx;
+      activeSessionStartedAtRef.current = Date.now();
+      sessionTurnCountRef.current = 0;
+      sessionGenerationRef.current += 1;
+      setLiveError("");
+      setFsm("LISTENING");
+      console.log(
+        `[VOICE S#${nextIdx}] Connected (voice: ${opened.voiceName}, tools: ON, search: ${
+          searchEnabledRef.current ? "ON" : "OFF"
+        })`
+      );
+    } catch (err: unknown) {
+      if (
+        err instanceof Error &&
+        err.message === "SESSION_CANCELLED"
+      ) {
+        return;
+      }
+      if (
+        isMountedRef.current &&
+        callActiveRef.current &&
+        audioPipelineGenerationRef.current === pipelineGen
+      ) {
+        setLiveError(
+          err instanceof Error
+            ? err.message
+            : formatLiveConnectionError(String(err))
+        );
+        setFsm("ERROR");
+      }
+    }
+  }, [getCompactMemorySummary, openGeminiLiveSession, setFsm]);
+
+  useEffect(() => {
+    prepareStandbySessionRef.current = prepareStandbySession;
+  }, [prepareStandbySession]);
+
+  useEffect(() => {
+    performAtomicHotSwapIfReadyRef.current = performAtomicHotSwapIfReady;
+  }, [performAtomicHotSwapIfReady]);
+
+  useEffect(() => {
+    reconnectActiveSessionInPlaceRef.current = reconnectActiveSessionInPlace;
+  }, [reconnectActiveSessionInPlace]);
+
+  /**
+   * Pure Off-Main-Thread 16kHz Int16 PCM Mic Capture Pipeline (exact 640-sample / 40ms packets):
+   * - Guarded by `audioPipelineGenerationRef` so Atomic Hot-Swap NEVER interrupts the mic stream!
+   * - Smart Echo Guard & Strict Turn Lock: holds mic uplink while FSM is `AI_SPEAKING`,
+   *   `TOOL_EXECUTING`, `CONNECTING`, or `ERROR`, or while playback nodes > 0 + 220ms tail.
+   * - ZERO manual `audioStreamEnd`, ZERO `activityStart`/`activityEnd`, ZERO silence gate.
    */
   const attachMicCapturePipeline = useCallback(
-    async (stream: MediaStream, generation: number) => {
-      if (!callActiveRef.current || sessionGenerationRef.current !== generation) {
+    async (stream: MediaStream, pipelineGen: number) => {
+      if (
+        !callActiveRef.current ||
+        audioPipelineGenerationRef.current !== pipelineGen
+      ) {
         return;
       }
 
@@ -2263,32 +3547,33 @@ export function InteractiveVoiceCallOverlay({
       micAnalyser.smoothingTimeConstant = 0.78;
       micSource.connect(micAnalyser);
       liveMicAnalyserRef.current = micAnalyser;
-      if (liveStatusRef.current !== "speaking") {
+      if (fsmStateRef.current !== "AI_SPEAKING") {
         activeAnalyserRef.current = micAnalyser;
       }
 
-      const sendPcmChunkToSession = (int16: Int16Array) => {
-        const activeSession = sessionRef.current;
+      const sendPcmChunkToActiveSession = (int16: Int16Array) => {
+        const activeSession = activeSessionRef.current;
         if (
           !activeSession ||
           !callActiveRef.current ||
-          sessionGenerationRef.current !== generation ||
+          audioPipelineGenerationRef.current !== pipelineGen ||
           isMicMutedRef.current ||
           int16.length === 0
         ) {
           return;
         }
 
-        // Smart Echo Guard: hold mic frames while AI speaker is active + 180ms room-echo tail
+        // Strict Turn Lock & Smart Echo Guard (pause mic uplink during AI_SPEAKING / TOOL_EXECUTING + 220ms tail)
         const nowPerf = performance.now();
         if (
+          fsmStateRef.current !== "LISTENING" ||
           activePlaybackNodesRef.current > 0 ||
           nowPerf < micUnlockAtRef.current
         ) {
           return;
         }
 
-        // Read-only RMS profiler (logging only — NEVER modifies PCM samples or sends audioStreamEnd)
+        // Read-only RMS latency profiler (never modifies PCM samples, never sends manual VAD signals)
         const rms = computeInt16PcmRms(int16);
         const nextProfiler = observeMicRmsForProfiler(
           speechProfilerRef.current,
@@ -2309,7 +3594,7 @@ export function InteractiveVoiceCallOverlay({
             },
           });
         } catch {
-          // Ignore if session closed mid-frame
+          // Ignore if active session is mid-close
         }
       };
 
@@ -2329,7 +3614,7 @@ export function InteractiveVoiceCallOverlay({
 
           if (
             !callActiveRef.current ||
-            sessionGenerationRef.current !== generation ||
+            audioPipelineGenerationRef.current !== pipelineGen ||
             inputCtx.state === "closed"
           ) {
             try {
@@ -2351,7 +3636,7 @@ export function InteractiveVoiceCallOverlay({
           workletNode.port.onmessage = (event: MessageEvent) => {
             const payload = event.data;
             if (payload instanceof Int16Array) {
-              sendPcmChunkToSession(payload);
+              sendPcmChunkToActiveSession(payload);
             }
           };
 
@@ -2375,8 +3660,10 @@ export function InteractiveVoiceCallOverlay({
         }
       }
 
-      // Legacy fallback only when browser lacks AudioWorkletNode (accumulated to 640-sample 40ms packets)
-      if (!workletAttached && typeof inputCtx.createScriptProcessor === "function") {
+      if (
+        !workletAttached &&
+        typeof inputCtx.createScriptProcessor === "function"
+      ) {
         const scriptNode = inputCtx.createScriptProcessor(2048, 1, 1);
         liveScriptNodeRef.current = scriptNode;
 
@@ -2398,7 +3685,7 @@ export function InteractiveVoiceCallOverlay({
             for (let i = 0; i < int16.length; i++) {
               pendingBuffer[pendingOffset++] = int16[i];
               if (pendingOffset >= LIVE_INPUT_CHUNK_SAMPLES) {
-                sendPcmChunkToSession(pendingBuffer);
+                sendPcmChunkToActiveSession(pendingBuffer);
                 pendingBuffer = new Int16Array(LIVE_INPUT_CHUNK_SAMPLES);
                 pendingOffset = 0;
               }
@@ -2415,17 +3702,16 @@ export function InteractiveVoiceCallOverlay({
   );
 
   const startLiveVoiceSession = useCallback(async () => {
-    // Cleanly tear down any existing session & bump generation synchronously FIRST
-    disconnectLiveSession();
-    const generation = sessionGenerationRef.current;
+    disconnectAllVoiceSessions({ nextFsm: "CONNECTING" });
+    const pipelineGen = audioPipelineGenerationRef.current;
+    autoReconnectCountRef.current = 0;
     voiceStopSpeechRef.current?.();
 
     if (!isMountedRef.current || !callActiveRef.current || !isOpen) return;
 
     setLiveError("");
-    updateLiveStatus("connecting");
+    setFsm("CONNECTING");
 
-    // 1. Acquire microphone with AEC + NS + AGC enabled so soft/short utterances are crystal clear
     if (
       typeof navigator === "undefined" ||
       !navigator.mediaDevices ||
@@ -2434,7 +3720,7 @@ export function InteractiveVoiceCallOverlay({
       setLiveError(
         "Browser tidak mengizinkan akses mikrofon (butuh HTTPS / tab penuh)."
       );
-      updateLiveStatus("error");
+      setFsm("ERROR");
       return;
     }
 
@@ -2449,13 +3735,13 @@ export function InteractiveVoiceCallOverlay({
         },
       });
     } catch (err: unknown) {
-      if (sessionGenerationRef.current !== generation) return;
+      if (audioPipelineGenerationRef.current !== pipelineGen) return;
       if (isMicPermissionDenied(err)) {
         setLiveError(formatLiveConnectionError("NotAllowedError"));
       } else {
         setLiveError(formatLiveConnectionError("NotFoundError"));
       }
-      updateLiveStatus("error");
+      setFsm("ERROR");
       return;
     }
 
@@ -2463,7 +3749,7 @@ export function InteractiveVoiceCallOverlay({
       !isMountedRef.current ||
       !callActiveRef.current ||
       !isOpen ||
-      sessionGenerationRef.current !== generation
+      audioPipelineGenerationRef.current !== pipelineGen
     ) {
       micStream.getTracks().forEach((t) => t.stop());
       return;
@@ -2474,15 +3760,15 @@ export function InteractiveVoiceCallOverlay({
       track.enabled = !isMicMutedRef.current;
     });
 
-    // 2. Prepare dedicated 24kHz Output AudioContext + AnalyserNode for zero-wait playback
     const AudioCtx =
       window.AudioContext ||
       (window as unknown as { webkitAudioContext?: typeof AudioContext })
         .webkitAudioContext;
     if (!AudioCtx) {
-      disconnectLiveSession();
-      setLiveError("Browser tidak mendukung Web Audio API untuk audio Live 24kHz.");
-      updateLiveStatus("error");
+      disconnectAllVoiceSessions({ nextFsm: "ERROR" });
+      setLiveError(
+        "Browser tidak mendukung Web Audio API untuk audio Live 24kHz."
+      );
       return;
     }
 
@@ -2501,7 +3787,7 @@ export function InteractiveVoiceCallOverlay({
       !isMountedRef.current ||
       !callActiveRef.current ||
       !isOpen ||
-      sessionGenerationRef.current !== generation
+      audioPipelineGenerationRef.current !== pipelineGen
     ) {
       return;
     }
@@ -2512,22 +3798,20 @@ export function InteractiveVoiceCallOverlay({
     outAnalyser.connect(outCtx.destination);
     liveOutputAnalyserRef.current = outAnalyser;
     liveNextPlayTimeRef.current = 0;
-    liveTurnCompleteRef.current = true;
+    isServerTurnCompleteRef.current = true;
     activePlaybackNodesRef.current = 0;
     micUnlockAtRef.current = 0;
 
-    // 3. Attach 16kHz AudioWorklet mic pipeline (exact 640-sample / 40ms packets)
     try {
-      await attachMicCapturePipeline(micStream, generation);
+      await attachMicCapturePipeline(micStream, pipelineGen);
     } catch (err: unknown) {
-      if (sessionGenerationRef.current !== generation) return;
-      disconnectLiveSession();
+      if (audioPipelineGenerationRef.current !== pipelineGen) return;
+      disconnectAllVoiceSessions({ nextFsm: "ERROR" });
       setLiveError(
         formatLiveConnectionError(
           err instanceof Error ? err.message : String(err)
         )
       );
-      updateLiveStatus("error");
       return;
     }
 
@@ -2535,494 +3819,95 @@ export function InteractiveVoiceCallOverlay({
       !isMountedRef.current ||
       !callActiveRef.current ||
       !isOpen ||
-      sessionGenerationRef.current !== generation
+      audioPipelineGenerationRef.current !== pipelineGen
     ) {
       return;
     }
 
-    // 4. Request Ephemeral Token from `/api/live-token` & open direct browser `ai.live.connect(...)`
-    const fetchLiveToken = async (opts?: {
-      excludeModels?: string[];
-      disableThinkingConfig?: boolean;
-      disableCustomVad?: boolean;
-    }): Promise<LiveTokenApiResponse> => {
-      const abortController = new AbortController();
-      tokenAbortControllerRef.current = abortController;
-      try {
-        const res = await fetch("/api/live-token", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          signal: abortController.signal,
-          body: JSON.stringify({
-            voiceName: selectedVoiceRef.current,
-            enableSearch: searchEnabledRef.current,
-            recentContext: recentContextRef.current,
-            ...(opts?.excludeModels && opts.excludeModels.length > 0
-              ? { excludeModels: opts.excludeModels }
-              : {}),
-            ...(opts?.disableThinkingConfig
-              ? { disableThinkingConfig: true }
-              : {}),
-            ...(opts?.disableCustomVad ? { disableCustomVad: true } : {}),
-          }),
-        });
-        const data = (await res.json().catch(() => ({}))) as LiveTokenApiResponse;
-        if (!res.ok || !data.success || !data.token || !data.model) {
-          return {
-            success: false,
-            error:
-              data.error ||
-              `Gagal mengambil token sesi Live (HTTP ${res.status}).`,
-          };
-        }
-        return data;
-      } finally {
-        if (tokenAbortControllerRef.current === abortController) {
-          tokenAbortControllerRef.current = null;
-        }
-      }
-    };
+    const initialMemory = getCompactMemorySummary();
+    try {
+      const opened = await openGeminiLiveSession({
+        purpose: "primary",
+        sessionIndex: 1,
+        audioPipelineGen: pipelineGen,
+        memorySummary: initialMemory,
+      });
 
-    const excludedModels: string[] = getRecentlyFailedLiveModels();
-    let lastErrorReason = "";
-    let lastCloseCode: number | undefined = undefined;
-    let disableThinkingConfig = false;
-    let disableCustomVad = false;
-
-    const MAX_LIVE_ATTEMPTS = 6;
-
-    for (let attempt = 0; attempt < MAX_LIVE_ATTEMPTS; attempt++) {
       if (
         !isMountedRef.current ||
         !callActiveRef.current ||
         !isOpen ||
-        sessionGenerationRef.current !== generation
+        audioPipelineGenerationRef.current !== pipelineGen
       ) {
+        try {
+          opened.session.close();
+        } catch {
+          // ignore
+        }
         return;
       }
 
-      let tokenCfg: LiveTokenApiResponse;
-      try {
-        tokenCfg = await fetchLiveToken({
-          excludeModels: excludedModels,
-          disableThinkingConfig,
-          disableCustomVad,
-        });
-      } catch (err: unknown) {
-        if (sessionGenerationRef.current !== generation) {
-          return;
-        }
-        lastErrorReason = err instanceof Error ? err.message : String(err);
-        break;
-      }
+      activeSessionRef.current = opened.session;
+      activeSessionIndexRef.current = 1;
+      activeSessionStartedAtRef.current = Date.now();
+      sessionTurnCountRef.current = 0;
+      setLiveError("");
+      setFsm("LISTENING");
 
-      if (sessionGenerationRef.current !== generation) {
-        return;
-      }
+      console.log(
+        `[VOICE S#1] Connected (voice: ${opened.voiceName}, tools: ON, search: ${
+          searchEnabledRef.current ? "ON" : "OFF"
+        })`
+      );
 
-      if (!tokenCfg.success || !tokenCfg.token || !tokenCfg.model) {
-        lastErrorReason =
-          tokenCfg.error || "Token Gemini Live tidak tersedia dari server.";
-        if (excludedModels.length > 0 && attempt === 0) {
-          excludedModels.length = 0;
-          recentlyFailedLiveModels.clear();
-          continue;
-        }
-        break;
-      }
-
-      // Standard `@google/genai` LiveConnectConfig ONLY (no experimental affective/compression overhead)
-      const liveConfig: LiveConnectConfig = {
-        responseModalities: [Modality.AUDIO],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: {
-              voiceName: tokenCfg.voiceName || selectedVoiceRef.current,
-            },
-          },
-        },
-        ...(tokenCfg.systemInstruction
-          ? { systemInstruction: tokenCfg.systemInstruction }
-          : {}),
-        ...(searchEnabledRef.current &&
-        Array.isArray(tokenCfg.tools) &&
-        tokenCfg.tools.length > 0
-          ? { tools: tokenCfg.tools }
-          : {}),
-        ...(tokenCfg.thinkingConfig
-          ? { thinkingConfig: tokenCfg.thinkingConfig }
-          : {}),
-        ...(tokenCfg.realtimeInputConfig
-          ? { realtimeInputConfig: tokenCfg.realtimeInputConfig }
-          : {}),
-        inputAudioTranscription: {},
-        outputAudioTranscription: {},
-      };
-
-      const ai = new GoogleGenAI({
-        apiKey: tokenCfg.token,
-        httpOptions: { apiVersion: "v1alpha" },
-      });
-
-      let connectedSession: Session | null = null;
-      let unexpectedCloseCode: number | undefined = undefined;
-      let unexpectedCloseReason = "";
-
-      try {
-        connectedSession = await ai.live.connect({
-          model: tokenCfg.model,
-          config: liveConfig,
-          callbacks: {
-            onopen: () => {
-              // WebSocket opened; setupComplete resolves ai.live.connect()
-            },
-            onmessage: (message: LiveServerMessage) => {
-              if (
-                !callActiveRef.current ||
-                sessionGenerationRef.current !== generation
-              ) {
-                return;
-              }
-
-              // 1. Safe defensive toolCall responder so unexpected server toolCalls NEVER stall the Live session
-              const functionCalls = message.toolCall?.functionCalls;
-              if (Array.isArray(functionCalls) && functionCalls.length > 0) {
-                commitUserTurnIfPending();
-                const functionResponses: Array<{
-                  id: string;
-                  name: string;
-                  response: Record<string, unknown>;
-                }> = [];
-
-                for (const call of functionCalls) {
-                  const callId = call.id || `tool-${Date.now()}`;
-                  const callName = call.name || "unknown";
-                  if (callName === "create_chat_note") {
-                    const normalized = normalizeChatNoteArtifact(call.args);
-                    if (normalized) {
-                      queueMicrotask(() => {
-                        onCreateChatNoteRef.current?.(normalized);
-                      });
-                      functionResponses.push({
-                        id: callId,
-                        name: callName,
-                        response: {
-                          status: "success",
-                          title: normalized.title,
-                          message: "Catatan sudah ditampilkan di room chat.",
-                        },
-                      });
-                    } else {
-                      functionResponses.push({
-                        id: callId,
-                        name: callName,
-                        response: { status: "error", message: "Catatan kosong." },
-                      });
-                    }
-                  } else if (callName === "create_google_doc") {
-                    const normalized = normalizeGoogleDocArtifact(call.args);
-                    if (normalized) {
-                      queueMicrotask(() => {
-                        onCreateGoogleDocRef.current?.(normalized);
-                      });
-                      functionResponses.push({
-                        id: callId,
-                        name: callName,
-                        response: {
-                          status: "success",
-                          title: normalized.title,
-                          message:
-                            "Dokumen Google Docs sudah siap di room chat.",
-                        },
-                      });
-                    } else {
-                      functionResponses.push({
-                        id: callId,
-                        name: callName,
-                        response: { status: "error", message: "Dokumen kosong." },
-                      });
-                    }
-                  } else {
-                    functionResponses.push({
-                      id: callId,
-                      name: callName,
-                      response: {
-                        status: "ok",
-                        message:
-                          "Tool tidak diperlukan; jawab langsung secara lisan dengan bahasa Indonesia yang jelas.",
-                      },
-                    });
-                  }
-                }
-
-                if (sessionRef.current && functionResponses.length > 0) {
-                  try {
-                    sessionRef.current.sendToolResponse({ functionResponses });
-                  } catch {
-                    // ignore send error on closing session
-                  }
-                }
-                return;
-              }
-
-              const content = message.serverContent;
-              if (!content) return;
-
-              // 2. Server-side Barge-In: stop all active nodes immediately and unlock mic
-              if (content.interrupted) {
-                const interruptedTurn = activePlaybackTurnNumberRef.current;
-                stopAllPlayback();
-                if (
-                  interruptedTurn > 0 &&
-                  !loggedSpeakerFinishedForTurnRef.current
-                ) {
-                  loggedSpeakerFinishedForTurnRef.current = true;
-                  console.log(
-                    `[VOICE T#${interruptedTurn}] Speaker finished -> Mic unlocked`
-                  );
-                }
-                finalizeCurrentTurnAsync();
-                updateLiveStatus("listening");
-                return;
-              }
-
-              // 3. ZERO-WAIT 24kHz PCM Output Playback FIRST (never waits for outputTranscription or turnComplete)
-              const parts = content.modelTurn?.parts;
-              if (Array.isArray(parts)) {
-                let receivedAudio = false;
-                for (const part of parts) {
-                  if (part.inlineData?.data) {
-                    receivedAudio = true;
-                    enqueueLivePcmChunk(
-                      part.inlineData.data,
-                      part.inlineData.mimeType,
-                      generation
-                    );
-                  }
-                }
-                if (receivedAudio) {
-                  commitUserTurnIfPending();
-                }
-              }
-
-              // 4. Google Search grounding metadata (non-blocking, active when Search is ON)
-              if (content.groundingMetadata) {
-                if (hasGoogleSearchGrounding(content.groundingMetadata)) {
-                  turnUsedGoogleSearchRef.current = true;
-                }
-                const sources = extractWebSourcesFromGroundingMetadata(
-                  content.groundingMetadata,
-                  6
-                );
-                if (sources.length > 0) {
-                  turnPendingSourcesRef.current = mergeUniqueWebSources(
-                    turnPendingSourcesRef.current,
-                    sources
-                  );
-                  if (assistantTurnIdRef.current) {
-                    emitPendingSourcesAsync(assistantTurnIdRef.current);
-                  }
-                }
-              }
-
-              // 5. Live Streaming User Speech Transcription (strip <noise> + stray leading punctuation; 100ms throttled)
-              if (content.inputTranscription?.text) {
-                if (userTurnCommittedRef.current) {
-                  userTurnCommittedRef.current = false;
-                  userTurnIdRef.current = null;
-                  userTurnTextRef.current = "";
-                }
-                userTurnTextRef.current += content.inputTranscription.text;
-                const cleanedInput = sanitizeLiveUserTranscript(
-                  userTurnTextRef.current
-                );
-                if (cleanedInput.length > 0) {
-                  ensureActiveTurnNumber();
-                  speechPulseRef.current = 0.6;
-                  scheduleUserTranscriptFlush();
-                }
-              }
-
-              // 6. Live Streaming AI Speech Transcription -> 100ms throttled async bubble update (`Auto · Suara`)
-              if (content.outputTranscription?.text) {
-                commitUserTurnIfPending();
-                assistantTurnTextRef.current += content.outputTranscription.text;
-                if (
-                  sanitizeLiveTranscriptText(assistantTurnTextRef.current)
-                    .length > 0
-                ) {
-                  ensureActiveTurnNumber();
-                  ensureAssistantTurnId();
-                  scheduleAssistantTranscriptFlush();
-                }
-              }
-
-              // 7. Turn Complete -> finalize room chat + unlock mic after 180ms Echo Guard tail if speaker already drained
-              if (content.turnComplete) {
-                const finishedTurn = activePlaybackTurnNumberRef.current;
-                liveTurnCompleteRef.current = true;
-                finalizeCurrentTurnAsync();
-                if (activePlaybackNodesRef.current === 0) {
-                  if (
-                    finishedTurn > 0 &&
-                    !loggedSpeakerFinishedForTurnRef.current
-                  ) {
-                    scheduleEchoGuardUnlock(generation, finishedTurn);
-                  } else {
-                    liveNextPlayTimeRef.current = 0;
-                    activeAnalyserRef.current = liveMicAnalyserRef.current;
-                    updateLiveStatus("listening");
-                  }
-                }
-              }
-            },
-            onerror: (errEvent: ErrorEvent) => {
-              if (sessionGenerationRef.current !== generation) return;
-              const reason =
-                errEvent?.message || "WebSocket error pada sesi Live.";
-              unexpectedCloseReason = reason;
-              console.error("[VOICE] Error:", reason);
-              if (
-                callActiveRef.current &&
-                sessionRef.current !== null
-              ) {
-                setLiveError(formatLiveConnectionError(reason));
-                updateLiveStatus("error");
-              }
-            },
-            onclose: (closeEvent: CloseEvent) => {
-              if (sessionGenerationRef.current !== generation) return;
-              unexpectedCloseCode = closeEvent?.code;
-              unexpectedCloseReason = closeEvent?.reason || "";
-
-              if (closeEvent?.code !== 1000) {
-                console.warn("[VOICE] Closed:", {
-                  code: closeEvent?.code,
-                  reason: closeEvent?.reason || "",
-                });
-              }
-
-              // If session was already live and closed unexpectedly, show clear visible error (NO silent fallback)
-              if (
-                callActiveRef.current &&
-                sessionRef.current !== null &&
-                closeEvent?.code !== 1000
-              ) {
-                sessionRef.current = null;
-                stopAllPlayback();
-                finalizeCurrentTurnAsync();
-                setLiveError(
-                  formatLiveConnectionError(
-                    closeEvent?.reason || unexpectedCloseReason,
-                    closeEvent?.code
-                  )
-                );
-                updateLiveStatus("error");
-              }
-            },
-          },
-        });
-
-        // Successfully connected & setupComplete received!
+      // Module 1 age-based background pre-warming timer (pre-warm standby if session reaches 55s age)
+      clearPrewarmInterval();
+      prewarmIntervalRef.current = setInterval(() => {
         if (
           !isMountedRef.current ||
           !callActiveRef.current ||
-          !isOpen ||
-          sessionGenerationRef.current !== generation
+          audioPipelineGenerationRef.current !== pipelineGen ||
+          !activeSessionRef.current
         ) {
-          try {
-            connectedSession.close();
-          } catch {
-            // ignore
-          }
           return;
         }
-
-        sessionRef.current = connectedSession;
-        setLiveError("");
-        updateLiveStatus("listening");
-        const activeVoice = tokenCfg.voiceName || selectedVoiceRef.current;
-        console.log(
-          `[VOICE] Live connected (voice: ${activeVoice}, Search: ${searchEnabledRef.current ? "ON" : "OFF"})`
-        );
+        const ageMs = Date.now() - activeSessionStartedAtRef.current;
+        if (
+          ageMs >= LIVE_STANDBY_MAX_AGE_MS &&
+          !standbyReadyRef.current &&
+          !standbyPrewarmingRef.current
+        ) {
+          void prepareStandbySessionRef.current();
+        }
+      }, 5000);
+    } catch (err: unknown) {
+      if (err instanceof Error && err.message === "SESSION_CANCELLED") {
         return;
-      } catch (connectErr: unknown) {
-        if (sessionGenerationRef.current !== generation) {
-          return;
-        }
-        const msg =
-          connectErr instanceof Error ? connectErr.message : String(connectErr);
-        const codeMatch = msg.match(/code\s+(\d{4})/i);
-        const parsedCode =
-          unexpectedCloseCode ??
-          (codeMatch ? Number.parseInt(codeMatch[1], 10) : undefined);
-
-        lastErrorReason = unexpectedCloseReason || msg;
-        lastCloseCode = parsedCode;
-        console.error("[VOICE] Error:", lastErrorReason, parsedCode ?? "");
-
-        const isConfigRejection =
-          parsedCode === 1007 ||
-          parsedCode === 1008 ||
-          /invalid argument|unsupported|not supported|thinking|activity/i.test(
-            lastErrorReason
-          );
-
-        // Clean progressive parameter adjustment on SAME Live model before switching models
-        if (
-          isConfigRejection &&
-          !disableThinkingConfig &&
-          tokenCfg.thinkingConfig
-        ) {
-          disableThinkingConfig = true;
-          continue;
-        }
-        if (
-          isConfigRejection &&
-          !disableCustomVad &&
-          tokenCfg.realtimeInputConfig
-        ) {
-          disableCustomVad = true;
-          continue;
-        }
-
-        // Otherwise exclude failed model (e.g., quota 1011 or unavailable model) and try next Live Native Audio model
-        if (tokenCfg.model && !excludedModels.includes(tokenCfg.model)) {
-          excludedModels.push(tokenCfg.model);
-          if (parsedCode === 1011 || parsedCode === 1008) {
-            recentlyFailedLiveModels.set(tokenCfg.model, Date.now());
-          }
-        }
-        disableThinkingConfig = false;
-        disableCustomVad = false;
       }
-    }
-
-    // All Live Audio connection attempts failed -> show clear explicit error UI (ZERO silent fallback)
-    if (
-      isMountedRef.current &&
-      callActiveRef.current &&
-      sessionGenerationRef.current === generation
-    ) {
-      disconnectLiveSession({ keepMicAndAudioCtx: true });
-      setLiveError(formatLiveConnectionError(lastErrorReason, lastCloseCode));
-      updateLiveStatus("error");
+      if (
+        isMountedRef.current &&
+        callActiveRef.current &&
+        audioPipelineGenerationRef.current === pipelineGen
+      ) {
+        disconnectAllVoiceSessions({
+          keepMicAndAudioCtx: true,
+          nextFsm: "ERROR",
+        });
+        setLiveError(
+          err instanceof Error
+            ? err.message
+            : formatLiveConnectionError(String(err))
+        );
+      }
     }
   }, [
     attachMicCapturePipeline,
-    commitUserTurnIfPending,
-    disconnectLiveSession,
-    emitPendingSourcesAsync,
-    enqueueLivePcmChunk,
-    ensureActiveTurnNumber,
-    ensureAssistantTurnId,
-    finalizeCurrentTurnAsync,
+    clearPrewarmInterval,
+    disconnectAllVoiceSessions,
+    getCompactMemorySummary,
     isOpen,
-    scheduleAssistantTranscriptFlush,
-    scheduleEchoGuardUnlock,
-    scheduleUserTranscriptFlush,
-    stopAllPlayback,
-    updateLiveStatus,
+    openGeminiLiveSession,
+    setFsm,
   ]);
 
   useEffect(() => {
@@ -3039,13 +3924,82 @@ export function InteractiveVoiceCallOverlay({
     }
   }, [isMicMuted]);
 
-  // Open / close lifecycle — single active session guaranteed (StrictMode-safe via bootTimerRef + disconnectLiveSession)
+  // Module 5: Expose `window.__formylabVoiceStats()` & `window.__testVoiceTools()`
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    window.__formylabVoiceStats = () => {
+      const history = [...metricsHistoryRef.current];
+      const summary = summarizeVoiceMetrics(history);
+      if (history.length > 0) {
+        console.table(history);
+      } else {
+        console.log("[VOICE STATS] Belum ada giliran selesai pada sesi ini.");
+      }
+      console.log(
+        `[VOICE STATS] Total turns: ${summary.totalTurns} | Avg Turn #1-3: ${
+          summary.avgFirstAudioTurn1To3Ms !== null
+            ? `${summary.avgFirstAudioTurn1To3Ms}ms`
+            : "-"
+        } | Avg Turn #4+: ${
+          summary.avgFirstAudioTurn4PlusMs !== null
+            ? `${summary.avgFirstAudioTurn4PlusMs}ms`
+            : "-"
+        } | Hot-swaps: ${summary.hotSwapCount}`
+      );
+      return { history, summary };
+    };
+
+    window.__testVoiceTools = () => {
+      const sampleTable: FormulaTableArtifact = {
+        title: "Moisturizer Barrier Gel-Cream Kulit Sensitif",
+        subtitle: "Target pH 5.2–5.6 · Tekstur ringan cepat meresap · Bebas parfum",
+        columns: ["Fase", "Bahan", "Persentase (%)", "Fungsi"],
+        rows: [
+          ["A (Air)", "Aqua (Deionized Water)", "76.2%", "Pelarut utama"],
+          ["A (Air)", "Glycerin", "5.0%", "Humektan pengikat air"],
+          ["A (Air)", "Panthenol (Pro-Vitamin B5)", "2.0%", "Menenangkan & hidrasi"],
+          ["B (Emulsi)", "Cetearyl Olivate & Sorbitan Olivate", "4.0%", "Emulsifier lembut bebas PEG"],
+          ["B (Minyak)", "Squalane (Plant-Derived)", "6.0%", "Emolien ringan non-komedogenik"],
+          ["C (Aktif)", "Ceramide NP Complex", "1.0%", "Memperkuat skin barrier"],
+          ["C (Aktif)", "Niacinamide", "3.0%", "Cerahkan & jaga elastisitas"],
+          ["C (Stabil)", "Phenoxyethanol & Ethylhexylglycerin", "0.8%", "Pengawet spektrum luas BPOM"],
+          ["C (Tekstur)", "Sodium Polyacrylate", "2.0%", "Gel-cream stabilizer"],
+        ],
+        notes:
+          "Panaskan Fase A dan B terpisah pada 70°C, homogenisasi perlahan, dinginkan hingga <40°C sebelum memasukkan Fase C. Sesuaikan pH akhir ke 5.2–5.6.",
+      };
+
+      latestFormulaTableRef.current = sampleTable;
+      onCreateFormulaTableRef.current?.(sampleTable);
+
+      const sampleDoc: GoogleDocArtifact = {
+        title: `Formula R&D — ${sampleTable.title}`,
+        markdownContent: formulaTableToMarkdown(sampleTable),
+        status: "draft",
+      };
+      pendingGoogleDocRef.current = sampleDoc;
+      onCreateGoogleDocRef.current?.(sampleDoc);
+
+      console.log(
+        "[VOICE SELF-TEST] Rendered FormulaTableCard & GoogleDocCard dry-run in chat room."
+      );
+      return { tableCreated: true, googleDocCreated: true };
+    };
+
+    return () => {
+      delete window.__formylabVoiceStats;
+      delete window.__testVoiceTools;
+    };
+  }, []);
+
+  // Open / close lifecycle — single active session guaranteed (StrictMode-safe via bootTimerRef)
   useEffect(() => {
     isMountedRef.current = true;
     callActiveRef.current = isOpen;
 
     if (!isOpen) {
-      disconnectLiveSession();
+      disconnectAllVoiceSessions({ nextFsm: "IDLE" });
       queueMicrotask(() => {
         setLiveError("");
       });
@@ -3066,7 +4020,7 @@ export function InteractiveVoiceCallOverlay({
     return () => {
       isMountedRef.current = false;
       callActiveRef.current = false;
-      disconnectLiveSession();
+      disconnectAllVoiceSessions();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
@@ -3078,7 +4032,7 @@ export function InteractiveVoiceCallOverlay({
     selectedVoiceRef.current = nextVoice;
     setSelectedVoice(nextVoice);
     if (callActiveRef.current) {
-      disconnectLiveSession();
+      disconnectAllVoiceSessions({ nextFsm: "CONNECTING" });
       void startLiveSessionRef.current();
     }
   };
@@ -3088,14 +4042,14 @@ export function InteractiveVoiceCallOverlay({
     searchEnabledRef.current = next;
     setSearchEnabled(next);
     if (callActiveRef.current) {
-      disconnectLiveSession();
+      disconnectAllVoiceSessions({ nextFsm: "CONNECTING" });
       void startLiveSessionRef.current();
     }
   };
 
   const handleOrbInteract = () => {
-    if (liveStatus === "error") {
-      disconnectLiveSession();
+    if (fsmState === "ERROR") {
+      disconnectAllVoiceSessions({ nextFsm: "CONNECTING" });
       void startLiveSessionRef.current();
       return;
     }
@@ -3105,46 +4059,59 @@ export function InteractiveVoiceCallOverlay({
     if (liveInputCtxRef.current?.state === "suspended") {
       liveInputCtxRef.current.resume().catch(() => {});
     }
-    // Instant Manual Barge-In: clicking the orb while AI is speaking stops all audio & unlocks mic immediately
-    if (liveStatus === "speaking" || activePlaybackNodesRef.current > 0) {
+    // Instant Manual Barge-In: clicking the orb while AI is speaking stops audio & unlocks mic immediately
+    if (fsmState === "AI_SPEAKING" || activePlaybackNodesRef.current > 0) {
       const interruptedTurn = activePlaybackTurnNumberRef.current;
       stopAllPlayback();
-      if (interruptedTurn > 0 && !loggedSpeakerFinishedForTurnRef.current) {
-        loggedSpeakerFinishedForTurnRef.current = true;
-        console.log(
-          `[VOICE T#${interruptedTurn}] Speaker finished -> Mic unlocked`
-        );
-      }
       finalizeCurrentTurnAsync();
-      updateLiveStatus("listening");
+      handleTurnFullyUnlocked(interruptedTurn);
     }
   };
 
-  // Pure natural orb motion: listening (subtle pulse) or speaking (reactive multi-band waves)
   const orbPhase: LivingOrbPhase =
-    liveStatus === "speaking" ? "speaking" : "listening";
+    fsmState === "AI_SPEAKING"
+      ? "speaking"
+      : fsmState === "TOOL_EXECUTING"
+        ? "thinking"
+        : "listening";
 
   const statusText = isMicMuted
     ? "Live · Mikrofon Dibisukan"
-    : LIVE_STATUS_LABELS[liveStatus];
+    : fsmState === "TOOL_EXECUTING" && toolStatusLabel
+      ? toolStatusLabel
+      : LIVE_FSM_STATUS_LABELS[fsmState];
+
+  const legacyStatusAttr =
+    fsmState === "CONNECTING"
+      ? "connecting"
+      : fsmState === "AI_SPEAKING"
+        ? "speaking"
+        : fsmState === "TOOL_EXECUTING"
+          ? "tool_executing"
+          : fsmState === "ERROR"
+            ? "error"
+            : "listening";
 
   const orbAriaLabel =
-    liveStatus === "error"
+    fsmState === "ERROR"
       ? "Koneksi Live terputus, ketuk untuk menghubungkan ulang"
       : isMicMuted
         ? "Mikrofon dibisukan"
-        : liveStatus === "speaking"
+        : fsmState === "AI_SPEAKING"
           ? "AI sedang berbicara, ketuk Orb untuk menyela"
-          : liveStatus === "connecting"
-            ? "Menghubungkan ke Gemini Live Audio"
-            : "Live aktif dan mendengarkan suara Anda";
+          : fsmState === "TOOL_EXECUTING"
+            ? toolStatusLabel || "AI sedang memproses aksi"
+            : fsmState === "CONNECTING"
+              ? "Menghubungkan ke Gemini Live Audio"
+              : "Live aktif dan mendengarkan suara Anda";
 
   return (
     <div
       className="pointer-events-none flex flex-col items-center justify-center gap-1.5 select-none"
       role="region"
       aria-label="Mode Suara Gemini Live Formylab"
-      data-live-status={liveStatus}
+      data-live-status={legacyStatusAttr}
+      data-live-fsm={fsmState}
       data-live-search={searchEnabled ? "on" : "off"}
     >
       {/* Compact Frameless Audio-Reactive 3D Particle Sphere floating above composer */}
@@ -3154,7 +4121,7 @@ export function InteractiveVoiceCallOverlay({
         aria-label={orbAriaLabel}
         title={orbAriaLabel}
         className={`pointer-events-auto relative w-24 h-24 sm:w-28 sm:h-28 rounded-full cursor-pointer outline-none bg-transparent border-0 p-0 focus-visible:ring-2 focus-visible:ring-[#0E807E]/60 transition-all duration-300 active:scale-[0.95] ${
-          isMicMuted || liveStatus === "error" ? "opacity-55" : "opacity-100"
+          isMicMuted || fsmState === "ERROR" ? "opacity-55" : "opacity-100"
         }`}
       >
         <LivingVoiceOrb
@@ -3170,17 +4137,19 @@ export function InteractiveVoiceCallOverlay({
           role="status"
           aria-live="polite"
           className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium backdrop-blur-md border transition-colors ${
-            liveStatus === "error"
+            fsmState === "ERROR"
               ? "bg-[#fef2f2]/95 text-[#b91c1c] border-[#b91c1c]/25"
-              : "bg-white/90 text-[#0B2B26] border-[#0B2B26]/12"
+              : fsmState === "TOOL_EXECUTING"
+                ? "bg-[#eefaf6]/95 text-[#0E807E] border-[#0E807E]/30"
+                : "bg-white/90 text-[#0B2B26] border-[#0B2B26]/12"
           }`}
         >
-          {liveStatus === "connecting" ? (
+          {fsmState === "CONNECTING" || fsmState === "TOOL_EXECUTING" ? (
             <Loader2
               className="w-3 h-3 text-[#0E807E] animate-spin shrink-0"
               aria-hidden="true"
             />
-          ) : liveStatus === "error" ? (
+          ) : fsmState === "ERROR" ? (
             <AlertCircle
               className="w-3 h-3 text-[#b91c1c] shrink-0"
               aria-hidden="true"
@@ -3190,7 +4159,7 @@ export function InteractiveVoiceCallOverlay({
               className={`w-2 h-2 rounded-full shrink-0 ${
                 isMicMuted
                   ? "bg-slate-400"
-                  : liveStatus === "speaking"
+                  : fsmState === "AI_SPEAKING"
                     ? "bg-[#0E807E] animate-pulse"
                     : "bg-[#10B981] animate-pulse"
               }`}
@@ -3258,7 +4227,7 @@ export function InteractiveVoiceCallOverlay({
           <button
             type="button"
             onClick={() => {
-              disconnectLiveSession();
+              disconnectAllVoiceSessions({ nextFsm: "CONNECTING" });
               void startLiveSessionRef.current();
             }}
             className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-[#b91c1c] hover:bg-[#991b1b] text-white text-[10.5px] font-medium whitespace-nowrap cursor-pointer transition-colors shrink-0"

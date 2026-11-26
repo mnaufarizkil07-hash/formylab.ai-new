@@ -9,9 +9,11 @@ import {
 } from "./InteractiveVoiceController";
 import {
   ChatNoteArtifact,
+  FormulaTableArtifact,
   GoogleDocArtifact,
   WebSourceCitation,
 } from "./chatNoteUtils";
+import { LiveMemoryMessage } from "./liveVoiceHelpers";
 
 export interface VoiceTranscriptEntry {
   id: string;
@@ -51,6 +53,7 @@ interface LiveVoiceCallModalProps {
   modelName?: string;
   isAiThinking?: boolean;
   latestAiReply?: string;
+  recentMessages?: LiveMemoryMessage[];
   onLiveUserStream?: (turnId: string, text: string) => void;
   onLiveAssistantStream?: (turnId: string, text: string) => void;
   onLiveRemoveMessage?: (turnId: string) => void;
@@ -63,6 +66,7 @@ interface LiveVoiceCallModalProps {
     usedGoogleSearch: boolean;
   }) => void;
   onLiveWebSources?: (turnId: string, sources: WebSourceCitation[]) => void;
+  onCreateFormulaTable?: (table: FormulaTableArtifact) => void;
   onCreateChatNote?: (note: ChatNoteArtifact) => void;
   onCreateGoogleDoc?: (doc: GoogleDocArtifact) => void;
 }
@@ -73,11 +77,13 @@ export default function LiveVoiceCallModal({
   voice,
   isMicMuted = false,
   latestAiReply,
+  recentMessages,
   onLiveUserStream,
   onLiveAssistantStream,
   onLiveRemoveMessage,
   onLiveTurnComplete,
   onLiveWebSources,
+  onCreateFormulaTable,
   onCreateChatNote,
   onCreateGoogleDoc,
 }: LiveVoiceCallModalProps) {
@@ -88,11 +94,13 @@ export default function LiveVoiceCallModal({
       voice={voice}
       isMicMuted={isMicMuted}
       recentChatContext={latestAiReply}
+      recentMessages={recentMessages}
       onLiveUserStream={onLiveUserStream}
       onLiveAssistantStream={onLiveAssistantStream}
       onLiveRemoveMessage={onLiveRemoveMessage}
       onLiveTurnComplete={onLiveTurnComplete}
       onLiveWebSources={onLiveWebSources}
+      onCreateFormulaTable={onCreateFormulaTable}
       onCreateChatNote={onCreateChatNote}
       onCreateGoogleDoc={onCreateGoogleDoc}
     />

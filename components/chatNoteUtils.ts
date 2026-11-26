@@ -501,3 +501,171 @@ export function mergeUniqueWebSources(
   return merged;
 }
 
+// ============================================================================
+// STRUCTURED FORMULA TABLE ARTIFACT (`create_formula_table` / `[[FORMULA_TABLE]]`)
+// ============================================================================
+
+export interface FormulaTableArtifact {
+  title: string;
+  subtitle?: string;
+  columns: string[];
+  rows: string[][];
+  notes?: string;
+  createdAt?: string;
+}
+
+export const FORMULA_TABLE_OPEN_TAG = "[[FORMULA_TABLE]]";
+export const FORMULA_TABLE_CLOSE_TAG = "[[/FORMULA_TABLE]]";
+
+export function normalizeFormulaTableArtifact(
+  input: unknown
+): FormulaTableArtifact | null {
+  if (!input || typeof input !== "object") return null;
+  const raw = input as Record<string, unknown>;
+
+  const rawColumns = Array.isArray(raw.columns)
+    ? raw.columns.map((c) => String(c ?? "").trim()).filter(Boolean)
+    : [];
+  const rawRows = Array.isArray(raw.rows)
+    ? raw.rows
+        .filter((r) => Array.isArray(r))
+        .map((r) => (r as unknown[]).map((cell) => String(cell ?? "").trim()))
+        .filter((r) => r.some((cell) => cell.length > 0))
+    : [];
+
+  if (rawColumns.length === 0 || rawRows.length === 0) return null;
+
+  const title =
+    String(raw.title ?? "").trim() || "Tabel Formulasi Kosmetik R&D";
+  const subtitle =
+    typeof raw.subtitle === "string" && raw.subtitle.trim()
+      ? raw.subtitle.trim()
+      : undefined;
+  const notes =
+    typeof raw.notes === "string" && raw.notes.trim()
+      ? raw.notes.trim()
+      : undefined;
+  const createdAt =
+    typeof raw.createdAt === "string" && raw.createdAt.trim()
+      ? raw.createdAt.trim()
+      : new Date().toLocaleTimeString("id-ID", {
+          hour: "2-digit",
+          minute: "2-digit",
+        });
+
+  const normalizedRows = rawRows.map((row) =>
+    rawColumns.map((_, idx) => row[idx] ?? "-")
+  );
+
+  return {
+    title,
+    subtitle,
+    columns: rawColumns,
+    rows: normalizedRows,
+    notes,
+    createdAt,
+  };
+}
+
+export function encodeFormulaTableMessage(table: FormulaTableArtifact): string {
+  return `${FORMULA_TABLE_OPEN_TAG}${JSON.stringify(table)}${FORMULA_TABLE_CLOSE_TAG}`;
+}
+
+export function parseFormulaTableMessage(
+  content: string
+): FormulaTableArtifact | null {
+  if (!content) return null;
+  const trimmed = content.trim();
+  if (
+    !trimmed.startsWith(FORMULA_TABLE_OPEN_TAG) ||
+    !trimmed.endsWith(FORMULA_TABLE_CLOSE_TAG)
+  ) {
+    return null;
+  }
+  const inner = trimmed
+    .slice(FORMULA_TABLE_OPEN_TAG.length, -FORMULA_TABLE_CLOSE_TAG.length)
+    .trim();
+  try {
+    return normalizeFormulaTableArtifact(JSON.parse(inner));
+  } catch {
+    return null;
+  }
+}
+
+function escapePipe(cell: string): string {
+  return cell.replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
+}
+
+export function formulaTableToMarkdown(table: FormulaTableArtifact): string {
+  const lines: string[] = [`## ${table.title}`];
+  if (table.subtitle) {
+    lines.push(table.subtitle);
+  }
+  lines.push("");
+  lines.push(`| ${table.columns.map(escapePipe).join(" | ")} |`);
+  lines.push(`| ${table.columns.map(() => "---").join(" | ")} |`);
+  for (const row of table.rows) {
+    lines.push(
+      `| ${table.columns.map((_, idx) => escapePipe(row[idx] ?? "-")).join(" | ")} |`
+    );
+  }
+  if (table.notes) {
+    lines.push("");
+    lines.push(`**Catatan Proses & Keamanan:** ${table.notes}`);
+  }
+  return lines.join("\n");
+}
+
+export function formatFormulaTableForHistoryContext(
+  table: FormulaTableArtifact
+): string {
+  return `[Tabel Formulasi — ${table.title}]\n${formulaTableToMarkdown(table)}`;
+}
+
+export function extractFormulatorDraftFromTable(table: FormulaTableArtifact): {
+  formulaName: string;
+  productType: string;
+  skinTarget: string;
+  primarySkinTarget: string;
+  targetPh: string;
+  customIngredients: string[];
+  batchSize: string;
+} {
+  const combinedMeta = `${table.title} ${table.subtitle || ""} ${table.notes || ""}`;
+  const lowerCols = table.columns.map((c) => c.toLowerCase());
+  const ingColIdx = Math.max(
+    0,
+    lowerCols.findIndex((c) => /bahan|ingredient|inci|komponen|nama/i.test(c))
+  );
+  const pctColIdx = lowerCols.findIndex((c) => /%|persen|konsentrasi|dosis/i.test(c));
+
+  const customIngredients: string[] = [];
+  for (const row of table.rows) {
+    const ing = (row[ingColIdx] || "").trim();
+    if (!ing || /^(total|jumlah|subtotal|-)$/i.test(ing)) continue;
+    const pct = pctColIdx >= 0 ? (row[pctColIdx] || "").trim() : "";
+    customIngredients.push(pct && pct !== "-" ? `${ing} (${pct})` : ing);
+  }
+
+  const phMatch = combinedMeta.match(/pH\s*[:=]?\s*(\d+(?:[.,]\d+)?(?:\s*[-–]\s*\d+(?:[.,]\d+)?)?)/i);
+  const targetPh = phMatch ? phMatch[1].replace(/,/g, ".") : "5.5";
+
+  let skinTarget = "Sensitive";
+  if (/berminyak|oily|acne|jerawat/i.test(combinedMeta)) skinTarget = "Oily / Acne-Prone";
+  else if (/kering|dry|dehidrasi/i.test(combinedMeta)) skinTarget = "Dry";
+  else if (/kusam|bright|cerah|flek/i.test(combinedMeta)) skinTarget = "Dull / Hyperpigmentation";
+  else if (/aging|kerut|elastis/i.test(combinedMeta)) skinTarget = "Mature / Anti-Aging";
+  else if (/normal|kombinasi|semua/i.test(combinedMeta)) skinTarget = "All Skin Types";
+
+  return {
+    formulaName: table.title,
+    productType: table.title,
+    skinTarget,
+    primarySkinTarget: skinTarget,
+    targetPh,
+    customIngredients,
+    batchSize: "100",
+  };
+}
+
+

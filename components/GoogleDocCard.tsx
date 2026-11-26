@@ -106,7 +106,7 @@ export default function GoogleDocCard({
     [doc, isCreating]
   );
 
-  // Auto-create seamlessly if Google Drive is ALREADY connected in this session
+  // Auto-create seamlessly if Google Drive is ALREADY connected or becomes connected via OAuth
   useEffect(() => {
     if (
       doc.docUrl ||
@@ -115,13 +115,13 @@ export default function GoogleDocCard({
     ) {
       return;
     }
-    if (isGoogleDriveConnected()) {
+    if (driveConnected || isGoogleDriveConnected()) {
       autoCreateAttemptedRef.current = true;
       queueMicrotask(() => {
         void executeCreateInDrive(false);
       });
     }
-  }, [doc.docUrl, doc.status, executeCreateInDrive]);
+  }, [doc.docUrl, doc.status, driveConnected, executeCreateInDrive]);
 
   const handleCopyRichDocs = async () => {
     const ok = await copyRichHtmlForGoogleDocs(doc.title, doc.markdownContent);
@@ -195,7 +195,7 @@ export default function GoogleDocCard({
               rel="noopener noreferrer"
               className="btn-glass-primary min-h-[44px] px-4 py-2 rounded-full inline-flex items-center gap-2 text-xs sm:text-[13px] font-medium text-[#0B2B26] cursor-pointer"
             >
-              <span>Buka di Google Docs</span>
+              <span>Buka Google Docs</span>
               <ExternalLink className="w-3.5 h-3.5 text-[#0E807E]" aria-hidden="true" />
             </a>
           ) : isCreating ? (
@@ -203,7 +203,7 @@ export default function GoogleDocCard({
               <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
               <span>Membuat Google Docs di Drive...</span>
             </div>
-          ) : oauthConfigured ? (
+          ) : (
             <button
               type="button"
               onClick={() => void executeCreateInDrive(true)}
@@ -212,11 +212,11 @@ export default function GoogleDocCard({
               <Cloud className="w-4 h-4 text-[#0E807E]" aria-hidden="true" />
               <span>
                 {driveConnected
-                  ? "Buat di Google Docs"
-                  : "Hubungkan Google Drive & Buat Docs"}
+                  ? "Simpan ke Google Docs"
+                  : "Hubungkan Google Drive & Simpan Sekarang"}
               </span>
             </button>
-          ) : null}
+          )}
 
           {/* Instant Safe Fallback Actions (.doc & Rich HTML Copy) */}
           <button

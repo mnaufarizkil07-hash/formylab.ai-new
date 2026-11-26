@@ -25,20 +25,28 @@ import ChatComposerBar, {
   MultimodalSendOptions,
 } from "../../components/ChatComposerBar";
 import ChatNoteCard from "../../components/ChatNoteCard";
+import FormulaTableCard from "../../components/FormulaTableCard";
 import GoogleDocCard from "../../components/GoogleDocCard";
 import {
   ChatNoteArtifact,
+  FormulaTableArtifact,
   GoogleDocArtifact,
   WebSourceCitation,
   encodeChatNoteMessage,
+  encodeFormulaTableMessage,
   encodeGoogleDocMessage,
+  extractFormulatorDraftFromTable,
+  formatFormulaTableForHistoryContext,
   formatGoogleDocForHistoryContext,
   formatNoteForHistoryContext,
+  formulaTableToMarkdown,
   mergeUniqueWebSources,
   normalizeChatNoteArtifact,
+  normalizeFormulaTableArtifact,
   normalizeGoogleDocArtifact,
   normalizeWebSourceCitation,
   parseChatNoteMessage,
+  parseFormulaTableMessage,
   parseGoogleDocMessage,
 } from "../../components/chatNoteUtils";
 import {
@@ -564,6 +572,14 @@ export default function ChatPage() {
       const payloadMessages = updatedMessages
         .filter((m) => m.id !== "msg-welcome")
         .map((m) => {
+          const parsedTable = parseFormulaTableMessage(m.content);
+          if (parsedTable) {
+            return {
+              role: m.role,
+              content: formatFormulaTableForHistoryContext(parsedTable),
+              attachments: m.attachments,
+            };
+          }
           const parsedNote = parseChatNoteMessage(m.content);
           if (parsedNote) {
             return {
@@ -1063,6 +1079,48 @@ export default function ChatPage() {
     [persistSessions]
   );
 
+  const handleCreateFormulaTable = useCallback(
+    (table: FormulaTableArtifact) => {
+      const normalized = normalizeFormulaTableArtifact(table);
+      if (!normalized) return;
+      const targetId = activeSessionIdRef.current;
+      const modelBadge = selectedModelRef.current;
+
+      setSessions((prev) => {
+        const next = prev.map((sess) => {
+          if (sess.id !== targetId) return sess;
+          const tableMsg: ChatMessage = {
+            id: generateUniqueId("ftable"),
+            role: "assistant",
+            content: encodeFormulaTableMessage(normalized),
+            modelBadge,
+            timestamp: "Tabel Formula",
+          };
+          return {
+            ...sess,
+            messages: [...sess.messages, tableMsg],
+          };
+        });
+        persistSessions(next);
+        return next;
+      });
+    },
+    [persistSessions]
+  );
+
+  const handleApplyFormulaTableToFormulator = useCallback(
+    (table: FormulaTableArtifact) => {
+      try {
+        const draft = extractFormulatorDraftFromTable(table);
+        localStorage.setItem("importedChatFormulation", JSON.stringify(draft));
+      } catch {
+        // Ignore storage errors in restricted environments
+      }
+      router.push("/formulate");
+    },
+    [router]
+  );
+
   const attachWebSourcesToMessage = useCallback(
     (msgId: string, incomingSources: WebSourceCitation[]) => {
       if (
@@ -1245,13 +1303,16 @@ export default function ChatPage() {
     activeSession?.messages
       .filter((m) => m.role === "assistant")
       .slice(-1)[0]?.content || "";
+  const latestAiParsedTable = parseFormulaTableMessage(latestAiRawContent);
   const latestAiParsedNote = parseChatNoteMessage(latestAiRawContent);
   const latestAiParsedDoc = parseGoogleDocMessage(latestAiRawContent);
-  const latestAiContextSnippet = latestAiParsedNote
-    ? formatNoteForHistoryContext(latestAiParsedNote)
-    : latestAiParsedDoc
-      ? formatGoogleDocForHistoryContext(latestAiParsedDoc)
-      : latestAiRawContent;
+  const latestAiContextSnippet = latestAiParsedTable
+    ? formatFormulaTableForHistoryContext(latestAiParsedTable)
+    : latestAiParsedNote
+      ? formatNoteForHistoryContext(latestAiParsedNote)
+      : latestAiParsedDoc
+        ? formatGoogleDocForHistoryContext(latestAiParsedDoc)
+        : latestAiRawContent;
 
   return (
     <div className="h-screen w-screen overflow-hidden flex bg-[#ffffff] text-[#0B2B26] font-matter">
@@ -1747,6 +1808,37 @@ export default function ChatPage() {
                     );
                   }
 
+                  const parsedFormulaTable = parseFormulaTableMessage(msg.content);
+                  if (parsedFormulaTable) {
+                    return (
+                      <div
+                        key={`${msg.id}-${msgIdx}`}
+                        className="flex items-start gap-3.5 justify-start"
+                      >
+                        <div className="w-8 h-8 rounded-full flex items-center justify-center shrink-0 bg-[#f4fbf8] border border-[#0B2B26]/10 text-[#0E807E] mt-0.5 shadow-none">
+                          <ModelIcon
+                            modelId={msgModelOpt.id}
+                            className="w-4 h-4"
+                            idSuffix={`ftable-${msg.id}-${msgIdx}`}
+                          />
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <FormulaTableCard
+                            table={parsedFormulaTable}
+                            onSaveToGoogleDocs={(tableItem) =>
+                              handleCreateGoogleDoc({
+                                title: tableItem.title,
+                                markdownContent: formulaTableToMarkdown(tableItem),
+                                status: "draft",
+                              })
+                            }
+                            onApplyToFormulator={handleApplyFormulaTableToFormulator}
+                          />
+                        </div>
+                      </div>
+                    );
+                  }
+
                   const parsedNote = parseChatNoteMessage(msg.content);
                   if (parsedNote) {
                     return (
@@ -1868,6 +1960,10 @@ export default function ChatPage() {
                             ...conversationMessages
                               .slice(Math.max(0, msgIdx - 3), msgIdx)
                               .map((m) => {
+                                const tableCtx = parseFormulaTableMessage(m.content);
+                                if (tableCtx) {
+                                  return formatFormulaTableForHistoryContext(tableCtx);
+                                }
                                 const noteCtx = parseChatNoteMessage(m.content);
                                 if (noteCtx) {
                                   return formatNoteForHistoryContext(noteCtx);
@@ -1927,11 +2023,16 @@ export default function ChatPage() {
                     modelName={activeModelOption.name}
                     isAiThinking={isLoading}
                     latestAiReply={latestAiContextSnippet}
+                    recentMessages={conversationMessages.map((m) => ({
+                      role: m.role,
+                      content: m.content,
+                    }))}
                     onLiveUserStream={handleLiveUserStream}
                     onLiveAssistantStream={handleLiveAssistantStream}
                     onLiveRemoveMessage={handleLiveRemoveMessage}
                     onLiveTurnComplete={handleLiveTurnComplete}
                     onLiveWebSources={attachWebSourcesToMessage}
+                    onCreateFormulaTable={handleCreateFormulaTable}
                     onCreateChatNote={handleCreateChatNote}
                     onCreateGoogleDoc={handleCreateGoogleDoc}
                   />

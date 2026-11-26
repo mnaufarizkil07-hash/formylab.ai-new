@@ -5,18 +5,19 @@ import {
   GoogleGenAI,
   Modality,
   StartSensitivity,
-  Tool,
+  type Tool,
 } from "@google/genai";
 import {
   LiveVoiceName,
+  buildLiveVoiceFunctionDeclarations,
   buildLiveVoiceSystemInstruction,
 } from "../../../components/liveVoiceHelpers";
 
 /**
  * Native Audio Live models ordered for instant Vercel-compatible browser connections:
- * Gemini 2.5 Flash Native Audio models support Ephemeral Tokens, Pure Native Server VAD,
- * `thinkingConfig: { thinkingBudget: 0 }`, and optional Google Search grounding
- * without experimental affective/compression overhead on multi-turn dialogues.
+ * Supports Ephemeral Tokens, Pure Native Server VAD, `thinkingConfig: { thinkingBudget: 0 }`,
+ * and Unified Function Calling (`create_formula_table`, `save_to_google_docs`,
+ * and conditional `search_web_info`) identically across all 4 voice chips.
  */
 const LIVE_NATIVE_AUDIO_MODELS = [
   "gemini-2.5-flash-native-audio-preview-12-2025",
@@ -54,10 +55,6 @@ const WS_SERVER_VAD_CONFIG = {
   activityHandling: "START_OF_ACTIVITY_INTERRUPTS",
 };
 
-// ONLY attached when the user explicitly toggles Search ON (zero custom function declarations!)
-const SDK_SEARCH_ONLY_TOOLS: Tool[] = [{ googleSearch: {} }];
-const WS_SEARCH_ONLY_TOOLS = [{ googleSearch: {} }];
-
 export async function POST(req: NextRequest) {
   try {
     const apiKey = process.env.GEMINI_API_KEY;
@@ -72,7 +69,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    let recentContext = "";
+    let memorySummary = "";
     let requestedVoice: LiveVoiceName = "Aoede";
     let enableSearch = false;
     let excludeModelSet = new Set<string>();
@@ -81,8 +78,13 @@ export async function POST(req: NextRequest) {
 
     try {
       const body = await req.json();
-      if (typeof body?.recentContext === "string") {
-        recentContext = body.recentContext;
+      if (typeof body?.memorySummary === "string" && body.memorySummary.trim()) {
+        memorySummary = body.memorySummary.trim().slice(0, 2600);
+      } else if (
+        typeof body?.recentContext === "string" &&
+        body.recentContext.trim()
+      ) {
+        memorySummary = body.recentContext.trim().slice(0, 2600);
       }
       if (
         typeof body?.voiceName === "string" &&
@@ -125,9 +127,17 @@ export async function POST(req: NextRequest) {
     }
 
     const systemInstruction = buildLiveVoiceSystemInstruction(
-      recentContext,
+      memorySummary,
       enableSearch
     );
+
+    // Unified Tool Array: ALL skills (`create_formula_table`, `save_to_google_docs`,
+    // and conditional `search_web_info`) via `functionDeclarations` — zero native search conflict!
+    const unifiedTools: Tool[] = [
+      {
+        functionDeclarations: buildLiveVoiceFunctionDeclarations(enableSearch),
+      },
+    ];
 
     const ai = new GoogleGenAI({
       apiKey,
@@ -167,10 +177,8 @@ export async function POST(req: NextRequest) {
       const vadPatch = disableCustomVad
         ? {}
         : { realtimeInputConfig: SDK_SERVER_VAD_CONFIG };
-      const sdkToolsPatch = enableSearch ? { tools: SDK_SEARCH_ONLY_TOOLS } : {};
-      const wsTools = enableSearch ? WS_SEARCH_ONLY_TOOLS : undefined;
 
-      // Tier 1: Constrained Ephemeral Token with zero-thinking budget + Pure Native Server VAD
+      // Tier 1: Constrained Ephemeral Token with Unified Tools + Zero-Thinking Budget + Pure Server VAD
       try {
         const tokenRes = await ai.authTokens.create({
           config: {
@@ -189,9 +197,9 @@ export async function POST(req: NextRequest) {
                   },
                 },
                 systemInstruction,
+                tools: unifiedTools,
                 inputAudioTranscription: {},
                 outputAudioTranscription: {},
-                ...sdkToolsPatch,
                 ...thinkingPatch,
                 ...vadPatch,
               },
@@ -207,7 +215,7 @@ export async function POST(req: NextRequest) {
             voiceName: requestedVoice,
             enableSearch,
             systemInstruction,
-            ...(wsTools ? { tools: wsTools } : {}),
+            tools: unifiedTools,
             thinkingConfig: supportsZeroThinkingBudget
               ? { thinkingBudget: 0 }
               : undefined,
@@ -220,11 +228,11 @@ export async function POST(req: NextRequest) {
         }
       } catch (err: unknown) {
         attemptErrors.push(
-          `[${modelId}:${enableSearch ? "search" : "pure"}] ${err instanceof Error ? err.message : String(err)}`
+          `[${modelId}:unified] ${err instanceof Error ? err.message : String(err)}`
         );
       }
 
-      // Tier 2: Model-only constrained token (client sends standard Live setup via ai.live.connect)
+      // Tier 2: Model-only constrained token (client sends unified setup via ai.live.connect)
       try {
         const tokenRes = await ai.authTokens.create({
           config: {
@@ -245,7 +253,7 @@ export async function POST(req: NextRequest) {
             voiceName: requestedVoice,
             enableSearch,
             systemInstruction,
-            ...(wsTools ? { tools: wsTools } : {}),
+            tools: unifiedTools,
             thinkingConfig: supportsZeroThinkingBudget
               ? { thinkingBudget: 0 }
               : undefined,
