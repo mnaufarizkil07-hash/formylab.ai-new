@@ -47,6 +47,7 @@ import {
   extractLatestFormulaTableFromMessages,
   extractLocalFactSummaryFallback,
   formatLiveConnectionError,
+  formatTodayIndonesianDateWib,
   getLiveThinkingConfigForModel,
   getScopedChatStorageKey,
   getVoiceMemoryStorageKey,
@@ -257,6 +258,10 @@ test("buildLiveVoiceFunctionDeclarations permanently registers all 4 unified ski
       "recall_chat_history",
     ]
   );
+
+  const searchTool = decls.find((d) => d.name === "search_web_info");
+  assert.ok(searchTool?.description?.includes("siapa pejabat/presiden saat ini"));
+  assert.ok(searchTool?.description?.includes("mengoreksi fakta"));
 
   const tableTool = decls.find((d) => d.name === "create_formula_table");
   assert.ok(tableTool?.parameters?.properties);
@@ -634,15 +639,23 @@ test("parsePcmSampleRate extracts rate from mimeType or falls back cleanly", () 
   assert.equal(parsePcmSampleRate(undefined, 24000), 24000);
 });
 
-test("buildLiveVoiceSystemInstruction stays strictly under 220 words (excluding memory), enforces ATURAN BAHASA MUTLAK, 1-2 dense sentences, and all 4 auto tools", () => {
-  const emptyMemPrompt = buildLiveVoiceSystemInstruction("");
+test("buildLiveVoiceSystemInstruction injects dynamic WIB today date on line 1, enforces strict search_web_info rules, and keeps base prompt concise", () => {
+  const fixedDate = new Date("2026-04-12T05:00:00Z"); // Sunday, 12 April 2026 in WIB
+  const expectedDate = formatTodayIndonesianDateWib(fixedDate);
+  const emptyMemPrompt = buildLiveVoiceSystemInstruction("", fixedDate);
   const baseWordCount = emptyMemPrompt.trim().split(/\s+/).filter(Boolean).length;
   assert.ok(
-    baseWordCount < 220,
-    `Expected base systemInstruction < 220 words, got ${baseWordCount}`
+    baseWordCount <= 230,
+    `Expected compact base systemInstruction <= 230 words, got ${baseWordCount}`
   );
-  assert.ok(emptyMemPrompt.startsWith("ATURAN BAHASA MUTLAK: User selalu berbicara dalam Bahasa Indonesia"));
+  assert.ok(
+    emptyMemPrompt.startsWith(`Waktu saat ini: ${expectedDate} (WIB).`),
+    `Expected top date line, got: ${emptyMemPrompt.slice(0, 80)}`
+  );
+  assert.ok(emptyMemPrompt.includes("ATURAN BAHASA MUTLAK: User selalu berbicara dalam Bahasa Indonesia"));
   assert.ok(emptyMemPrompt.includes("1 sampai 2 kalimat"));
+  assert.ok(emptyMemPrompt.includes("WAJIB panggil tool `search_web_info` terlebih dahulu sebelum menjawab"));
+  assert.ok(emptyMemPrompt.includes("DILARANG KERAS mengatakan 'Berdasarkan informasi terkini...'"));
   assert.ok(emptyMemPrompt.includes("create_formula_table"));
   assert.ok(emptyMemPrompt.includes("save_to_google_docs"));
   assert.ok(emptyMemPrompt.includes("search_web_info"));
@@ -652,8 +665,10 @@ test("buildLiveVoiceSystemInstruction stays strictly under 220 words (excluding 
   assert.equal(emptyMemPrompt.includes("[MEMORI PERCAKAPAN SEBELUMNYA]"), false);
 
   const withMemory = buildLiveVoiceSystemInstruction(
-    "[RINGKASAN FAKTA JANGKA PANJANG]\nUser: Sari\n\n[16 PESAN DIALOG TERAKHIR]\nUser: Halo\nFormylab AI: Halo Sari!"
+    "[RINGKASAN FAKTA JANGKA PANJANG]\nUser: Sari\n\n[16 PESAN DIALOG TERAKHIR]\nUser: Halo\nFormylab AI: Halo Sari!",
+    fixedDate
   );
+  assert.ok(withMemory.startsWith(`Waktu saat ini: ${expectedDate} (WIB).`));
   assert.ok(withMemory.includes("[MEMORI PERCAKAPAN SEBELUMNYA]"));
 });
 

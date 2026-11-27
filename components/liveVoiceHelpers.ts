@@ -702,7 +702,7 @@ export function buildLiveVoiceFunctionDeclarations(): FunctionDeclaration[] {
     {
       name: "search_web_info",
       description:
-        "Mencari informasi terkini dan terverifikasi dari internet (Google Search) seperti tren skincare terbaru, berita terbaru, harga bahan baku terbaru, regulasi BPOM/Halal terbaru, atau fakta eksternal.",
+        "Wajib dipanggil untuk mencari informasi real-time di Google Search: siapa pejabat/presiden saat ini, berita & kejadian terkini, fakta dunia terbaru, harga bahan, regulasi BPOM/Halal terbaru, tren pasar, atau kapan pun user secara eksplisit meminta cek/cari di internet atau mengoreksi fakta.",
       parameters: {
         type: Type.OBJECT,
         properties: {
@@ -734,18 +734,43 @@ export function buildLiveVoiceFunctionDeclarations(): FunctionDeclaration[] {
 }
 
 /**
- * Natural GPT-Voice Indonesian Persona (Module 2 + Module 5):
- * - Strict Indonesian language lock on line 1.
- * - Warm, smooth, conversational R&D partner rhythm with natural comma/period pauses.
- * - Automatic seamless tool calling across all 4 skills (`search_web_info`, `create_formula_table`,
- *   `save_to_google_docs`, `recall_chat_history`).
- * - Deterministic full memory injection from second 1 (`[RINGKASAN FAKTA JANGKA PANJANG]`,
+ * Formats today's Indonesian date in WIB (Asia/Jakarta) so Live Voice and `/api/live-search`
+ * always anchor real-time facts to the exact current date even on UTC servers like Vercel.
+ */
+export function formatTodayIndonesianDateWib(date: Date = new Date()): string {
+  try {
+    return date.toLocaleDateString("id-ID", {
+      weekday: "long",
+      day: "numeric",
+      month: "long",
+      year: "numeric",
+      timeZone: "Asia/Jakarta",
+    });
+  } catch {
+    return date.toLocaleDateString("id-ID", {
+      weekday: "long",
+      day: "numeric",
+      month: "long",
+      year: "numeric",
+    });
+  }
+}
+
+/**
+ * Natural GPT-Voice Indonesian Persona with Dynamic Date Awareness & Strict Live Search Rules:
+ * - Dynamic current date (WIB) injected at line 1 on initial connect, standby, and reconnect.
+ * - Strict Indonesian language lock + warm, concise 1-2 sentence conversational pacing.
+ * - Mandatory `search_web_info` trigger for time-sensitive facts & user corrections.
+ * - Deterministic full memory injection (`[RINGKASAN FAKTA JANGKA PANJANG]`,
  *   `[TABEL FORMULA AKTIF]`, `[16 PESAN DIALOG TERAKHIR]`).
  */
 export function buildLiveVoiceSystemInstruction(
-  memorySummary?: string
+  memorySummary?: string,
+  now: Date = new Date()
 ): string {
+  const todayStr = formatTodayIndonesianDateWib(now);
   const lines = [
+    `Waktu saat ini: ${todayStr} (WIB).`,
     "ATURAN BAHASA MUTLAK: User selalu berbicara dalam Bahasa Indonesia (sesekali menyebut istilah kosmetik/INCI). Selalu tafsirkan ucapan user sebagai Bahasa Indonesia dan SELALU balas dalam Bahasa Indonesia lisan yang hangat, akrab, cepat, dan natural seperti rekan senior R&D Formylab.ai di telepon. Abaikan noise singkat tak jelas tanpa merespons atau meminta maaf.",
     "",
     "Gaya bicara:",
@@ -754,7 +779,7 @@ export function buildLiveVoiceSystemInstruction(
     "- Jangan menyapa user memakai nama bahan kosmetik.",
     "",
     "Tool otomatis (selalu aktif):",
-    "- `search_web_info`: panggil untuk tren skincare/kosmetik terbaru, harga bahan terkini, regulasi BPOM/Halal terbaru, atau fakta web; untuk obrolan biasa jawab langsung.",
+    "- `search_web_info`: Jika user menanyakan fakta yang bisa berubah seiring waktu (seperti siapa presiden/pejabat saat ini, berita, tren, regulasi, harga) ATAU user berkata 'cek di internet' / 'cari di Google' / mengoreksi jawabanmu, WAJIB panggil tool `search_web_info` terlebih dahulu sebelum menjawab. DILARANG KERAS mengatakan 'Berdasarkan informasi terkini...' jika kamu belum benar-benar memanggil tool `search_web_info` pada giliran ini.",
     "- `create_formula_table`: JANGAN PERNAH menolak saat user minta tabel resep detail atau perbandingan bahan; langsung panggil dengan `topic`, `key_ingredients`, `constraints`, `table_type` ('formulation' | 'comparison' | 'general'), lalu ringkas 1 sampai 2 kalimat lewat suara.",
     "- `save_to_google_docs`: panggil saat user minta simpan ke Google Docs/Drive (`include_latest_table: true` untuk tabel terakhir).",
     "- `recall_chat_history`: panggil saat user menanyakan bahasan lama di chat ini.",

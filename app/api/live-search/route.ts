@@ -4,17 +4,22 @@ import {
   WebSourceCitation,
   extractWebSourcesFromGroundingMetadata,
 } from "../../../components/chatNoteUtils";
+import {
+  formatTodayIndonesianDateWib,
+  hasGoogleSearchGrounding,
+} from "../../../components/liveVoiceHelpers";
 
 /**
  * Stable Vercel-safe Gemini Google Search grounding endpoint for Live Voice Mode.
- * Uses identical Next.js App Router + `@google/genai` patterns as `/api/live-token`.
- * - Primary model: `gemini-2.5-flash` (fast, stable, supports `googleSearch` tool).
+ * - Injects dynamic Indonesian date (WIB) so search results always anchor to today's facts.
+ * - Primary model: `gemini-2.5-flash` with `tools: [{ googleSearch: {} }]` & `temperature: 0.1`.
  * - Internal 9-second hard timeout (`Promise.race`) so Vercel Serverless NEVER times out with 502.
- * - ALWAYS returns HTTP 200 JSON (`{ ok: true, summary, sources }` or `{ ok: false, fallbackNote }`).
+ * - NEVER instructs the Live model to fall back to stale offline/2024 knowledge: if real-time
+ *   search fails, explicitly tells the model to state honestly that search is currently unavailable.
  */
 const LIVE_SEARCH_TIMEOUT_MS = 9_000;
-const FALLBACK_NOTE =
-  "Pencarian langsung sedang sibuk, jawab berdasarkan pengetahuan terkini yang kamu ketahui.";
+const SEARCH_UNAVAILABLE_NOTE =
+  "Pencarian internet sedang gagal atau sibuk saat ini. Sampaikan dengan jujur ke pengguna bahwa pencarian internet sedang mengalami kendala sehingga kamu belum bisa memverifikasi data real-time, dan DILARANG menebak atau memakai fakta lama.";
 
 function raceWithTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -44,7 +49,7 @@ export async function POST(req: NextRequest) {
           success: false,
           summary: "",
           sources: [] as WebSourceCitation[],
-          fallbackNote: FALLBACK_NOTE,
+          fallbackNote: SEARCH_UNAVAILABLE_NOTE,
           error: "GEMINI_API_KEY tidak tersedia di server.",
         },
         { status: 200 }
@@ -67,12 +72,15 @@ export async function POST(req: NextRequest) {
           success: false,
           summary: "",
           sources: [] as WebSourceCitation[],
-          fallbackNote: FALLBACK_NOTE,
+          fallbackNote: SEARCH_UNAVAILABLE_NOTE,
           error: "Query pencarian kosong.",
         },
         { status: 200 }
       );
     }
+
+    const todayStr = formatTodayIndonesianDateWib();
+    const searchPrompt = `Tanggal hari ini: ${todayStr} (WIB). Cari informasi terbaru dan paling akurat di internet untuk pertanyaan berikut, lalu jawab singkat, tegas, dan faktual dalam 2-3 kalimat Bahasa Indonesia:\n\n${query}`;
 
     const ai = new GoogleGenAI({
       apiKey,
@@ -100,12 +108,10 @@ export async function POST(req: NextRequest) {
         const response = await raceWithTimeout(
           ai.models.generateContent({
             model,
-            contents: query,
+            contents: searchPrompt,
             config: {
               tools: [{ googleSearch: {} }],
-              systemInstruction:
-                "Kamu adalah asisten riset cepat Formylab.ai. Rangkum fakta terbaru dari hasil Google Search dalam 2 sampai 3 kalimat padat Bahasa Indonesia yang sangat natural dan informatif, tanpa simbol markdown, tanpa daftar panjang.",
-              temperature: 0.2,
+              temperature: 0.1,
             },
           }),
           remainingMs
@@ -124,6 +130,8 @@ export async function POST(req: NextRequest) {
           groundingMetadata,
           6
         );
+        const grounded =
+          sources.length > 0 || hasGoogleSearchGrounding(groundingMetadata);
 
         if (cleanedSummary) {
           return NextResponse.json(
@@ -132,6 +140,8 @@ export async function POST(req: NextRequest) {
               success: true,
               summary: cleanedSummary,
               sources,
+              grounded,
+              today: todayStr,
               model,
             },
             { status: 200 }
@@ -155,7 +165,8 @@ export async function POST(req: NextRequest) {
         success: false,
         summary: "",
         sources: [] as WebSourceCitation[],
-        fallbackNote: FALLBACK_NOTE,
+        today: todayStr,
+        fallbackNote: SEARCH_UNAVAILABLE_NOTE,
         error: lastErrCode || "SEARCH_UNAVAILABLE",
       },
       { status: 200 }
@@ -167,7 +178,7 @@ export async function POST(req: NextRequest) {
         success: false,
         summary: "",
         sources: [] as WebSourceCitation[],
-        fallbackNote: FALLBACK_NOTE,
+        fallbackNote: SEARCH_UNAVAILABLE_NOTE,
         error: "SEARCH_UNAVAILABLE",
       },
       { status: 200 }

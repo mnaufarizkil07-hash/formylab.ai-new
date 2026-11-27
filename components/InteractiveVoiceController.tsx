@@ -3381,15 +3381,15 @@ export function InteractiveVoiceCallOverlay({
 
                 const isSearchOk = Boolean(data.ok || data.success) && Boolean(data.summary);
                 if (!isSearchOk) {
-                  const fallbackMsg =
+                  const unavailableMsg =
                     data.fallbackNote ||
-                    "Pencarian langsung sedang sibuk, jawab berdasarkan pengetahuan terkini yang kamu ketahui.";
+                    "Pencarian internet sedang gagal atau sibuk saat ini. Sampaikan dengan jujur ke pengguna bahwa pencarian internet sedang mengalami kendala sehingga kamu belum bisa memverifikasi data real-time, dan DILARANG menebak atau memakai fakta lama.";
                   console.log(
-                    `[VOICE S#${activeSessionIndexRef.current} T#${turnNum}] /api/live-search -> fallback (HTTP ${res.status}${data.error ? `: ${data.error.slice(0, 80)}` : ""})`
+                    `[VOICE S#${activeSessionIndexRef.current} T#${turnNum}] /api/live-search -> unavailable (HTTP ${res.status}${data.error ? `: ${data.error.slice(0, 80)}` : ""})`
                   );
                   return {
-                    status: "ok",
-                    resultMessage: fallbackMsg,
+                    status: "error",
+                    resultMessage: unavailableMsg,
                   };
                 }
 
