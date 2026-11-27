@@ -8,6 +8,7 @@ import {
   type Tool,
 } from "@google/genai";
 import {
+  LIVE_CONTEXT_WINDOW_COMPRESSION,
   LiveVoiceName,
   buildLiveVoiceFunctionDeclarations,
   buildLiveVoiceSystemInstruction,
@@ -16,8 +17,7 @@ import {
 /**
  * Native Audio Live models ordered for instant Vercel-compatible browser connections:
  * Supports Ephemeral Tokens, Pure Native Server VAD, `thinkingConfig: { thinkingBudget: 0 }`,
- * and Unified Function Calling (`create_formula_table`, `save_to_google_docs`,
- * and conditional `search_web_info`) identically across all 4 voice chips.
+ * Context Window Compression, and ALL 4 Unified Skills permanently active across all 4 voice chips.
  */
 const LIVE_NATIVE_AUDIO_MODELS = [
   "gemini-2.5-flash-native-audio-preview-12-2025",
@@ -32,14 +32,14 @@ const ALLOWED_VOICES = new Set<LiveVoiceName>([
   "Puck",
 ]);
 
-// 100% Pure Native Server VAD
+// 100% Pure Native Server VAD — fast endpointing (180ms silence, 80ms prefix padding)
 const SDK_SERVER_VAD_CONFIG = {
   automaticActivityDetection: {
     disabled: false,
     startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
     endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_HIGH,
-    prefixPaddingMs: 100,
-    silenceDurationMs: 250,
+    prefixPaddingMs: 80,
+    silenceDurationMs: 180,
   },
   activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
 };
@@ -49,8 +49,8 @@ const WS_SERVER_VAD_CONFIG = {
     disabled: false,
     startOfSpeechSensitivity: "START_SENSITIVITY_HIGH",
     endOfSpeechSensitivity: "END_SENSITIVITY_HIGH",
-    prefixPaddingMs: 100,
-    silenceDurationMs: 250,
+    prefixPaddingMs: 80,
+    silenceDurationMs: 180,
   },
   activityHandling: "START_OF_ACTIVITY_INTERRUPTS",
 };
@@ -71,29 +71,26 @@ export async function POST(req: NextRequest) {
 
     let memorySummary = "";
     let requestedVoice: LiveVoiceName = "Aoede";
-    let enableSearch = false;
     let excludeModelSet = new Set<string>();
     let disableThinkingConfig = false;
     let disableCustomVad = false;
+    let disableContextCompression = false;
 
     try {
       const body = await req.json();
       if (typeof body?.memorySummary === "string" && body.memorySummary.trim()) {
-        memorySummary = body.memorySummary.trim().slice(0, 2600);
+        memorySummary = body.memorySummary.trim().slice(0, 6500);
       } else if (
         typeof body?.recentContext === "string" &&
         body.recentContext.trim()
       ) {
-        memorySummary = body.recentContext.trim().slice(0, 2600);
+        memorySummary = body.recentContext.trim().slice(0, 6500);
       }
       if (
         typeof body?.voiceName === "string" &&
         ALLOWED_VOICES.has(body.voiceName as LiveVoiceName)
       ) {
         requestedVoice = body.voiceName as LiveVoiceName;
-      }
-      if (body?.enableSearch === true) {
-        enableSearch = true;
       }
       if (Array.isArray(body?.excludeModels)) {
         const known = new Set<string>(LIVE_NATIVE_AUDIO_MODELS);
@@ -107,6 +104,9 @@ export async function POST(req: NextRequest) {
       }
       if (body?.disableThinkingConfig === true) disableThinkingConfig = true;
       if (body?.disableCustomVad === true) disableCustomVad = true;
+      if (body?.disableContextCompression === true) {
+        disableContextCompression = true;
+      }
     } catch {
       // Empty JSON body is allowed
     }
@@ -126,16 +126,13 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const systemInstruction = buildLiveVoiceSystemInstruction(
-      memorySummary,
-      enableSearch
-    );
+    const systemInstruction = buildLiveVoiceSystemInstruction(memorySummary);
 
-    // Unified Tool Array: ALL skills (`create_formula_table`, `save_to_google_docs`,
-    // and conditional `search_web_info`) via `functionDeclarations` — zero native search conflict!
+    // Unified Tool Array: ALL 4 skills (`create_formula_table`, `save_to_google_docs`,
+    // `search_web_info`, `recall_chat_history`) permanently active on EVERY voice chip!
     const unifiedTools: Tool[] = [
       {
-        functionDeclarations: buildLiveVoiceFunctionDeclarations(enableSearch),
+        functionDeclarations: buildLiveVoiceFunctionDeclarations(),
       },
     ];
 
@@ -177,8 +174,11 @@ export async function POST(req: NextRequest) {
       const vadPatch = disableCustomVad
         ? {}
         : { realtimeInputConfig: SDK_SERVER_VAD_CONFIG };
+      const compressionPatch = disableContextCompression
+        ? {}
+        : { contextWindowCompression: LIVE_CONTEXT_WINDOW_COMPRESSION };
 
-      // Tier 1: Constrained Ephemeral Token with Unified Tools + Zero-Thinking Budget + Pure Server VAD
+      // Tier 1: Constrained Ephemeral Token with All 4 Unified Tools + Zero-Thinking + Fast Server VAD + Context Compression
       try {
         const tokenRes = await ai.authTokens.create({
           config: {
@@ -202,7 +202,8 @@ export async function POST(req: NextRequest) {
                 outputAudioTranscription: {},
                 ...thinkingPatch,
                 ...vadPatch,
-              },
+                ...compressionPatch,
+              } as Record<string, unknown>,
             },
           },
         });
@@ -213,7 +214,6 @@ export async function POST(req: NextRequest) {
             token: tokenRes.name,
             model: modelId,
             voiceName: requestedVoice,
-            enableSearch,
             systemInstruction,
             tools: unifiedTools,
             thinkingConfig: supportsZeroThinkingBudget
@@ -222,6 +222,9 @@ export async function POST(req: NextRequest) {
             realtimeInputConfig: disableCustomVad
               ? undefined
               : WS_SERVER_VAD_CONFIG,
+            contextWindowCompression: disableContextCompression
+              ? undefined
+              : LIVE_CONTEXT_WINDOW_COMPRESSION,
             expireTime,
             remainingCandidatesCount,
           });
@@ -251,7 +254,6 @@ export async function POST(req: NextRequest) {
             token: tokenRes.name,
             model: modelId,
             voiceName: requestedVoice,
-            enableSearch,
             systemInstruction,
             tools: unifiedTools,
             thinkingConfig: supportsZeroThinkingBudget
@@ -260,6 +262,9 @@ export async function POST(req: NextRequest) {
             realtimeInputConfig: disableCustomVad
               ? undefined
               : WS_SERVER_VAD_CONFIG,
+            contextWindowCompression: disableContextCompression
+              ? undefined
+              : LIVE_CONTEXT_WINDOW_COMPRESSION,
             expireTime,
             remainingCandidatesCount,
           });

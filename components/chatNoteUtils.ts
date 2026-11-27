@@ -505,23 +505,187 @@ export function mergeUniqueWebSources(
 // STRUCTURED FORMULA TABLE ARTIFACT (`create_formula_table` / `[[FORMULA_TABLE]]`)
 // ============================================================================
 
+export type FormulaTableType = "formulation" | "comparison" | "general";
+
+export interface FormulaTableSpecs {
+  targetPh?: string;
+  texture?: string;
+  stabilityNote?: string;
+  bpomHalalNote?: string;
+}
+
 export interface FormulaTableArtifact {
+  id?: string;
   title: string;
   subtitle?: string;
+  tableType?: FormulaTableType;
   columns: string[];
   rows: string[][];
+  totalPercentage?: string;
+  specs?: FormulaTableSpecs;
+  procedure?: string[];
   notes?: string;
   createdAt?: string;
+  isLoading?: boolean;
 }
 
 export const FORMULA_TABLE_OPEN_TAG = "[[FORMULA_TABLE]]";
 export const FORMULA_TABLE_CLOSE_TAG = "[[/FORMULA_TABLE]]";
+
+export const FORMULATION_REQUIRED_COLUMNS: string[] = [
+  "Fase",
+  "Nama Bahan & INCI",
+  "Persentase (%)",
+  "Fungsi Utama",
+  "Catatan Teknis & Batas Aman",
+];
+
+function parsePercentageNumber(cell: string): number | null {
+  if (!cell) return null;
+  const cleaned = cell.replace(/,/g, ".").trim();
+  // Match standard numbers like "74.5%", "5", "0.80 %", or "ad 100% (72.5%)"
+  const parenMatch = cleaned.match(/\(([\d.]+)\s*%?\)/);
+  if (parenMatch) {
+    const val = Number.parseFloat(parenMatch[1]);
+    return Number.isFinite(val) && val >= 0 ? val : null;
+  }
+  if (/q\.?s\.?|ad\s*100/i.test(cleaned) && !/^\d/.test(cleaned)) {
+    return null;
+  }
+  const rangeMatch = cleaned.match(/(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)/);
+  if (rangeMatch) {
+    const a = Number.parseFloat(rangeMatch[1]);
+    const b = Number.parseFloat(rangeMatch[2]);
+    if (Number.isFinite(a) && Number.isFinite(b)) {
+      return Number(((a + b) / 2).toFixed(2));
+    }
+  }
+  const directMatch = cleaned.match(/(\d+(?:\.\d+)?)/);
+  if (!directMatch) return null;
+  const val = Number.parseFloat(directMatch[1]);
+  return Number.isFinite(val) && val >= 0 ? val : null;
+}
+
+function formatPercentCell(val: number): string {
+  return `${Math.max(0, val).toFixed(2)}%`;
+}
+
+/**
+ * Validates and balances formulation percentage rows so they ALWAYS sum to
+ * exactly 100.00%, automatically adjusting the primary Aqua/Water solvent row
+ * (or inserting one if missing). Strips any duplicate "Total" rows from the LLM.
+ */
+export function validateAndBalanceFormulationRows(
+  columns: string[],
+  rows: string[][]
+): { rows: string[][]; totalPercentage: string } {
+  const lowerCols = columns.map((c) => c.toLowerCase());
+  const pctColIdx = lowerCols.findIndex((c) =>
+    /%|persen|konsentrasi|dosis/i.test(c)
+  );
+  const nameColIdx = Math.max(
+    0,
+    lowerCols.findIndex((c) => /bahan|inci|ingredient|nama|komponen/i.test(c))
+  );
+
+  // Filter out accidental summary/total rows returned by the model
+  const cleanedRows = rows
+    .filter((row) => {
+      const joined = row.join(" ").toLowerCase();
+      return !/^\s*(total|jumlah|subtotal)\b/i.test(row[0] || "") &&
+        !/^\s*(total|jumlah|subtotal)\b/i.test(row[nameColIdx] || "") &&
+        !(joined.includes("total") && joined.includes("100"));
+    })
+    .map((row) => columns.map((_, idx) => (row[idx] ?? "-").trim() || "-"));
+
+  if (pctColIdx < 0 || cleanedRows.length === 0) {
+    return { rows: cleanedRows, totalPercentage: "100.00%" };
+  }
+
+  // Locate primary Aqua / Water solvent row
+  let waterRowIdx = cleanedRows.findIndex((row) =>
+    /\b(aqua|water|deionized\s*water|purified\s*water|air\s*demineral|air\s*murni)\b/i.test(
+      row[nameColIdx] || ""
+    )
+  );
+  if (waterRowIdx < 0) {
+    waterRowIdx = cleanedRows.findIndex((row) =>
+      /ad\s*100|pelarut\s*utama/i.test(row.join(" "))
+    );
+  }
+  if (waterRowIdx < 0) {
+    waterRowIdx = 0;
+  }
+
+  // Parse all non-water rows first (in basis points = hundredths of a percent to avoid float drift)
+  const basisPoints: number[] = cleanedRows.map((row, idx) => {
+    if (idx === waterRowIdx) return 0;
+    const parsed = parsePercentageNumber(row[pctColIdx] || "");
+    const safeVal = parsed !== null ? Math.min(99, Math.max(0.01, parsed)) : 1.0;
+    return Math.round(safeVal * 100);
+  });
+
+  let nonWaterSumBp = basisPoints.reduce((acc, bp) => acc + bp, 0);
+
+  // If non-water ingredients exceed 95%, proportionally scale them down so Aqua gets at least 5.00%
+  if (nonWaterSumBp > 9500) {
+    const scale = 9000 / nonWaterSumBp;
+    for (let i = 0; i < basisPoints.length; i++) {
+      if (i === waterRowIdx) continue;
+      basisPoints[i] = Math.max(5, Math.round(basisPoints[i] * scale));
+    }
+    nonWaterSumBp = basisPoints.reduce((acc, bp) => acc + bp, 0);
+  }
+
+  const waterBp = Math.max(0, 10000 - nonWaterSumBp);
+  basisPoints[waterRowIdx] = waterBp;
+
+  const balancedRows = cleanedRows.map((row, idx) => {
+    const copy = [...row];
+    copy[pctColIdx] = formatPercentCell(basisPoints[idx] / 100);
+    return copy;
+  });
+
+  const finalSumBp = basisPoints.reduce((acc, bp) => acc + bp, 0);
+  return {
+    rows: balancedRows,
+    totalPercentage: formatPercentCell(finalSumBp / 100),
+  };
+}
+
+function normalizeFormulaSpecs(raw: unknown): FormulaTableSpecs | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const obj = raw as Record<string, unknown>;
+  const targetPh =
+    typeof obj.targetPh === "string" && obj.targetPh.trim()
+      ? obj.targetPh.trim()
+      : undefined;
+  const texture =
+    typeof obj.texture === "string" && obj.texture.trim()
+      ? obj.texture.trim()
+      : undefined;
+  const stabilityNote =
+    typeof obj.stabilityNote === "string" && obj.stabilityNote.trim()
+      ? obj.stabilityNote.trim()
+      : undefined;
+  const bpomHalalNote =
+    typeof obj.bpomHalalNote === "string" && obj.bpomHalalNote.trim()
+      ? obj.bpomHalalNote.trim()
+      : undefined;
+
+  if (!targetPh && !texture && !stabilityNote && !bpomHalalNote) {
+    return undefined;
+  }
+  return { targetPh, texture, stabilityNote, bpomHalalNote };
+}
 
 export function normalizeFormulaTableArtifact(
   input: unknown
 ): FormulaTableArtifact | null {
   if (!input || typeof input !== "object") return null;
   const raw = input as Record<string, unknown>;
+
+  const isLoading = raw.isLoading === true;
 
   const rawColumns = Array.isArray(raw.columns)
     ? raw.columns.map((c) => String(c ?? "").trim()).filter(Boolean)
@@ -533,14 +697,37 @@ export function normalizeFormulaTableArtifact(
         .filter((r) => r.some((cell) => cell.length > 0))
     : [];
 
-  if (rawColumns.length === 0 || rawRows.length === 0) return null;
+  if (!isLoading && (rawColumns.length === 0 || rawRows.length === 0)) {
+    return null;
+  }
 
+  const id =
+    typeof raw.id === "string" && raw.id.trim() ? raw.id.trim() : undefined;
   const title =
     String(raw.title ?? "").trim() || "Tabel Formulasi Kosmetik R&D";
   const subtitle =
     typeof raw.subtitle === "string" && raw.subtitle.trim()
       ? raw.subtitle.trim()
       : undefined;
+  const rawTableType = String(raw.tableType ?? raw.table_type ?? "")
+    .toLowerCase()
+    .trim();
+  const tableType: FormulaTableType | undefined =
+    rawTableType === "formulation" ||
+    rawTableType === "comparison" ||
+    rawTableType === "general"
+      ? rawTableType
+      : undefined;
+  const totalPercentage =
+    typeof raw.totalPercentage === "string" && raw.totalPercentage.trim()
+      ? raw.totalPercentage.trim()
+      : undefined;
+  const specs = normalizeFormulaSpecs(raw.specs);
+  const procedure = Array.isArray(raw.procedure)
+    ? raw.procedure
+        .map((step) => String(step ?? "").trim())
+        .filter((step) => step.length > 0)
+    : undefined;
   const notes =
     typeof raw.notes === "string" && raw.notes.trim()
       ? raw.notes.trim()
@@ -553,17 +740,25 @@ export function normalizeFormulaTableArtifact(
           minute: "2-digit",
         });
 
+  const effectiveColumns =
+    rawColumns.length > 0 ? rawColumns : FORMULATION_REQUIRED_COLUMNS;
   const normalizedRows = rawRows.map((row) =>
-    rawColumns.map((_, idx) => row[idx] ?? "-")
+    effectiveColumns.map((_, idx) => row[idx] ?? "-")
   );
 
   return {
+    id,
     title,
     subtitle,
-    columns: rawColumns,
+    tableType,
+    columns: effectiveColumns,
     rows: normalizedRows,
+    totalPercentage,
+    specs,
+    procedure: procedure && procedure.length > 0 ? procedure : undefined,
     notes,
     createdAt,
+    isLoading: isLoading || undefined,
   };
 }
 
@@ -609,6 +804,44 @@ export function formulaTableToMarkdown(table: FormulaTableArtifact): string {
       `| ${table.columns.map((_, idx) => escapePipe(row[idx] ?? "-")).join(" | ")} |`
     );
   }
+  if (table.totalPercentage) {
+    const pctIdx = table.columns.findIndex((c) =>
+      /%|persen|konsentrasi/i.test(c)
+    );
+    const totalCells = table.columns.map((_, idx) => {
+      if (idx === 0) return "**TOTAL**";
+      if (idx === pctIdx) return `**${table.totalPercentage}**`;
+      return "";
+    });
+    lines.push(`| ${totalCells.join(" | ")} |`);
+  }
+
+  if (table.specs) {
+    lines.push("");
+    lines.push("### Spesifikasi Target");
+    if (table.specs.targetPh) {
+      lines.push(`- **Target pH:** ${table.specs.targetPh}`);
+    }
+    if (table.specs.texture) {
+      lines.push(`- **Tekstur & Sensori:** ${table.specs.texture}`);
+    }
+    if (table.specs.stabilityNote) {
+      lines.push(`- **Stabilitas:** ${table.specs.stabilityNote}`);
+    }
+    if (table.specs.bpomHalalNote) {
+      lines.push(`- **BPOM & Halal:** ${table.specs.bpomHalalNote}`);
+    }
+  }
+
+  if (table.procedure && table.procedure.length > 0) {
+    lines.push("");
+    lines.push("### Prosedur Pembuatan");
+    table.procedure.forEach((step, idx) => {
+      const cleanedStep = step.replace(/^\d+[.)]\s*/, "").trim();
+      lines.push(`${idx + 1}. ${cleanedStep}`);
+    });
+  }
+
   if (table.notes) {
     lines.push("");
     lines.push(`**Catatan Proses & Keamanan:** ${table.notes}`);
@@ -631,7 +864,7 @@ export function extractFormulatorDraftFromTable(table: FormulaTableArtifact): {
   customIngredients: string[];
   batchSize: string;
 } {
-  const combinedMeta = `${table.title} ${table.subtitle || ""} ${table.notes || ""}`;
+  const combinedMeta = `${table.title} ${table.subtitle || ""} ${table.specs?.targetPh || ""} ${table.specs?.texture || ""} ${table.notes || ""}`;
   const lowerCols = table.columns.map((c) => c.toLowerCase());
   const ingColIdx = Math.max(
     0,
@@ -647,7 +880,8 @@ export function extractFormulatorDraftFromTable(table: FormulaTableArtifact): {
     customIngredients.push(pct && pct !== "-" ? `${ing} (${pct})` : ing);
   }
 
-  const phMatch = combinedMeta.match(/pH\s*[:=]?\s*(\d+(?:[.,]\d+)?(?:\s*[-–]\s*\d+(?:[.,]\d+)?)?)/i);
+  const phSource = table.specs?.targetPh || combinedMeta;
+  const phMatch = phSource.match(/(?:pH\s*[:=]?\s*)?(\d+(?:[.,]\d+)?(?:\s*[-–]\s*\d+(?:[.,]\d+)?)?)/i);
   const targetPh = phMatch ? phMatch[1].replace(/,/g, ".") : "5.5";
 
   let skinTarget = "Sensitive";
@@ -667,5 +901,6 @@ export function extractFormulatorDraftFromTable(table: FormulaTableArtifact): {
     batchSize: "100",
   };
 }
+
 
 

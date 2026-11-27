@@ -1,5 +1,6 @@
 import { Type, type FunctionDeclaration } from "@google/genai";
 import {
+  type FormulaTableArtifact,
   formatFormulaTableForHistoryContext,
   formatGoogleDocForHistoryContext,
   formatNoteForHistoryContext,
@@ -52,20 +53,39 @@ export const LIVE_FSM_STATUS_LABELS: Record<LiveVoiceFsmState, string> = {
 };
 
 export const LIVE_INPUT_TARGET_SAMPLE_RATE = 16000;
-export const LIVE_INPUT_CHUNK_SAMPLES = 640; // exact 40ms @ 16kHz
+export const LIVE_INPUT_CHUNK_SAMPLES = 320; // exact 20ms @ 16kHz
+export const LIVE_HIGHPASS_CUTOFF_HZ = 85;
 export const LIVE_TRANSCRIPT_THROTTLE_MS = 80;
-export const LIVE_ECHO_GUARD_TAIL_MS = 220;
-export const LIVE_SPEECH_QUIET_CONFIRM_MS = 300;
-export const LIVE_STANDBY_PREWARM_TURN = 2;
-export const LIVE_HOTSWAP_TARGET_TURN = 3;
-export const LIVE_STANDBY_MAX_AGE_MS = 55_000;
+export const LIVE_ECHO_GUARD_TAIL_MS = 120;
+export const LIVE_SPEECH_QUIET_CONFIRM_MS = 260;
+export const LIVE_STANDBY_PREWARM_TURN = 7;
+export const LIVE_HOTSWAP_TARGET_TURN = 8;
+export const LIVE_STANDBY_MAX_AGE_MS = 120_000;
 export const LIVE_TURN_WATCHDOG_MS = 5_000;
-export const LIVE_TOOL_TIMEOUT_MS = 12_000;
+export const LIVE_TOOL_RECOVERY_MS = 2_200;
+export const LIVE_TOOL_TIMEOUT_MS = 20_000;
 export const LIVE_MAX_AUTO_RECONNECTS = 2;
+
+export const LIVE_CONTEXT_WINDOW_COMPRESSION = {
+  triggerTokens: "12000",
+  slidingWindow: {
+    targetTokens: "6000",
+  },
+} as const;
+
+export const NON_LATIN_HALLUCINATION_SCRIPT_RE =
+  /[\u0E00-\u0E7F\u0600-\u06FF\u0400-\u04FF\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7AF]/;
 
 export interface LiveMemoryMessage {
   role: "user" | "assistant";
   content: string;
+}
+
+export interface DeterministicMemoryInput {
+  longTermSummary?: string;
+  latestFormulaTable?: FormulaTableArtifact | null;
+  recentMessages?: ReadonlyArray<LiveMemoryMessage>;
+  fallbackContext?: string;
 }
 
 export interface VoiceTurnMetric {
@@ -84,15 +104,45 @@ export interface VoiceMetricsSummary {
   hotSwapCount: number;
 }
 
+function expandMessageToReadableMemoryText(rawContent: string): string {
+  const raw = (rawContent || "").trim();
+  if (!raw) return "";
+  const parsedTable = parseFormulaTableMessage(raw);
+  if (parsedTable) {
+    if (parsedTable.isLoading) return "";
+    const ingList = parsedTable.rows
+      .slice(0, 12)
+      .map((r) => {
+        const name = r[1] || r[0] || "";
+        const pct = r[2] || "";
+        return pct && pct !== "-" ? `${name} (${pct})` : name;
+      })
+      .filter(Boolean)
+      .join(", ");
+    const phText = parsedTable.specs?.targetPh
+      ? ` | pH: ${parsedTable.specs.targetPh}`
+      : "";
+    return `[Tabel Formula: ${parsedTable.title}${phText} | Bahan: ${ingList}]`;
+  }
+  const parsedNote = parseChatNoteMessage(raw);
+  if (parsedNote) {
+    return formatNoteForHistoryContext(parsedNote);
+  }
+  const parsedDoc = parseGoogleDocMessage(raw);
+  if (parsedDoc) {
+    return formatGoogleDocForHistoryContext(parsedDoc);
+  }
+  return raw;
+}
+
 /**
- * Summarizes up to the last 8 room chat messages into a compact plain-text memory
- * string (~350 words max) for `[MEMORI PERCAKAPAN SEBELUMNYA]` during background
- * standby session pre-warming & reconnects (NEVER carries raw audio tokens).
+ * Summarizes up to the last `maxMessages` room chat messages into a compact plain-text
+ * memory string for backwards compatibility and tests (NEVER carries raw audio tokens).
  */
 export function buildConversationMemorySummary(
   messages: ReadonlyArray<LiveMemoryMessage> | undefined,
-  maxMessages = 8,
-  maxWords = 350
+  maxMessages = 12,
+  maxWords = 450
 ): string {
   if (!Array.isArray(messages) || messages.length === 0) return "";
 
@@ -100,28 +150,10 @@ export function buildConversationMemorySummary(
   const lines: string[] = [];
 
   for (const msg of recent) {
-    const raw = (msg?.content || "").trim();
-    if (!raw) continue;
-
-    let readable = raw;
-    const parsedTable = parseFormulaTableMessage(raw);
-    if (parsedTable) {
-      readable = formatFormulaTableForHistoryContext(parsedTable);
-    } else {
-      const parsedNote = parseChatNoteMessage(raw);
-      if (parsedNote) {
-        readable = formatNoteForHistoryContext(parsedNote);
-      } else {
-        const parsedDoc = parseGoogleDocMessage(raw);
-        if (parsedDoc) {
-          readable = formatGoogleDocForHistoryContext(parsedDoc);
-        }
-      }
-    }
-
-    const compact = readable.replace(/\s+/g, " ").trim().slice(0, 360);
+    const readable = expandMessageToReadableMemoryText(msg?.content || "");
+    const compact = readable.replace(/\s+/g, " ").trim().slice(0, 380);
     if (!compact) continue;
-    const prefix = msg.role === "user" ? "User" : "AI";
+    const prefix = msg.role === "user" ? "User" : "Asisten";
     lines.push(`${prefix}: ${compact}`);
   }
 
@@ -136,58 +168,214 @@ export function buildConversationMemorySummary(
 }
 
 /**
- * Unified Function Declarations for Gemini Live Voice Mode.
- * ALL skills (`create_formula_table`, `save_to_google_docs`, and conditional `search_web_info`)
- * live inside ONE `functionDeclarations` array so there is ZERO WebSocket conflict across
- * all 4 voice chips (`Aoede`, `Zephyr`, `Kore`, `Puck`).
+ * Deterministic 0ms synchronous memory prompt builder injected on EVERY standby
+ * pre-warm and reconnect so the Voice AI NEVER loses context or confuses names:
+ * 1) `[RINGKASAN FAKTA]` (`longTermSummary` from `/api/live-memory` if available)
+ * 2) `[TABEL FORMULA AKTIF]` (title, all ingredients + percentages, specs & notes)
+ * 3) `[12 PESAN DIALOG TERAKHIR]` (verbatim last 12 messages with `User:` / `Asisten:`)
  */
-export function buildLiveVoiceFunctionDeclarations(
-  enableSearch = false
-): FunctionDeclaration[] {
-  const declarations: FunctionDeclaration[] = [
+export function buildDeterministicMemoryPrompt(
+  input: DeterministicMemoryInput
+): string {
+  const sections: string[] = [];
+
+  const cleanSummary = (input.longTermSummary || "").trim();
+  if (cleanSummary) {
+    sections.push(`[RINGKASAN FAKTA]\n${cleanSummary.slice(0, 1200)}`);
+  }
+
+  const activeTable =
+    input.latestFormulaTable && !input.latestFormulaTable.isLoading
+      ? input.latestFormulaTable
+      : null;
+  if (activeTable) {
+    const lowerCols = activeTable.columns.map((c) => c.toLowerCase());
+    const nameIdx = Math.max(
+      0,
+      lowerCols.findIndex((c) => /bahan|inci|ingredient|nama|komponen/i.test(c))
+    );
+    const pctIdx = lowerCols.findIndex((c) => /%|persen|konsentrasi/i.test(c));
+    const phaseIdx = lowerCols.findIndex((c) => /fase|phase/i.test(c));
+    const funcIdx = lowerCols.findIndex((c) => /fungsi|function/i.test(c));
+
+    const tableLines: string[] = [`Judul: ${activeTable.title}`];
+    if (activeTable.subtitle) {
+      tableLines.push(`Ringkasan: ${activeTable.subtitle}`);
+    }
+    if (activeTable.specs) {
+      const specParts = [
+        activeTable.specs.targetPh ? `pH ${activeTable.specs.targetPh}` : "",
+        activeTable.specs.texture ? `Tekstur: ${activeTable.specs.texture}` : "",
+        activeTable.specs.bpomHalalNote
+          ? `BPOM/Halal: ${activeTable.specs.bpomHalalNote}`
+          : "",
+      ].filter(Boolean);
+      if (specParts.length > 0) {
+        tableLines.push(`Spesifikasi: ${specParts.join(" | ")}`);
+      }
+    }
+    const ingredientSummaries = activeTable.rows
+      .map((row) => {
+        const phase = phaseIdx >= 0 && row[phaseIdx] ? `[${row[phaseIdx]}] ` : "";
+        const name = row[nameIdx] || row[0] || "-";
+        const pct = pctIdx >= 0 && row[pctIdx] ? ` ${row[pctIdx]}` : "";
+        const fn = funcIdx >= 0 && row[funcIdx] ? ` (${row[funcIdx]})` : "";
+        return `- ${phase}${name}${pct}${fn}`;
+      })
+      .join("\n");
+    if (ingredientSummaries) {
+      tableLines.push(`Komposisi (${activeTable.totalPercentage || "100.00%"}):\n${ingredientSummaries}`);
+    }
+    if (activeTable.notes) {
+      tableLines.push(`Catatan: ${activeTable.notes}`);
+    }
+    sections.push(`[TABEL FORMULA AKTIF]\n${tableLines.join("\n").slice(0, 2200)}`);
+  }
+
+  const dialogLines: string[] = [];
+  if (Array.isArray(input.recentMessages) && input.recentMessages.length > 0) {
+    const nonEmpty: Array<{ role: "user" | "assistant"; text: string }> = [];
+    for (const msg of input.recentMessages) {
+      const expanded = expandMessageToReadableMemoryText(msg?.content || "")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!expanded) continue;
+      nonEmpty.push({
+        role: msg.role,
+        text: expanded.slice(0, 420),
+      });
+    }
+    const last12 = nonEmpty.slice(-12);
+    for (const item of last12) {
+      const speaker = item.role === "user" ? "User" : "Asisten";
+      dialogLines.push(`${speaker}: ${item.text}`);
+    }
+  }
+
+  if (dialogLines.length > 0) {
+    sections.push(`[12 PESAN DIALOG TERAKHIR]\n${dialogLines.join("\n")}`);
+  } else if (input.fallbackContext && input.fallbackContext.trim()) {
+    sections.push(
+      `[12 PESAN DIALOG TERAKHIR]\nAsisten: ${input.fallbackContext.trim().slice(0, 1200)}`
+    );
+  }
+
+  return sections.join("\n\n").trim().slice(0, 6200);
+}
+
+/**
+ * Local <1ms keyword search over full chat history + active formula table for
+ * the `recall_chat_history(keyword)` Live Voice tool.
+ */
+export function recallChatHistoryLocal(
+  messages: ReadonlyArray<LiveMemoryMessage> | undefined,
+  keyword: string,
+  latestFormulaTable?: FormulaTableArtifact | null,
+  maxMatches = 6
+): string {
+  const cleanKeyword = (keyword || "").trim().toLowerCase();
+  const tokens = cleanKeyword
+    .split(/[\s,.;:!?/\\-]+/)
+    .map((t) => t.trim())
+    .filter((t) => t.length >= 2);
+
+  const hits: Array<{ score: number; text: string }> = [];
+
+  if (latestFormulaTable && !latestFormulaTable.isLoading) {
+    const tableText = formatFormulaTableForHistoryContext(latestFormulaTable);
+    const lowerTable = tableText.toLowerCase();
+    const score =
+      tokens.length === 0
+        ? 1
+        : tokens.reduce((acc, tok) => acc + (lowerTable.includes(tok) ? 2 : 0), 0);
+    if (score > 0) {
+      hits.push({
+        score: score + 2,
+        text: `[Tabel Formula Aktif] ${latestFormulaTable.title}: ${latestFormulaTable.rows
+          .map((r) => `${r[1] || r[0]} ${r[2] || ""}`.trim())
+          .join(", ")
+          .slice(0, 380)}`,
+      });
+    }
+  }
+
+  if (Array.isArray(messages)) {
+    messages.forEach((msg, idx) => {
+      const readable = expandMessageToReadableMemoryText(msg?.content || "")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!readable) return;
+      const lower = readable.toLowerCase();
+      const score =
+        tokens.length === 0
+          ? 1
+          : tokens.reduce((acc, tok) => acc + (lower.includes(tok) ? 1 : 0), 0);
+      if (score > 0) {
+        const speaker = msg.role === "user" ? "User" : "Asisten";
+        hits.push({
+          score,
+          text: `#${idx + 1} ${speaker}: ${readable.slice(0, 260)}`,
+        });
+      }
+    });
+  }
+
+  if (hits.length === 0) {
+    return `Tidak ditemukan arsip percakapan yang cocok dengan kata kunci "${keyword}".`;
+  }
+
+  const top = hits
+    .sort((a, b) => b.score - a.score)
+    .slice(0, maxMatches)
+    .map((h) => h.text);
+
+  return `Hasil pencarian arsip lokal untuk "${keyword}":\n${top.join("\n")}`;
+}
+
+/**
+ * Unified Function Declarations for Gemini Live Voice Mode.
+ * ALL 4 skills (`create_formula_table`, `save_to_google_docs`, `search_web_info`,
+ * and `recall_chat_history`) are ALWAYS registered permanently & automatically across
+ * ALL 4 voice chips (`Aoede`, `Zephyr`, `Kore`, `Puck`).
+ */
+export function buildLiveVoiceFunctionDeclarations(): FunctionDeclaration[] {
+  return [
     {
       name: "create_formula_table",
       description:
-        "Membuat dan menampilkan tabel terstruktur (resep formulasi kosmetik, daftar bahan & persentase, fungsi, pH, atau perbandingan) langsung di room chat.",
+        "Membuat dan menampilkan tabel R&D rinci & lengkap (8-12 bahan INCI valid 100.00%, target pH, tekstur, BPOM/Halal, dan prosedur pembuatan, atau tabel perbandingan mendalam) langsung di room chat.",
       parameters: {
         type: Type.OBJECT,
         properties: {
-          title: {
+          topic: {
             type: Type.STRING,
             description:
-              "Judul tabel (misal: 'Formula Dasar Moisturizer Kulit Sensitif').",
+              "Jenis/judul produk atau topik perbandingan (misal: 'Moisturizer Barrier Kulit Sensitif dengan Butylene Glycol & Arbutin').",
           },
-          subtitle: {
-            type: Type.STRING,
-            description: "Ringkasan target kulit, target pH, atau tekstur produk.",
-          },
-          columns: {
-            type: Type.ARRAY,
-            items: { type: Type.STRING },
-            description:
-              "Nama kolom tabel (misal: ['Fase', 'Bahan', 'Persentase (%)', 'Fungsi']).",
-          },
-          rows: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING },
-            },
-            description: "Baris data tabel sesuai urutan kolom.",
-          },
-          notes: {
+          key_ingredients: {
             type: Type.STRING,
             description:
-              "Catatan proses pembuatan, stabilitas, atau keamanan BPOM/Halal.",
+              "Bahan aktif atau bahan utama yang diminta pengguna (opsional, misal: 'Butylene Glycol, Alpha Arbutin, Ceramide NP, Panthenol').",
+          },
+          constraints: {
+            type: Type.STRING,
+            description:
+              "Target kulit, pH, tekstur, bebas alkohol/parfum, atau batasan khusus dari pengguna (opsional).",
+          },
+          table_type: {
+            type: Type.STRING,
+            enum: ["formulation", "comparison", "general"],
+            description:
+              "Jenis tabel: 'formulation' untuk resep formulasi kosmetik 100%, 'comparison' untuk perbandingan bahan/produk, atau 'general' untuk tabel informasi umum.",
           },
         },
-        required: ["title", "columns", "rows"],
+        required: ["topic", "table_type"],
       },
     },
     {
       name: "save_to_google_docs",
       description:
-        "Menyimpan resep, tabel formulasi terakhir, atau catatan diskusi ke dokumen Google Docs di Google Drive user.",
+        "Menyimpan resep, tabel formulasi terakhir, atau catatan diskusi lengkap ke dokumen Google Docs di Google Drive user.",
       parameters: {
         type: Type.OBJECT,
         properties: {
@@ -203,19 +391,16 @@ export function buildLiveVoiceFunctionDeclarations(
           include_latest_table: {
             type: Type.BOOLEAN,
             description:
-              "Jika true, otomatis ikutkan data tabel formulasi terakhir yang tampil di chat ke dalam dokumen Google Docs.",
+              "Jika true, otomatis ikutkan data tabel formulasi lengkap terakhir yang tampil di chat ke dalam dokumen Google Docs.",
           },
         },
         required: ["title", "content"],
       },
     },
-  ];
-
-  if (enableSearch) {
-    declarations.push({
+    {
       name: "search_web_info",
       description:
-        "Mencari informasi fakta terkini dari web (Google Search) seperti regulasi BPOM/Halal terbaru, harga bahan baku, berita, atau tren pasar kosmetik.",
+        "Mencari informasi terkini dan terverifikasi dari internet (Google Search) seperti berita terbaru, harga bahan baku terbaru, regulasi BPOM/Halal terbaru, tren pasar, atau fakta eksternal.",
       parameters: {
         type: Type.OBJECT,
         properties: {
@@ -226,10 +411,24 @@ export function buildLiveVoiceFunctionDeclarations(
         },
         required: ["query"],
       },
-    });
-  }
-
-  return declarations;
+    },
+    {
+      name: "recall_chat_history",
+      description:
+        "Mencari arsip percakapan lama atau detail formula sebelumnya secara lokal (< 1ms) berdasarkan kata kunci.",
+      parameters: {
+        type: Type.OBJECT,
+        properties: {
+          keyword: {
+            type: Type.STRING,
+            description:
+              "Kata kunci yang ingin dicari di riwayat percakapan (misal: nama bahan, nama user, target pH, atau produk sebelumnya).",
+          },
+        },
+        required: ["keyword"],
+      },
+    },
+  ];
 }
 
 /**
@@ -242,44 +441,63 @@ export function sanitizeLiveTranscriptText(raw: string): string {
 }
 
 /**
- * Cleans user speech transcription by stripping `<noise>`/`<inaudible>` tags AND
- * stray leading punctuation (e.g. `". Oke, langsung buat resepnya."` -> `"Oke, langsung buat resepnya."`).
+ * Detects non-Latin hallucination scripts (Thai, Arabic, Cyrillic, Japanese Kana,
+ * CJK, Korean Hangul) caused by background mic noise.
+ */
+export function isNonLatinHallucinationFragment(raw: string): boolean {
+  const withoutTags = sanitizeLiveTranscriptText(raw);
+  if (!withoutTags) return false;
+  if (!NON_LATIN_HALLUCINATION_SCRIPT_RE.test(withoutTags)) return false;
+
+  // Strip non-Latin characters and check if meaningful Latin Indonesian text remains
+  const latinOnly = withoutTags
+    .replace(/[\u0E00-\u0E7F\u0600-\u06FF\u0400-\u04FF\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7AF]+/g, "")
+    .replace(/[.,!?;:\s-]+/g, "")
+    .trim();
+
+  // If the fragment is short or predominantly non-Latin noise (e.g. "ฮัลโหล"), drop it!
+  return withoutTags.length <= 48 || latinOnly.length < 3;
+}
+
+/**
+ * Cleans user speech transcription by stripping `<noise>`/`<inaudible>` tags,
+ * dropping non-Latin noise hallucinations (Thai/Arabic/Cyrillic/CJK/Korean),
+ * and stripping stray leading punctuation (e.g. `". Oke, langsung buat resepnya."`).
  */
 export function sanitizeLiveUserTranscript(raw: string): string {
   const withoutTags = sanitizeLiveTranscriptText(raw);
   if (!withoutTags) return "";
-  return withoutTags.replace(/^[.,!?;:\s]+/, "").trim();
+  if (isNonLatinHallucinationFragment(withoutTags)) return "";
+  // Also strip isolated stray non-Latin characters if mixed into a longer Indonesian sentence
+  const cleanedScripts = withoutTags
+    .replace(/[\u0E00-\u0E7F\u0600-\u06FF\u0400-\u04FF\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7AF]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleanedScripts.replace(/^[.,!?;:\s]+/, "").trim();
 }
 
 /**
- * Module 4: GPT-Voice-grade natural Indonesian spoken persona + explicit Unified Tool awareness
- * + optional `[MEMORI PERCAKAPAN SEBELUMNYA]` text memory for O(1) Hot-Swap continuity.
+ * Natural Indonesian Voice Persona + Strict Indonesian Language Lock + All 4 Automatic Skills
+ * + Deterministic Memory Prompt (`[RINGKASAN FAKTA]`, `[TABEL FORMULA AKTIF]`, `[12 PESAN DIALOG TERAKHIR]`).
  */
 export function buildLiveVoiceSystemInstruction(
-  memorySummary?: string,
-  enableSearch = false
+  memorySummary?: string
 ): string {
   const lines = [
+    "BAHASA UTAMA: User selalu berbicara dalam Bahasa Indonesia (sesekali diselingi istilah bahan kosmetik/INCI berbahasa Inggris). Selalu pahami audio user sebagai Bahasa Indonesia dan SELALU balas dalam Bahasa Indonesia yang natural dan santai, kecuali user secara eksplisit meminta bahasa lain. Jangan pernah menyapa user dengan nama bahan kosmetik.",
+    "",
     "Kamu adalah partner R&D kosmetik Formylab.ai yang sedang mengobrol langsung lewat telepon dengan pengguna.",
     "Gaya bicara wajib sangat natural seperti rekan kerja manusia di telepon, BUKAN membacakan artikel:",
     "- Gunakan Bahasa Indonesia lisan sehari-hari yang hangat, santai, luwes, dan langsung ke inti dalam 1 sampai 2 kalimat padat per giliran bicara.",
     "- Gunakan koma sebagai jeda napas alami (misal 'Oke, gampangnya gini...', 'Nah, kalau buat kulit sensitif...', 'Boleh banget...').",
     "- DILARANG membacakan simbol markdown, tanda kurung, atau daftar tabel/persentase panjang lewat suara.",
-    "KEMAMPUAN TOOL AKTIF (WAJIB DIGUNAKAN SAAT DIMINTA):",
-    `- Kamu memiliki tool aktif untuk membuat tabel langsung di chat (\`create_formula_table\`), menyimpan ke Google Docs (\`save_to_google_docs\`), ${
-      enableSearch
-        ? "dan mencari info web terkini (`search_web_info`)."
-        : "(dan `search_web_info` jika pengguna menyalakan toggle Search)."
-    }`,
-    "- Kapan pun user meminta tabel, resep terstruktur, daftar bahan & persen, atau perbandingan bahan, JANGAN PERNAH menolak—langsung panggil `create_formula_table`, lalu sampaikan lewat suara secara santai dalam 1 kalimat bahwa tabelnya sudah tampil di layar.",
+    "",
+    "KEMAMPUAN TOOL OTOMATIS (SELALU AKTIF):",
+    "Semua kemampuanmu (pencarian internet `search_web_info`, pembuatan tabel rinci `create_formula_table`, simpan Google Docs `save_to_google_docs`, dan arsip chat `recall_chat_history`) selalu aktif otomatis. Jika user menanyakan berita terkini, harga bahan terbaru, regulasi BPOM terbaru, tren pasar, atau fakta eksternal yang butuh sumber internet, langsung panggil `search_web_info` secara otomatis lalu sampaikan jawabannya dengan suara natural. Untuk obrolan biasa atau konsep dasar, jawab langsung tanpa memanggil search agar tetap super cepat.",
+    "- Kapan pun user meminta tabel, resep terstruktur, daftar bahan & persen, atau perbandingan bahan, JANGAN PERNAH menolak—langsung panggil `create_formula_table` dengan `topic`, `key_ingredients`, `constraints`, dan `table_type` ('formulation' | 'comparison' | 'general'). Setelah tool selesai, jelaskan inti formulanya dalam 1 sampai 2 kalimat santai lewat suara.",
     "- Kapan pun user meminta simpan ke Google Docs atau Google Drive, langsung panggil `save_to_google_docs` (set `include_latest_table: true` jika merujuk tabel terakhir di chat).",
+    "- Kapan pun user menanyakan sesuatu yang pernah dibahas jauh sebelumnya di chat ini, panggil `recall_chat_history` dengan kata kunci terkait.",
   ];
-
-  if (enableSearch) {
-    lines.push(
-      "- Kapan pun user menanyakan berita terkini, harga bahan terbaru, atau regulasi/fakta aktual, panggil `search_web_info` lalu jawab singkat berdasarkan hasilnya. Untuk obrolan biasa dan formulasi umum, jawab langsung tanpa memanggil search."
-    );
-  }
 
   const cleanMemory =
     typeof memorySummary === "string" ? memorySummary.trim() : "";
@@ -288,7 +506,7 @@ export function buildLiveVoiceSystemInstruction(
     lines.push("[MEMORI PERCAKAPAN SEBELUMNYA]");
     lines.push(cleanMemory);
     lines.push(
-      "Lanjutkan percakapan secara mulus tanpa mengulang salam pembuka jika konteks di atas sudah berjalan."
+      "Lanjutkan percakapan secara mulus tanpa mengulang salam pembuka jika konteks di atas sudah berjalan. Selalu jaga konsistensi nama user, bahan yang dipilih, dan tabel formula aktif di atas."
     );
   }
 
@@ -343,6 +561,80 @@ export function summarizeVoiceMetrics(
     avgFirstAudioTurn1To3Ms: avg(turn1To3),
     avgFirstAudioTurn4PlusMs: avg(turn4Plus),
     hotSwapCount: metrics.filter((m) => m.hotSwapped === "ya").length,
+  };
+}
+
+/**
+ * Continuous fractional-phase accumulator resampler preserving `lastSample` and
+ * `phase` seamlessly across 128-sample Web Audio blocks (zero clicks/stutters)
+ * and emitting exact 320-sample (20ms @ 16kHz) Int16 mono PCM packets.
+ */
+export interface ContinuousResampler {
+  pushBlock: (block: Float32Array) => Int16Array[];
+  reset: () => void;
+}
+
+export function createContinuousResampler(
+  inputSampleRate: number,
+  targetSampleRate = LIVE_INPUT_TARGET_SAMPLE_RATE,
+  packetSamples = LIVE_INPUT_CHUNK_SAMPLES
+): ContinuousResampler {
+  const safeInputRate =
+    Number.isFinite(inputSampleRate) && inputSampleRate > 0
+      ? inputSampleRate
+      : targetSampleRate;
+  const ratio = Math.max(0.25, safeInputRate / targetSampleRate);
+  let phase = 0;
+  let lastSample = 0;
+  let outBuf = new Int16Array(packetSamples);
+  let outIdx = 0;
+
+  return {
+    pushBlock(block: Float32Array): Int16Array[] {
+      const packets: Int16Array[] = [];
+      if (!block || block.length === 0) return packets;
+      const len = block.length;
+
+      const emit = (val: number) => {
+        const clamped = Math.max(-1, Math.min(1, val));
+        outBuf[outIdx++] =
+          clamped < 0 ? Math.round(clamped * 0x8000) : Math.round(clamped * 0x7fff);
+        if (outIdx >= packetSamples) {
+          packets.push(outBuf);
+          outBuf = new Int16Array(packetSamples);
+          outIdx = 0;
+        }
+      };
+
+      if (Math.abs(ratio - 1) < 0.001) {
+        for (let i = 0; i < len; i++) {
+          emit(block[i]);
+        }
+        lastSample = block[len - 1];
+        return packets;
+      }
+
+      // Virtual buffer V[0] = lastSample, V[1..len] = block[0..len-1]
+      // Valid fractional positions pos in [0, len) guarantee idx0 in [0..len-1] and idx0+1 in [1..len].
+      let pos = phase;
+      while (pos < len) {
+        const idx0 = Math.floor(pos);
+        const frac = pos - idx0;
+        const s0 = idx0 === 0 ? lastSample : block[idx0 - 1];
+        const s1 = block[idx0];
+        emit(s0 + (s1 - s0) * frac);
+        pos += ratio;
+      }
+      phase = pos - len;
+      lastSample = block[len - 1];
+      return packets;
+    },
+    reset() {
+      phase = 0;
+      lastSample = 0;
+      outBuf = new Int16Array(packetSamples);
+      outIdx = 0;
+    },
   };
 }
 

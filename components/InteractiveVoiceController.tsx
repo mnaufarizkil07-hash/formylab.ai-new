@@ -7,7 +7,6 @@ import {
   Square,
   Play,
   Pause,
-  Globe,
   Loader2,
   RefreshCw,
   AlertCircle,
@@ -23,7 +22,9 @@ import {
 import { cleanMarkdownForSpeech } from "../lib/interactiveAiEngine";
 import {
   ChatNoteArtifact,
+  FORMULATION_REQUIRED_COLUMNS,
   FormulaTableArtifact,
+  type FormulaTableType,
   GoogleDocArtifact,
   WebSourceCitation,
   extractWebSourcesFromGroundingMetadata,
@@ -32,20 +33,24 @@ import {
   normalizeChatNoteArtifact,
   normalizeFormulaTableArtifact,
   normalizeWebSourceCitation,
+  validateAndBalanceFormulationRows,
 } from "./chatNoteUtils";
 import {
   createGoogleDocInDrive,
   isGoogleDriveConnected,
 } from "../lib/googleDocsClient";
 import {
+  LIVE_CONTEXT_WINDOW_COMPRESSION,
   LIVE_ECHO_GUARD_TAIL_MS,
   LIVE_FSM_STATUS_LABELS,
+  LIVE_HIGHPASS_CUTOFF_HZ,
   LIVE_HOTSWAP_TARGET_TURN,
   LIVE_INPUT_CHUNK_SAMPLES,
   LIVE_INPUT_TARGET_SAMPLE_RATE,
   LIVE_MAX_AUTO_RECONNECTS,
   LIVE_STANDBY_MAX_AGE_MS,
   LIVE_STANDBY_PREWARM_TURN,
+  LIVE_TOOL_RECOVERY_MS,
   LIVE_TOOL_TIMEOUT_MS,
   LIVE_TRANSCRIPT_THROTTLE_MS,
   LIVE_TURN_WATCHDOG_MS,
@@ -56,16 +61,18 @@ import {
   SpeechEndProfilerState,
   VoiceTurnMetric,
   base64PcmToFloat32,
-  buildConversationMemorySummary,
+  buildDeterministicMemoryPrompt,
   classifyLiveVoicePillars,
   computeInt16PcmRms,
+  createContinuousResampler,
   createSpeechEndProfilerState,
-  downsampleFloat32ToInt16Pcm,
   formatLiveConnectionError,
   hasGoogleSearchGrounding,
   int16PcmToBase64,
+  isNonLatinHallucinationFragment,
   observeMicRmsForProfiler,
   parsePcmSampleRate,
+  recallChatHistoryLocal,
   sanitizeLiveTranscriptText,
   sanitizeLiveUserTranscript,
   summarizeVoiceMetrics,
@@ -765,7 +772,10 @@ interface InteractiveVoiceCallOverlayProps {
     usedGoogleSearch: boolean;
   }) => void;
   onLiveWebSources?: (turnId: string, sources: WebSourceCitation[]) => void;
-  onCreateFormulaTable?: (table: FormulaTableArtifact) => void;
+  onCreateFormulaTable?: (
+    table: FormulaTableArtifact,
+    replaceMessageId?: string
+  ) => void;
   onCreateChatNote?: (note: ChatNoteArtifact) => void;
   onCreateGoogleDoc?: (doc: GoogleDocArtifact) => void;
 }
@@ -775,11 +785,14 @@ interface LiveTokenApiResponse {
   token?: string;
   model?: string;
   voiceName?: LiveVoiceName;
-  enableSearch?: boolean;
   systemInstruction?: string;
   tools?: Tool[];
   thinkingConfig?: LiveConnectConfig["thinkingConfig"];
   realtimeInputConfig?: LiveConnectConfig["realtimeInputConfig"];
+  contextWindowCompression?: {
+    triggerTokens: string;
+    slidingWindow: { targetTokens: string };
+  };
   remainingCandidatesCount?: number;
   error?: string;
 }
@@ -806,10 +819,10 @@ function getRecentlyFailedLiveModels(): string[] {
 
 /**
  * Pure Off-Main-Thread 16kHz Int16 PCM Mic Capture AudioWorklet (100% Native Server VAD):
- * - Smooth linear interpolation downsampling from actual AudioContext `sampleRate` (e.g. 48kHz / 44.1kHz)
- *   to exact 16000 Hz mono Int16 PCM.
- * - Emits continuous, uninterrupted ~40ms chunks (640 samples @ 16kHz) directly to Gemini Live API.
- * - Zero client-side silence gate, zero RMS detector, zero manual turn signals.
+ * - Continuous fractional-phase accumulator resampler storing `_lastSample` & `_phase`
+ *   across 128-sample blocks (zero boundary clicks/dropouts across 48kHz / 44.1kHz -> 16kHz).
+ * - Emits tight, uninterrupted 20ms packets (exact 320 samples @ 16kHz) directly to Gemini Live API.
+ * - Zero client-side silence gate, zero RMS mute, zero manual turn signals.
  */
 const PCM_CAPTURE_WORKLET_CODE = `
 class FormylabLivePcmCaptureProcessor extends AudioWorkletProcessor {
@@ -817,16 +830,18 @@ class FormylabLivePcmCaptureProcessor extends AudioWorkletProcessor {
     super();
     this._targetRate = ${LIVE_INPUT_TARGET_SAMPLE_RATE};
     this._ratio = Math.max(0.25, sampleRate / this._targetRate);
-    this._packetSamples = ${LIVE_INPUT_CHUNK_SAMPLES}; // ~40ms @ 16kHz (640 samples)
+    this._packetSamples = ${LIVE_INPUT_CHUNK_SAMPLES}; // exact 20ms @ 16kHz (320 samples)
     this._out = new Int16Array(this._packetSamples);
     this._outIndex = 0;
-    // Virtual buffer [this._prevSample, ch[0..len-1]] -> seamless linear interpolation across audio quanta
-    this._phase = 1.0;
-    this._prevSample = 0;
+    // Continuous virtual stream V[0] = _lastSample, V[1..len] = ch[0..len-1]
+    this._phase = 0.0;
+    this._lastSample = 0.0;
   }
 
-  _pushSample(int16Sample) {
-    this._out[this._outIndex++] = int16Sample;
+  _pushSample(floatVal) {
+    const clamped = Math.max(-1, Math.min(1, floatVal));
+    this._out[this._outIndex++] =
+      clamped < 0 ? Math.round(clamped * 0x8000) : Math.round(clamped * 0x7fff);
     if (this._outIndex >= this._packetSamples) {
       const packet = this._out;
       this._out = new Int16Array(this._packetSamples);
@@ -845,12 +860,9 @@ class FormylabLivePcmCaptureProcessor extends AudioWorkletProcessor {
 
     if (Math.abs(this._ratio - 1.0) < 0.001) {
       for (let i = 0; i < len; i++) {
-        const clamped = Math.max(-1, Math.min(1, ch[i]));
-        this._pushSample(
-          clamped < 0 ? Math.round(clamped * 0x8000) : Math.round(clamped * 0x7fff)
-        );
+        this._pushSample(ch[i]);
       }
-      this._prevSample = ch[len - 1];
+      this._lastSample = ch[len - 1];
       return true;
     }
 
@@ -858,17 +870,13 @@ class FormylabLivePcmCaptureProcessor extends AudioWorkletProcessor {
     while (pos < len) {
       const idx0 = Math.floor(pos);
       const frac = pos - idx0;
-      const s0 = idx0 <= 0 ? this._prevSample : ch[idx0 - 1];
+      const s0 = idx0 === 0 ? this._lastSample : ch[idx0 - 1];
       const s1 = ch[idx0];
-      const interp = s0 + (s1 - s0) * frac;
-      const clamped = Math.max(-1, Math.min(1, interp));
-      this._pushSample(
-        clamped < 0 ? Math.round(clamped * 0x8000) : Math.round(clamped * 0x7fff)
-      );
+      this._pushSample(s0 + (s1 - s0) * frac);
       pos += this._ratio;
     }
     this._phase = pos - len;
-    this._prevSample = ch[len - 1];
+    this._lastSample = ch[len - 1];
     return true;
   }
 }
@@ -1627,6 +1635,8 @@ function getToolStatusLabel(toolName: string): string {
       return "Live · Menyimpan ke Docs...";
     case "search_web_info":
       return "Live · Mencari Info...";
+    case "recall_chat_history":
+      return "Live · Mencari Riwayat...";
     case "create_chat_note":
       return "Live · Mencatat...";
     default:
@@ -1678,7 +1688,6 @@ export function InteractiveVoiceCallOverlay({
   const [fsmState, setFsmState] = useState<LiveVoiceFsmState>("IDLE");
   const [toolStatusLabel, setToolStatusLabel] = useState<string>("");
   const [selectedVoice, setSelectedVoice] = useState<LiveVoiceName>("Aoede");
-  const [searchEnabled, setSearchEnabled] = useState<boolean>(false);
   const [liveError, setLiveError] = useState<string>("");
 
   // Core lifecycle refs (zero stale closures; React chat updates NEVER trigger reconnects)
@@ -1686,7 +1695,6 @@ export function InteractiveVoiceCallOverlay({
   const isMountedRef = useRef(true);
   const isMicMutedRef = useRef(isMicMuted);
   const selectedVoiceRef = useRef<LiveVoiceName>(selectedVoice);
-  const searchEnabledRef = useRef<boolean>(searchEnabled);
   const fsmStateRef = useRef<LiveVoiceFsmState>("IDLE");
   const recentContextRef = useRef<string>(recentChatContext || "");
   const recentMessagesRef = useRef<LiveMemoryMessage[]>(recentMessages || []);
@@ -1750,22 +1758,22 @@ export function InteractiveVoiceCallOverlay({
     selectedVoiceRef.current = selectedVoice;
   }, [selectedVoice]);
 
-  useEffect(() => {
-    searchEnabledRef.current = searchEnabled;
-  }, [searchEnabled]);
-
   // ============================================================================
-  // MODULE 1: DUAL-SESSION HOT-SWAP REFS
+  // MODULE 1: DUAL-SESSION HOT-SWAP + DETERMINISTIC LONG-TERM MEMORY REFS
   // ============================================================================
   const activeSessionRef = useRef<Session | null>(null);
   const standbySessionRef = useRef<Session | null>(null);
   const standbyReadyRef = useRef<boolean>(false);
+  const standbyMemoryInjectedRef = useRef<boolean>(false);
   const standbyPrewarmingRef = useRef<boolean>(false);
   const activeSessionIndexRef = useRef<number>(1);
   const standbySessionIndexRef = useRef<number>(2);
   const activeSessionStartedAtRef = useRef<number>(0);
   const sessionTurnCountRef = useRef<number>(0);
   const autoReconnectCountRef = useRef<number>(0);
+  const longTermSummaryRef = useRef<string>("");
+  const lastSummarizedTurnRef = useRef<number>(0);
+  const memoryRefreshInFlightRef = useRef<boolean>(false);
 
   // Separate audio pipeline generation (bumped ONLY on full teardown) vs session generation
   // (bumped on BOTH full teardown AND atomic hot-swap so mic/worklet stays uninterrupted during swap).
@@ -1782,6 +1790,7 @@ export function InteractiveVoiceCallOverlay({
   const liveOutputCtxRef = useRef<AudioContext | null>(null);
   const liveMicStreamRef = useRef<MediaStream | null>(null);
   const liveMicSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const liveHighpassFilterRef = useRef<BiquadFilterNode | null>(null);
   const liveMicAnalyserRef = useRef<AnalyserNode | null>(null);
   const liveOutputAnalyserRef = useRef<AnalyserNode | null>(null);
   const activeAnalyserRef = useRef<AnalyserNode | null>(null);
@@ -1793,13 +1802,16 @@ export function InteractiveVoiceCallOverlay({
   const liveSilentGainRef = useRef<GainNode | null>(null);
 
   // ============================================================================
-  // MODULE 2: ZERO-WAIT PLAYBACK + SMART ECHO GUARD + WATCHDOG REFS
+  // MODULE 2: ZERO-WAIT PLAYBACK + SMART ECHO GUARD + WATCHDOG + TOOL RECOVERY REFS
   // ============================================================================
   const liveScheduledSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const activePlaybackNodesRef = useRef<number>(0);
+  const micLockedRef = useRef<boolean>(false);
   const micUnlockAtRef = useRef<number>(0);
   const echoUnlockTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const turnWatchdogTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const toolRecoveryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const receivedAudioAfterToolRef = useRef<boolean>(false);
   const liveNextPlayTimeRef = useRef<number>(0);
   const isServerTurnCompleteRef = useRef<boolean>(true);
   const activeTurnIdRef = useRef<number>(0);
@@ -1896,6 +1908,13 @@ export function InteractiveVoiceCallOverlay({
     if (turnWatchdogTimerRef.current !== null) {
       clearTimeout(turnWatchdogTimerRef.current);
       turnWatchdogTimerRef.current = null;
+    }
+  }, []);
+
+  const clearToolRecoveryTimer = useCallback(() => {
+    if (toolRecoveryTimerRef.current !== null) {
+      clearTimeout(toolRecoveryTimerRef.current);
+      toolRecoveryTimerRef.current = null;
     }
   }, []);
 
@@ -2089,6 +2108,7 @@ export function InteractiveVoiceCallOverlay({
   const stopAllPlayback = useCallback(() => {
     clearEchoUnlockTimer();
     clearTurnWatchdogTimer();
+    clearToolRecoveryTimer();
 
     liveScheduledSourcesRef.current.forEach((node) => {
       try {
@@ -2102,6 +2122,7 @@ export function InteractiveVoiceCallOverlay({
     liveScheduledSourcesRef.current.clear();
 
     activePlaybackNodesRef.current = 0;
+    micLockedRef.current = false;
     micUnlockAtRef.current = 0;
     liveNextPlayTimeRef.current = 0;
     isServerTurnCompleteRef.current = true;
@@ -2109,18 +2130,63 @@ export function InteractiveVoiceCallOverlay({
     if (liveMicAnalyserRef.current) {
       activeAnalyserRef.current = liveMicAnalyserRef.current;
     }
-  }, [clearEchoUnlockTimer, clearTurnWatchdogTimer]);
+  }, [clearEchoUnlockTimer, clearToolRecoveryTimer, clearTurnWatchdogTimer]);
+
+  /**
+   * Non-blocking background refresh of `[RINGKASAN FAKTA]` via `/api/live-memory`
+   * so long-term memory is always ready ahead of Turn #7 standby pre-warm.
+   */
+  const refreshLongTermMemoryInBackground = useCallback(() => {
+    if (memoryRefreshInFlightRef.current) return;
+    const msgs = recentMessagesRef.current;
+    if (!Array.isArray(msgs) || msgs.length < 4) return;
+    memoryRefreshInFlightRef.current = true;
+
+    const transcript = msgs
+      .slice(-12)
+      .map(
+        (m) =>
+          `${m.role === "user" ? "User" : "Asisten"}: ${(m.content || "")
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 320)}`
+      )
+      .join("\n");
+
+    fetch("/api/live-memory", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        previousSummary: longTermSummaryRef.current,
+        transcript,
+      }),
+    })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: { success?: boolean; summary?: string } | null) => {
+        if (data?.success && typeof data.summary === "string" && data.summary.trim()) {
+          longTermSummaryRef.current = data.summary.trim();
+        }
+      })
+      .catch(() => {
+        // Non-blocking background helper; deterministic local memory always covers fallback
+      })
+      .finally(() => {
+        memoryRefreshInFlightRef.current = false;
+      });
+  }, []);
 
   /**
    * Post-Turn Lifecycle Hook:
-   * - Logs `[VOICE S#X T#N] Turn done -> Mic unlocked`.
-   * - Records turn metric in diagnostics ring buffer.
-   * - Increments `sessionTurnCountRef`.
-   * - At Turn #2 on current session -> triggers silent background standby pre-warming.
-   * - At Turn #3+ on current session -> performs atomic O(1) hot-swap (<5ms) if standby is ready!
+   * - Unlocks mic & resets FSM to LISTENING.
+   * - Refreshes `[RINGKASAN FAKTA]` asynchronously every 3 completed turns.
+   * - At Turn #7 on current session -> triggers silent background standby pre-warming.
+   * - At Turn #8+ on current session -> performs atomic O(1) hot-swap (<5ms) if standby is ready
+   *   AND verified with full deterministic memory!
    */
   const handleTurnFullyUnlocked = useCallback(
     (finishedTurnNum: number) => {
+      clearToolRecoveryTimer();
+      micLockedRef.current = false;
       micUnlockAtRef.current = 0;
       liveNextPlayTimeRef.current = 0;
       activeAnalyserRef.current = liveMicAnalyserRef.current;
@@ -2140,9 +2206,15 @@ export function InteractiveVoiceCallOverlay({
         sessionTurnCountRef.current += 1;
         const turnsOnCurrentSession = sessionTurnCountRef.current;
 
+        if (finishedTurnNum - lastSummarizedTurnRef.current >= 3) {
+          lastSummarizedTurnRef.current = finishedTurnNum;
+          refreshLongTermMemoryInBackground();
+        }
+
         if (
           turnsOnCurrentSession >= LIVE_HOTSWAP_TARGET_TURN &&
           standbyReadyRef.current &&
+          standbyMemoryInjectedRef.current &&
           standbySessionRef.current
         ) {
           performAtomicHotSwapIfReadyRef.current();
@@ -2155,7 +2227,12 @@ export function InteractiveVoiceCallOverlay({
         }
       }
     },
-    [recordTurnMetric, setFsm]
+    [
+      clearToolRecoveryTimer,
+      recordTurnMetric,
+      refreshLongTermMemoryInBackground,
+      setFsm,
+    ]
   );
 
   /**
@@ -2263,6 +2340,8 @@ export function InteractiveVoiceCallOverlay({
 
         clearEchoUnlockTimer();
         clearTurnWatchdogTimer();
+        clearToolRecoveryTimer();
+        receivedAudioAfterToolRef.current = true;
 
         const isFirstChunkOfTurn = !loggedServerAudioForTurnRef.current;
         const nowCtx = outCtx.currentTime;
@@ -2275,6 +2354,7 @@ export function InteractiveVoiceCallOverlay({
         isServerTurnCompleteRef.current = false;
 
         activePlaybackNodesRef.current += 1;
+        micLockedRef.current = true;
         micUnlockAtRef.current = Number.POSITIVE_INFINITY;
 
         if (isFirstChunkOfTurn) {
@@ -2352,6 +2432,7 @@ export function InteractiveVoiceCallOverlay({
     [
       armTurnWatchdog,
       clearEchoUnlockTimer,
+      clearToolRecoveryTimer,
       clearTurnWatchdogTimer,
       ensureActiveTurnNumber,
       scheduleEchoGuardUnlock,
@@ -2379,6 +2460,7 @@ export function InteractiveVoiceCallOverlay({
       }
       clearPrewarmInterval();
       clearTurnWatchdogTimer();
+      clearToolRecoveryTimer();
 
       if (tokenAbortControllerRef.current) {
         try {
@@ -2415,7 +2497,10 @@ export function InteractiveVoiceCallOverlay({
       standbySessionIndexRef.current = 2;
       activeSessionStartedAtRef.current = 0;
       standbyReadyRef.current = false;
+      standbyMemoryInjectedRef.current = false;
       standbyPrewarmingRef.current = false;
+      micLockedRef.current = false;
+      receivedAudioAfterToolRef.current = false;
       speechProfilerRef.current = createSpeechEndProfilerState();
       lastSpeechEndedAtRef.current = 0;
 
@@ -2480,6 +2565,15 @@ export function InteractiveVoiceCallOverlay({
         liveScriptNodeRef.current = null;
       }
 
+      if (liveHighpassFilterRef.current) {
+        try {
+          liveHighpassFilterRef.current.disconnect();
+        } catch {
+          // ignore
+        }
+        liveHighpassFilterRef.current = null;
+      }
+
       if (liveSilentGainRef.current) {
         try {
           liveSilentGainRef.current.disconnect();
@@ -2537,6 +2631,7 @@ export function InteractiveVoiceCallOverlay({
     },
     [
       clearPrewarmInterval,
+      clearToolRecoveryTimer,
       clearTranscriptThrottleTimers,
       clearTurnWatchdogTimer,
       finalizeCurrentTurnAsync,
@@ -2546,11 +2641,27 @@ export function InteractiveVoiceCallOverlay({
   );
 
   /**
-   * Module 3: Unified Async Tool Execution Handler (`create_formula_table`,
-   * `save_to_google_docs`, `search_web_info`, plus legacy `create_chat_note`/`create_google_doc`).
-   * - Wraps every call in `try/catch` + 12-second timeout.
-   * - Supports multiple tool calls sequentially in a single turn.
-   * - ALWAYS responds via `session.sendToolResponse({ functionResponses })` so Gemini never hangs.
+   * Synchronous 0ms deterministic memory prompt builder combining:
+   * 1) `[RINGKASAN FAKTA]` (`longTermSummaryRef.current`)
+   * 2) `[TABEL FORMULA AKTIF]` (`latestFormulaTableRef.current`)
+   * 3) `[12 PESAN DIALOG TERAKHIR]` (verbatim last 12 turns with `User:` / `Asisten:`)
+   */
+  const getDeterministicMemoryPrompt = useCallback((): string => {
+    return buildDeterministicMemoryPrompt({
+      longTermSummary: longTermSummaryRef.current,
+      latestFormulaTable: latestFormulaTableRef.current,
+      recentMessages: recentMessagesRef.current,
+      fallbackContext: recentContextRef.current,
+    });
+  }, []);
+
+  /**
+   * Unified Async Tool Execution Handler (`create_formula_table`, `save_to_google_docs`,
+   * `search_web_info`, `recall_chat_history`, plus legacy `create_chat_note`/`create_google_doc`).
+   * - Hybrid R&D detailed table generation via `/api/generate-detailed-table` + instant shimmer card.
+   * - ALWAYS responds via `session.sendToolResponse({ functionResponses: [{ id, name, response: { result, status } }] })`.
+   * - IMMEDIATELY clears `TOOL_EXECUTING` -> `LISTENING` after `sendToolResponse` AND arms a
+   *   2,200ms recovery timer so the UI & mic NEVER deadlock even if Gemini stays silent!
    */
   const executeLiveToolCalls = useCallback(
     async (
@@ -2564,17 +2675,21 @@ export function InteractiveVoiceCallOverlay({
 
       const firstToolName = functionCalls[0]?.name || "";
       setFsm("TOOL_EXECUTING", getToolStatusLabel(firstToolName));
+      micLockedRef.current = true;
       micUnlockAtRef.current = Number.POSITIVE_INFINITY;
       clearTurnWatchdogTimer();
+      clearToolRecoveryTimer();
 
       const functionResponses: Array<{
         id: string;
         name: string;
-        response: Record<string, unknown>;
+        response: { result: string; status: string };
       }> = [];
+      let fallbackConfirmationText = "";
 
       for (const call of functionCalls) {
-        const callId = call.id || `tool-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        const callId =
+          call.id || `tool-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
         const callName = call.name || "unknown";
         const args = (call.args || {}) as Record<string, unknown>;
 
@@ -2585,27 +2700,152 @@ export function InteractiveVoiceCallOverlay({
         setFsm("TOOL_EXECUTING", getToolStatusLabel(callName));
 
         try {
-          const responsePayload = await withTimeout<Record<string, unknown>>(
+          const outcome = await withTimeout<{
+            resultMessage: string;
+            status: "ok" | "error";
+            fallbackChatText?: string;
+          }>(
             (async () => {
               if (callName === "create_formula_table") {
-                const normalized = normalizeFormulaTableArtifact(args);
-                if (!normalized) {
+                const topic = String(
+                  args.topic ?? args.title ?? "Formulasi Kosmetik R&D"
+                ).trim();
+                const keyIngredients = String(
+                  args.key_ingredients ?? args.keyIngredients ?? ""
+                ).trim();
+                const constraints = String(
+                  args.constraints ?? args.subtitle ?? ""
+                ).trim();
+                const rawType = String(
+                  args.table_type ?? args.tableType ?? "formulation"
+                )
+                  .toLowerCase()
+                  .trim();
+                const tableType: FormulaTableType =
+                  rawType === "comparison"
+                    ? "comparison"
+                    : rawType === "general"
+                      ? "general"
+                      : "formulation";
+
+                const shimmerMsgId = `ftable-${Date.now()}-${Math.random()
+                  .toString(36)
+                  .slice(2, 6)}`;
+
+                // 1) Immediately show lightweight shimmer loading card in chat room
+                const loadingCard: FormulaTableArtifact = {
+                  id: shimmerMsgId,
+                  title: topic || "Menyusun Tabel R&D...",
+                  subtitle:
+                    "Menyusun bahan INCI lengkap, validasi total 100.00%, target pH & prosedur...",
+                  tableType,
+                  columns: FORMULATION_REQUIRED_COLUMNS,
+                  rows: [],
+                  isLoading: true,
+                };
+                queueMicrotask(() => {
+                  onCreateFormulaTableRef.current?.(loadingCard, shimmerMsgId);
+                });
+
+                // 2) Call Hybrid Backend `/api/generate-detailed-table` for rich R&D output
+                let detailedTable: FormulaTableArtifact | null = null;
+                let backendError = "";
+
+                try {
+                  const res = await fetch("/api/generate-detailed-table", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      topic,
+                      key_ingredients: keyIngredients,
+                      constraints,
+                      table_type: tableType,
+                      conversationContext: getDeterministicMemoryPrompt().slice(
+                        0,
+                        1800
+                      ),
+                    }),
+                  });
+                  const data = (await res.json().catch(() => ({}))) as {
+                    success?: boolean;
+                    table?: unknown;
+                    error?: string;
+                  };
+                  if (res.ok && data.success && data.table) {
+                    detailedTable = normalizeFormulaTableArtifact({
+                      ...(data.table as Record<string, unknown>),
+                      id: shimmerMsgId,
+                      isLoading: false,
+                    });
+                  } else {
+                    backendError =
+                      data.error ||
+                      `Gagal menyusun tabel R&D (HTTP ${res.status}).`;
+                  }
+                } catch (fetchErr: unknown) {
+                  backendError =
+                    fetchErr instanceof Error
+                      ? fetchErr.message
+                      : String(fetchErr);
+                }
+
+                // Backwards-compatible rescue if Gemini sent legacy inline columns/rows
+                if (!detailedTable && Array.isArray(args.rows) && args.rows.length > 0) {
+                  const legacy = normalizeFormulaTableArtifact(args);
+                  if (legacy) {
+                    const balanced =
+                      tableType === "formulation"
+                        ? validateAndBalanceFormulationRows(
+                            legacy.columns,
+                            legacy.rows
+                          )
+                        : null;
+                    detailedTable = {
+                      ...legacy,
+                      id: shimmerMsgId,
+                      tableType,
+                      rows: balanced ? balanced.rows : legacy.rows,
+                      totalPercentage: balanced?.totalPercentage,
+                      isLoading: false,
+                    };
+                  }
+                }
+
+                if (!detailedTable) {
+                  queueMicrotask(() => {
+                    onLiveRemoveMessageRef.current?.(shimmerMsgId);
+                  });
                   return {
                     status: "error",
-                    message:
-                      "Data kolom atau baris tabel tidak lengkap. Minta model menyertakan columns dan rows.",
+                    resultMessage:
+                      backendError ||
+                      "Gagal menghasilkan tabel formulasi rinci. Minta maaf singkat dan tawarkan mencoba ulang.",
+                    fallbackChatText:
+                      "Maaf, penyusunan tabel R&D sempat terkendala. Boleh ulangi permintaanmu sebentar?",
                   };
                 }
-                latestFormulaTableRef.current = normalized;
+
+                // 3) Replace shimmer in-place with complete detailed R&D FormulaTableCard
+                latestFormulaTableRef.current = detailedTable;
                 queueMicrotask(() => {
-                  onCreateFormulaTableRef.current?.(normalized);
+                  onCreateFormulaTableRef.current?.(detailedTable!, shimmerMsgId);
                 });
+
+                const keyItemsSummary = detailedTable.rows
+                  .slice(0, 6)
+                  .map((r) => `${r[1] || r[0]}${r[2] ? ` ${r[2]}` : ""}`)
+                  .join(", ");
+                const phInfo = detailedTable.specs?.targetPh
+                  ? ` Target pH ${detailedTable.specs.targetPh}.`
+                  : "";
+                const totalInfo = detailedTable.totalPercentage
+                  ? ` Total komposisi tepat ${detailedTable.totalPercentage}.`
+                  : "";
+
                 return {
-                  status: "success",
-                  title: normalized.title,
-                  rowsCount: normalized.rows.length,
-                  message:
-                    "Tabel formulasi sudah berhasil ditampilkan langsung di room chat.",
+                  status: "ok",
+                  resultMessage: `Tabel R&D lengkap "${detailedTable.title}" (${detailedTable.rows.length} baris) sudah tampil di room chat.${totalInfo}${phInfo} Sorotan utama: ${keyItemsSummary}. Jelaskan inti formulanya dalam 1 sampai 2 kalimat santai tanpa membacakan seluruh tabel.`,
+                  fallbackChatText: `Tabel R&D "${detailedTable.title}" sudah tampil lengkap di chat (${detailedTable.rows.length} baris${detailedTable.totalPercentage ? `, total ${detailedTable.totalPercentage}` : ""}). Ada bahan atau tekstur yang ingin kamu sesuaikan?`,
                 };
               }
 
@@ -2636,7 +2876,7 @@ export function InteractiveVoiceCallOverlay({
                 if (!content) {
                   return {
                     status: "error",
-                    message: "Isi dokumen kosong, tidak bisa disimpan.",
+                    resultMessage: "Isi dokumen kosong, tidak bisa disimpan.",
                   };
                 }
 
@@ -2658,12 +2898,9 @@ export function InteractiveVoiceCallOverlay({
                     onCreateGoogleDocRef.current?.(createdArtifact);
                   });
                   return {
-                    status: "success",
-                    savedToDrive: true,
-                    title: created.title,
-                    docUrl: created.url,
-                    message:
-                      "Dokumen berhasil dibuat langsung di Google Drive dan link Buka Google Docs sudah tampil di chat.",
+                    status: "ok",
+                    resultMessage: `Dokumen "${created.title}" berhasil dibuat langsung di Google Drive dan link Buka Google Docs sudah tampil di chat.`,
+                    fallbackChatText: `Dokumen Google Docs "${created.title}" sudah tersimpan di Google Drive dan tautannya tampil di chat.`,
                   };
                 }
 
@@ -2677,11 +2914,9 @@ export function InteractiveVoiceCallOverlay({
                   onCreateGoogleDocRef.current?.(draftArtifact);
                 });
                 return {
-                  status: "pending_google_drive_auth",
-                  savedToDrive: false,
-                  title,
-                  message:
-                    "Draft Google Docs sudah tampil di room chat. Beri tahu pengguna dengan santai untuk klik tombol Hubungkan Google Drive & Simpan Sekarang di chat agar langsung tersimpan ke Drive.",
+                  status: "ok",
+                  resultMessage: `Draft Google Docs "${title}" sudah tampil di room chat. Beri tahu pengguna dengan santai untuk klik tombol Hubungkan Google Drive & Simpan Sekarang di chat agar langsung tersimpan ke Drive.`,
+                  fallbackChatText: `Draft Google Docs "${title}" sudah siap di room chat. Klik tombol Hubungkan Google Drive di kartunya untuk menyimpan langsung.`,
                 };
               }
 
@@ -2690,7 +2925,7 @@ export function InteractiveVoiceCallOverlay({
                 if (!query) {
                   return {
                     status: "error",
-                    message: "Kata kunci pencarian kosong.",
+                    resultMessage: "Kata kunci pencarian kosong.",
                   };
                 }
                 const res = await fetch("/api/live-search", {
@@ -2707,7 +2942,7 @@ export function InteractiveVoiceCallOverlay({
                 if (!res.ok || !data.success) {
                   return {
                     status: "error",
-                    message:
+                    resultMessage:
                       data.error ||
                       "Pencarian web sementara gagal. Sampaikan secara jujur ke pengguna.",
                   };
@@ -2732,14 +2967,31 @@ export function InteractiveVoiceCallOverlay({
                   }
                 }
 
+                const sourceNames = cleanSources
+                  .slice(0, 3)
+                  .map((s) => s.domain)
+                  .join(", ");
+
                 return {
-                  status: "success",
-                  summary: data.summary || "",
-                  sources: cleanSources.map((s) => ({
-                    title: s.title,
-                    domain: s.domain,
-                    url: s.url,
-                  })),
+                  status: "ok",
+                  resultMessage: `${data.summary || "Info ditemukan."}${
+                    sourceNames ? ` (Sumber: ${sourceNames})` : ""
+                  }`,
+                  fallbackChatText:
+                    data.summary || "Hasil pencarian web terbaru sudah ditemukan.",
+                };
+              }
+
+              if (callName === "recall_chat_history") {
+                const keyword = String(args.keyword ?? "").trim();
+                const localHits = recallChatHistoryLocal(
+                  recentMessagesRef.current,
+                  keyword,
+                  latestFormulaTableRef.current
+                );
+                return {
+                  status: "ok",
+                  resultMessage: localHits,
                 };
               }
 
@@ -2750,32 +3002,38 @@ export function InteractiveVoiceCallOverlay({
                     onCreateChatNoteRef.current?.(normalized);
                   });
                   return {
-                    status: "success",
-                    title: normalized.title,
-                    message: "Catatan sudah ditampilkan di room chat.",
+                    status: "ok",
+                    resultMessage: `Catatan "${normalized.title}" sudah ditampilkan di room chat.`,
+                    fallbackChatText: `Catatan "${normalized.title}" sudah tampil di room chat.`,
                   };
                 }
-                return { status: "error", message: "Catatan kosong." };
+                return { status: "error", resultMessage: "Catatan kosong." };
               }
 
               return {
-                status: "unsupported_tool",
-                message:
+                status: "error",
+                resultMessage:
                   "Tool tidak dikenali. Jawab langsung secara lisan dengan bahasa Indonesia yang natural.",
               };
             })(),
             LIVE_TOOL_TIMEOUT_MS,
-            `Tool ${callName} melebihi batas waktu 12 detik.`
+            `Tool ${callName} melebihi batas waktu.`
           );
 
           turnToolsCalledRef.current.push(callName);
+          if (outcome.fallbackChatText) {
+            fallbackConfirmationText = outcome.fallbackChatText;
+          }
           console.log(
-            `[VOICE S#${activeSessionIndexRef.current} T#${turnNum}] Tool executed: ${callName}`
+            `[VOICE S#${activeSessionIndexRef.current} T#${turnNum}] Tool executed: ${callName} (${outcome.status})`
           );
           functionResponses.push({
             id: callId,
             name: callName,
-            response: responsePayload,
+            response: {
+              result: outcome.resultMessage,
+              status: outcome.status,
+            },
           });
         } catch (toolErr: unknown) {
           const errMsg =
@@ -2788,8 +3046,8 @@ export function InteractiveVoiceCallOverlay({
             id: callId,
             name: callName,
             response: {
+              result: `Gagal menjalankan ${callName}: ${errMsg}`,
               status: "error",
-              message: `Gagal menjalankan ${callName}: ${errMsg}`,
             },
           });
         }
@@ -2800,34 +3058,73 @@ export function InteractiveVoiceCallOverlay({
         callActiveRef.current &&
         functionResponses.length > 0
       ) {
+        const currentGen = sessionGenerationRef.current;
         try {
           targetSession.sendToolResponse({ functionResponses });
-          // Wait for Gemini's spoken follow-up; arm 5s watchdog in case server produces no audio
+          // 100% ANTI-DEADLOCK: Immediately clear "Live · Menyiapkan Tabel..." -> "Live · Mendengarkan"
+          receivedAudioAfterToolRef.current = false;
           isServerTurnCompleteRef.current = false;
-          armTurnWatchdog(sessionGenerationRef.current, turnNum);
-        } catch {
-          if (fsmStateRef.current === "TOOL_EXECUTING") {
+          setFsm("LISTENING");
+
+          // Arm 2,200ms recovery timer: if server doesn't start speaking confirmation audio
+          // within 2.2s, force FSM -> LISTENING, unlock mic, and show short chat confirmation
+          clearToolRecoveryTimer();
+          toolRecoveryTimerRef.current = setTimeout(() => {
+            toolRecoveryTimerRef.current = null;
+            if (
+              !isMountedRef.current ||
+              !callActiveRef.current ||
+              sessionGenerationRef.current !== currentGen
+            ) {
+              return;
+            }
+            if (
+              receivedAudioAfterToolRef.current ||
+              fsmStateRef.current === "AI_SPEAKING" ||
+              activePlaybackNodesRef.current > 0
+            ) {
+              return;
+            }
+            console.warn(
+              `[VOICE S#${activeSessionIndexRef.current} T#${turnNum}] Tool recovery 2.2s: tidak ada audio konfirmasi — memaksa LISTENING & membuka mikrofon`
+            );
+            isServerTurnCompleteRef.current = true;
+            micLockedRef.current = false;
+            micUnlockAtRef.current = 0;
             setFsm("LISTENING");
-          }
+            if (fallbackConfirmationText && !assistantTurnTextRef.current.trim()) {
+              const confirmId = ensureAssistantMessageId();
+              assistantTurnTextRef.current = fallbackConfirmationText;
+              onLiveAssistantStreamRef.current?.(confirmId, fallbackConfirmationText);
+              finalizeCurrentTurnAsync();
+            }
+            handleTurnFullyUnlocked(turnNum);
+          }, LIVE_TOOL_RECOVERY_MS);
+        } catch {
+          micLockedRef.current = false;
+          micUnlockAtRef.current = 0;
+          isServerTurnCompleteRef.current = true;
+          setFsm("LISTENING");
+        }
+      } else {
+        micLockedRef.current = false;
+        micUnlockAtRef.current = 0;
+        if (fsmStateRef.current === "TOOL_EXECUTING") {
+          setFsm("LISTENING");
         }
       }
     },
-    [armTurnWatchdog, clearTurnWatchdogTimer, emitPendingSourcesAsync, setFsm]
+    [
+      clearToolRecoveryTimer,
+      clearTurnWatchdogTimer,
+      emitPendingSourcesAsync,
+      ensureAssistantMessageId,
+      finalizeCurrentTurnAsync,
+      getDeterministicMemoryPrompt,
+      handleTurnFullyUnlocked,
+      setFsm,
+    ]
   );
-
-  /**
-   * Builds compact plain-text conversation memory (<= 8 recent messages, <= 350 words)
-   * for seamless background standby pre-warming and reconnects (NEVER carries raw audio).
-   */
-  const getCompactMemorySummary = useCallback((): string => {
-    const fromMessages = buildConversationMemorySummary(
-      recentMessagesRef.current,
-      8,
-      350
-    );
-    if (fromMessages) return fromMessages;
-    return recentContextRef.current.trim().slice(0, 1400);
-  }, []);
 
   /**
    * Shared Gemini Live WebSocket Session Opener (used by primary connect, background standby
@@ -2860,6 +3157,7 @@ export function InteractiveVoiceCallOverlay({
         excludeModels?: string[];
         disableThinkingConfig?: boolean;
         disableCustomVad?: boolean;
+        disableContextCompression?: boolean;
       }): Promise<LiveTokenApiResponse> => {
         const abortController = new AbortController();
         if (isStandby) {
@@ -2874,7 +3172,6 @@ export function InteractiveVoiceCallOverlay({
             signal: abortController.signal,
             body: JSON.stringify({
               voiceName: selectedVoiceRef.current,
-              enableSearch: searchEnabledRef.current,
               memorySummary,
               ...(opts?.excludeModels && opts.excludeModels.length > 0
                 ? { excludeModels: opts.excludeModels }
@@ -2883,6 +3180,9 @@ export function InteractiveVoiceCallOverlay({
                 ? { disableThinkingConfig: true }
                 : {}),
               ...(opts?.disableCustomVad ? { disableCustomVad: true } : {}),
+              ...(opts?.disableContextCompression
+                ? { disableContextCompression: true }
+                : {}),
             }),
           });
           const data = (await res.json().catch(() => ({}))) as LiveTokenApiResponse;
@@ -2910,8 +3210,9 @@ export function InteractiveVoiceCallOverlay({
       let lastCloseCode: number | undefined = undefined;
       let disableThinkingConfig = false;
       let disableCustomVad = false;
+      let disableContextCompression = false;
 
-      const MAX_LIVE_ATTEMPTS = 6;
+      const MAX_LIVE_ATTEMPTS = 7;
 
       for (let attempt = 0; attempt < MAX_LIVE_ATTEMPTS; attempt++) {
         if (!isStillValid()) {
@@ -2922,6 +3223,7 @@ export function InteractiveVoiceCallOverlay({
           excludeModels: excludedModels,
           disableThinkingConfig,
           disableCustomVad,
+          disableContextCompression,
         });
 
         if (!isStillValid()) {
@@ -2951,8 +3253,7 @@ export function InteractiveVoiceCallOverlay({
           ...(tokenCfg.systemInstruction
             ? { systemInstruction: tokenCfg.systemInstruction }
             : {}),
-          // ALWAYS register Unified Function Declarations (`create_formula_table`,
-          // `save_to_google_docs`, + conditional `search_web_info`) on EVERY voice chip!
+          // ALWAYS register ALL 4 Unified Function Declarations on EVERY voice chip!
           ...(Array.isArray(tokenCfg.tools) && tokenCfg.tools.length > 0
             ? { tools: tokenCfg.tools }
             : {}),
@@ -2965,6 +3266,12 @@ export function InteractiveVoiceCallOverlay({
           inputAudioTranscription: {},
           outputAudioTranscription: {},
         };
+
+        // Keep Context Window Compression active (Turns #1-#8 constant latency without affective dialog)
+        if (!disableContextCompression) {
+          (liveConfig as Record<string, unknown>).contextWindowCompression =
+            tokenCfg.contextWindowCompression || LIVE_CONTEXT_WINDOW_COMPRESSION;
+        }
 
         const ai = new GoogleGenAI({
           apiKey: tokenCfg.token,
@@ -3053,25 +3360,30 @@ export function InteractiveVoiceCallOverlay({
                   }
                 }
 
-                // 5. Streaming User Speech Transcription (strip <noise> + leading punctuation; 80ms throttle)
+                // 5. Streaming User Speech Transcription (strip <noise>, drop non-Latin noise hallucinations like Thai/CJK/Arabic, strip leading punctuation)
                 if (content.inputTranscription?.text) {
-                  // User started a new utterance -> seal previous AI bubble from late fragments
-                  lastCommittedAiMessageIdRef.current = null;
-                  lastCommittedAiTextRef.current = "";
+                  const rawUserChunk = content.inputTranscription.text;
+                  if (isNonLatinHallucinationFragment(rawUserChunk)) {
+                    // Ignore short non-Latin script mic-noise hallucinations (e.g. "ฮัลโหล")
+                  } else {
+                    // User started a new utterance -> seal previous AI bubble from late fragments
+                    lastCommittedAiMessageIdRef.current = null;
+                    lastCommittedAiTextRef.current = "";
 
-                  if (userTurnCommittedRef.current) {
-                    userTurnCommittedRef.current = false;
-                    currentUserMessageIdRef.current = null;
-                    userTurnTextRef.current = "";
-                  }
-                  userTurnTextRef.current += content.inputTranscription.text;
-                  const cleanedInput = sanitizeLiveUserTranscript(
-                    userTurnTextRef.current
-                  );
-                  if (cleanedInput.length > 0) {
-                    ensureActiveTurnNumber();
-                    speechPulseRef.current = 0.6;
-                    scheduleUserTranscriptFlush();
+                    if (userTurnCommittedRef.current) {
+                      userTurnCommittedRef.current = false;
+                      currentUserMessageIdRef.current = null;
+                      userTurnTextRef.current = "";
+                    }
+                    userTurnTextRef.current += rawUserChunk;
+                    const cleanedInput = sanitizeLiveUserTranscript(
+                      userTurnTextRef.current
+                    );
+                    if (cleanedInput.length > 0) {
+                      ensureActiveTurnNumber();
+                      speechPulseRef.current = 0.6;
+                      scheduleUserTranscriptFlush();
+                    }
                   }
                 }
 
@@ -3252,10 +3564,18 @@ export function InteractiveVoiceCallOverlay({
           const isConfigRejection =
             parsedCode === 1007 ||
             parsedCode === 1008 ||
-            /invalid argument|unsupported|not supported|thinking|activity/i.test(
+            /invalid argument|unsupported|not supported|thinking|activity|compression|sliding/i.test(
               lastErrorReason
             );
 
+          if (
+            isConfigRejection &&
+            !disableContextCompression &&
+            /compression|sliding/i.test(lastErrorReason)
+          ) {
+            disableContextCompression = true;
+            continue;
+          }
           if (
             isConfigRejection &&
             !disableThinkingConfig &&
@@ -3272,6 +3592,10 @@ export function InteractiveVoiceCallOverlay({
             disableCustomVad = true;
             continue;
           }
+          if (isConfigRejection && !disableContextCompression) {
+            disableContextCompression = true;
+            continue;
+          }
 
           if (tokenCfg.model && !excludedModels.includes(tokenCfg.model)) {
             excludedModels.push(tokenCfg.model);
@@ -3281,6 +3605,7 @@ export function InteractiveVoiceCallOverlay({
           }
           disableThinkingConfig = false;
           disableCustomVad = false;
+          disableContextCompression = false;
         }
       }
 
@@ -3316,6 +3641,7 @@ export function InteractiveVoiceCallOverlay({
   const performAtomicHotSwapIfReady = useCallback((): boolean => {
     if (
       !standbyReadyRef.current ||
+      !standbyMemoryInjectedRef.current ||
       !standbySessionRef.current ||
       !callActiveRef.current
     ) {
@@ -3337,6 +3663,7 @@ export function InteractiveVoiceCallOverlay({
     activeSessionRef.current = standbySessionRef.current;
     standbySessionRef.current = null;
     standbyReadyRef.current = false;
+    standbyMemoryInjectedRef.current = false;
     activeSessionIndexRef.current = toIdx;
     activeSessionStartedAtRef.current = Date.now();
     sessionTurnCountRef.current = 0;
@@ -3362,8 +3689,9 @@ export function InteractiveVoiceCallOverlay({
   }, []);
 
   /**
-   * Module 1: Silent Background Pre-Warming of `standbySessionRef`
-   * Triggered when `sessionTurnCountRef === 2` OR active session age >= 55 seconds.
+   * Silent Background Pre-Warming of `standbySessionRef`
+   * Triggered when `sessionTurnCountRef >= 7` OR active session age >= 120 seconds.
+   * Always synchronously injects the full 3-block Deterministic Memory Prompt.
    */
   const prepareStandbySession = useCallback(async () => {
     if (
@@ -3377,10 +3705,21 @@ export function InteractiveVoiceCallOverlay({
     }
 
     standbyPrewarmingRef.current = true;
+    standbyMemoryInjectedRef.current = false;
     const pipelineGen = audioPipelineGenerationRef.current;
     const currentIdx = activeSessionIndexRef.current;
     const nextIdx = currentIdx + 1;
-    const memoryText = getCompactMemorySummary();
+    const memoryText = getDeterministicMemoryPrompt();
+    const hasConversationData =
+      recentMessagesRef.current.length > 0 ||
+      latestFormulaTableRef.current !== null ||
+      longTermSummaryRef.current.length > 0;
+
+    // Guard: never hot-swap with an empty memory prompt when conversation data exists
+    if (hasConversationData && !memoryText.trim()) {
+      standbyPrewarmingRef.current = false;
+      return;
+    }
 
     try {
       const opened = await openGeminiLiveSession({
@@ -3405,15 +3744,17 @@ export function InteractiveVoiceCallOverlay({
 
       standbySessionRef.current = opened.session;
       standbySessionIndexRef.current = nextIdx;
+      standbyMemoryInjectedRef.current = !hasConversationData || memoryText.trim().length > 0;
       standbyReadyRef.current = true;
 
       console.log(
-        `[VOICE S#${currentIdx}] Standby S#${nextIdx} pre-warmed (text memory: ${memoryText.length} chars)`
+        `[VOICE S#${currentIdx}] Standby S#${nextIdx} pre-warmed (deterministic memory: ${memoryText.length} chars)`
       );
 
-      // If active session already passed Turn #3 while standby was warming and is now idle, swap immediately
+      // If active session already passed Turn #8 while standby was warming and is now idle, swap immediately
       if (
         sessionTurnCountRef.current >= LIVE_HOTSWAP_TARGET_TURN &&
+        standbyMemoryInjectedRef.current &&
         fsmStateRef.current === "LISTENING" &&
         isServerTurnCompleteRef.current &&
         activePlaybackNodesRef.current === 0
@@ -3426,20 +3767,20 @@ export function InteractiveVoiceCallOverlay({
       standbyPrewarmingRef.current = false;
     }
   }, [
-    getCompactMemorySummary,
+    getDeterministicMemoryPrompt,
     openGeminiLiveSession,
     performAtomicHotSwapIfReady,
   ]);
 
   /**
-   * Module 1: Seamless In-Place Auto-Reconnect (up to 2 retries on unexpected WS drop)
-   * Preserves mic/AudioWorklet/AudioContext and injects text memory seamlessly.
+   * Seamless In-Place Auto-Reconnect (up to 2 retries on unexpected WS drop)
+   * Preserves mic/AudioWorklet/AudioContext and injects the full 3-block memory prompt seamlessly.
    */
   const reconnectActiveSessionInPlace = useCallback(async () => {
     if (!isMountedRef.current || !callActiveRef.current) return;
     const pipelineGen = audioPipelineGenerationRef.current;
     const nextIdx = activeSessionIndexRef.current + 1;
-    const memoryText = getCompactMemorySummary();
+    const memoryText = getDeterministicMemoryPrompt();
     setFsm("CONNECTING");
 
     try {
@@ -3468,12 +3809,11 @@ export function InteractiveVoiceCallOverlay({
       activeSessionStartedAtRef.current = Date.now();
       sessionTurnCountRef.current = 0;
       sessionGenerationRef.current += 1;
+      micLockedRef.current = false;
       setLiveError("");
       setFsm("LISTENING");
       console.log(
-        `[VOICE S#${nextIdx}] Connected (voice: ${opened.voiceName}, tools: ON, search: ${
-          searchEnabledRef.current ? "ON" : "OFF"
-        })`
+        `[VOICE S#${nextIdx}] Connected (voice: ${opened.voiceName}, tools: ALL 4 AUTO)`
       );
     } catch (err: unknown) {
       if (
@@ -3495,7 +3835,7 @@ export function InteractiveVoiceCallOverlay({
         setFsm("ERROR");
       }
     }
-  }, [getCompactMemorySummary, openGeminiLiveSession, setFsm]);
+  }, [getDeterministicMemoryPrompt, openGeminiLiveSession, setFsm]);
 
   useEffect(() => {
     prepareStandbySessionRef.current = prepareStandbySession;
@@ -3542,10 +3882,18 @@ export function InteractiveVoiceCallOverlay({
       const micSource = inputCtx.createMediaStreamSource(stream);
       liveMicSourceRef.current = micSource;
 
+      // 85Hz High-Pass BiquadFilterNode removes laptop fan / AC rumble without cutting human voice
+      const highpassFilter = inputCtx.createBiquadFilter();
+      highpassFilter.type = "highpass";
+      highpassFilter.frequency.value = LIVE_HIGHPASS_CUTOFF_HZ;
+      highpassFilter.Q.value = 0.707;
+      liveHighpassFilterRef.current = highpassFilter;
+      micSource.connect(highpassFilter);
+
       const micAnalyser = inputCtx.createAnalyser();
       micAnalyser.fftSize = 256;
       micAnalyser.smoothingTimeConstant = 0.78;
-      micSource.connect(micAnalyser);
+      highpassFilter.connect(micAnalyser);
       liveMicAnalyserRef.current = micAnalyser;
       if (fsmStateRef.current !== "AI_SPEAKING") {
         activeAnalyserRef.current = micAnalyser;
@@ -3563,9 +3911,10 @@ export function InteractiveVoiceCallOverlay({
           return;
         }
 
-        // Strict Turn Lock & Smart Echo Guard (pause mic uplink during AI_SPEAKING / TOOL_EXECUTING + 220ms tail)
+        // Strict Turn Lock & Smart Echo Guard (pause mic uplink during AI_SPEAKING / TOOL_EXECUTING + 120ms tail)
         const nowPerf = performance.now();
         if (
+          micLockedRef.current ||
           fsmStateRef.current !== "LISTENING" ||
           activePlaybackNodesRef.current > 0 ||
           nowPerf < micUnlockAtRef.current
@@ -3644,7 +3993,7 @@ export function InteractiveVoiceCallOverlay({
           silentGain.gain.value = 0;
           liveSilentGainRef.current = silentGain;
 
-          micSource.connect(workletNode);
+          highpassFilter.connect(workletNode);
           workletNode.connect(silentGain);
           silentGain.connect(inputCtx.destination);
           workletAttached = true;
@@ -3664,36 +4013,30 @@ export function InteractiveVoiceCallOverlay({
         !workletAttached &&
         typeof inputCtx.createScriptProcessor === "function"
       ) {
-        const scriptNode = inputCtx.createScriptProcessor(2048, 1, 1);
+        const scriptNode = inputCtx.createScriptProcessor(1024, 1, 1);
         liveScriptNodeRef.current = scriptNode;
 
         const silentGain = inputCtx.createGain();
         silentGain.gain.value = 0;
         liveSilentGainRef.current = silentGain;
 
-        let pendingBuffer = new Int16Array(LIVE_INPUT_CHUNK_SAMPLES);
-        let pendingOffset = 0;
+        const fallbackResampler = createContinuousResampler(
+          inputCtx.sampleRate,
+          LIVE_INPUT_TARGET_SAMPLE_RATE,
+          LIVE_INPUT_CHUNK_SAMPLES
+        );
 
         scriptNode.onaudioprocess = (ev: AudioProcessingEvent) => {
           const ch0 = ev.inputBuffer.getChannelData(0);
           if (ch0 && ch0.length > 0) {
-            const int16 = downsampleFloat32ToInt16Pcm(
-              new Float32Array(ch0),
-              inputCtx.sampleRate,
-              LIVE_INPUT_TARGET_SAMPLE_RATE
-            );
-            for (let i = 0; i < int16.length; i++) {
-              pendingBuffer[pendingOffset++] = int16[i];
-              if (pendingOffset >= LIVE_INPUT_CHUNK_SAMPLES) {
-                sendPcmChunkToActiveSession(pendingBuffer);
-                pendingBuffer = new Int16Array(LIVE_INPUT_CHUNK_SAMPLES);
-                pendingOffset = 0;
-              }
+            const packets = fallbackResampler.pushBlock(ch0);
+            for (const pkt of packets) {
+              sendPcmChunkToActiveSession(pkt);
             }
           }
         };
 
-        micSource.connect(scriptNode);
+        highpassFilter.connect(scriptNode);
         scriptNode.connect(silentGain);
         silentGain.connect(inputCtx.destination);
       }
@@ -3824,7 +4167,7 @@ export function InteractiveVoiceCallOverlay({
       return;
     }
 
-    const initialMemory = getCompactMemorySummary();
+    const initialMemory = getDeterministicMemoryPrompt();
     try {
       const opened = await openGeminiLiveSession({
         purpose: "primary",
@@ -3851,16 +4194,15 @@ export function InteractiveVoiceCallOverlay({
       activeSessionIndexRef.current = 1;
       activeSessionStartedAtRef.current = Date.now();
       sessionTurnCountRef.current = 0;
+      micLockedRef.current = false;
       setLiveError("");
       setFsm("LISTENING");
 
       console.log(
-        `[VOICE S#1] Connected (voice: ${opened.voiceName}, tools: ON, search: ${
-          searchEnabledRef.current ? "ON" : "OFF"
-        })`
+        `[VOICE S#1] Connected (voice: ${opened.voiceName}, tools: ALL 4 AUTO)`
       );
 
-      // Module 1 age-based background pre-warming timer (pre-warm standby if session reaches 55s age)
+      // Age-based background pre-warming timer (pre-warm standby if session reaches 120s age)
       clearPrewarmInterval();
       prewarmIntervalRef.current = setInterval(() => {
         if (
@@ -3904,7 +4246,7 @@ export function InteractiveVoiceCallOverlay({
     attachMicCapturePipeline,
     clearPrewarmInterval,
     disconnectAllVoiceSessions,
-    getCompactMemorySummary,
+    getDeterministicMemoryPrompt,
     isOpen,
     openGeminiLiveSession,
     setFsm,
@@ -3952,22 +4294,42 @@ export function InteractiveVoiceCallOverlay({
 
     window.__testVoiceTools = () => {
       const sampleTable: FormulaTableArtifact = {
-        title: "Moisturizer Barrier Gel-Cream Kulit Sensitif",
-        subtitle: "Target pH 5.2–5.6 · Tekstur ringan cepat meresap · Bebas parfum",
-        columns: ["Fase", "Bahan", "Persentase (%)", "Fungsi"],
+        title: "Moisturizer Barrier Gel-Cream Kulit Sensitif (Butylene Glycol & Alpha Arbutin)",
+        subtitle: "Target kulit sensitif & kusam · Bebas parfum & alkohol · Validasi total 100.00%",
+        tableType: "formulation",
+        columns: FORMULATION_REQUIRED_COLUMNS,
         rows: [
-          ["A (Air)", "Aqua (Deionized Water)", "76.2%", "Pelarut utama"],
-          ["A (Air)", "Glycerin", "5.0%", "Humektan pengikat air"],
-          ["A (Air)", "Panthenol (Pro-Vitamin B5)", "2.0%", "Menenangkan & hidrasi"],
-          ["B (Emulsi)", "Cetearyl Olivate & Sorbitan Olivate", "4.0%", "Emulsifier lembut bebas PEG"],
-          ["B (Minyak)", "Squalane (Plant-Derived)", "6.0%", "Emolien ringan non-komedogenik"],
-          ["C (Aktif)", "Ceramide NP Complex", "1.0%", "Memperkuat skin barrier"],
-          ["C (Aktif)", "Niacinamide", "3.0%", "Cerahkan & jaga elastisitas"],
-          ["C (Stabil)", "Phenoxyethanol & Ethylhexylglycerin", "0.8%", "Pengawet spektrum luas BPOM"],
-          ["C (Tekstur)", "Sodium Polyacrylate", "2.0%", "Gel-cream stabilizer"],
+          ["A (Air)", "Deionized Water (Aqua)", "73.15%", "Pelarut utama (ad 100%)", "Gunakan air demineral konduktivitas < 5 µS/cm"],
+          ["A (Air)", "Butylene Glycol", "5.00%", "Humektan ringan & peningkat penetrasi", "Bebas rasa lengket, aman BPOM 1–10%"],
+          ["A (Air)", "Glycerin (Plant-Derived)", "3.00%", "Humektan pengikat kelembapan", "Halal nabati, sinergis dengan Butylene Glycol"],
+          ["A (Air)", "Disodium EDTA", "0.10%", "Chelating agent pengikat ion logam", "Menjaga stabilitas warna Alpha Arbutin & pengawet"],
+          ["B (Emulsi)", "Cetearyl Olivate & Sorbitan Olivate (Olivem 1000)", "4.00%", "Emulsifier liquid crystal bebas PEG", "Ramah skin barrier, leleh 70–75°C"],
+          ["B (Minyak)", "Squalane (Sugarcane-Derived)", "5.00%", "Emolien biomimetik non-komedogenik", "Halal nabati, sensori halus cepat meresap"],
+          ["B (Minyak)", "Caprylic/Capric Triglyceride", "3.00%", "Emolien ringan penyeimbang spreadability", "Stabil terhadap oksidasi"],
+          ["C (Aktif)", "Alpha Arbutin", "2.00%", "Pencerah kulit penghambat tirosinase", "Batas aman BPOM ≤ 2%, stabil optimal pH 5.0–6.0"],
+          ["C (Aktif)", "Panthenol (D-Panthenol / Pro-Vitamin B5)", "2.00%", "Menenangkan kemerahan & hidrasi", "Tambahkan pada suhu < 40°C"],
+          ["C (Barrier)", "Ceramide NP Complex", "1.00%", "Memperbaiki lipid skin barrier", "Dispersikan merata di fase pendinginan"],
+          ["C (Tekstur)", "Sodium Polyacrylate", "0.80%", "Gel-cream rheology modifier", "Mencegah pemisahan emulsi di suhu tropis"],
+          ["C (Pengawet)", "Phenoxyethanol & Ethylhexylglycerin", "0.85%", "Pengawet spektrum luas BPOM", "Batas Phenoxyethanol BPOM ≤ 1.0%, efektif pH 4–8"],
+          ["C (pH)", "Citric Acid (10% Aq. Solution)", "0.10%", "pH adjuster", "Sesuaikan perlahan hingga pH akhir 5.3–5.5"],
+        ],
+        totalPercentage: "100.00%",
+        specs: {
+          targetPh: "5.2 – 5.6 (ideal untuk stabilitas Alpha Arbutin & skin barrier)",
+          texture: "Gel-cream ringan warna putih susu, cepat meresap tanpa residu berminyak",
+          stabilityNote: "Uji sentrifugasi 3000 rpm 30 menit & siklus suhu 4°C/45°C; lindungi dari cahaya langsung untuk mencegah oksidasi Alpha Arbutin.",
+          bpomHalalNote: "Alpha Arbutin 2.0% & Phenoxyethanol < 1.0% sesuai PerBPOM No. 17 Tahun 2022; seluruh emolien & humektan bersumber nabati Halal-friendly.",
+        },
+        procedure: [
+          "Timbang seluruh bahan Fase A (Aqua, Butylene Glycol, Glycerin, Disodium EDTA) dalam beaker utama, aduk homogen lalu panaskan hingga 70–75°C.",
+          "Timbang Fase B (Olivem 1000, Squalane, Caprylic/Capric Triglyceride) di wadah terpisah, panaskan hingga 70–75°C sampai seluruh emulsifier meleleh sempurna.",
+          "Tuang Fase B ke dalam Fase A perlahan sambil dihomogenisasi (1500–2500 rpm) selama 5–8 menit hingga terbentuk emulsi putih halus.",
+          "Mulai pendinginan sambil diaduk perlahan (sweep mixing) hingga suhu turun di bawah 40°C untuk mencegah aerasi berlebih.",
+          "Larutkan Alpha Arbutin & Panthenol dalam sebagian kecil air Fase A (suhu ruang), masukkan bersama Ceramide NP, Sodium Polyacrylate, dan pengawet pada suhu < 40°C lalu homogenkan kembali.",
+          "Ukur pH pada suhu 25°C dan sesuaikan dengan larutan Citric Acid 10% hingga mencapai pH 5.2–5.6, lalu lakukan uji viskositas dan isi ke kemasan kedap udara.",
         ],
         notes:
-          "Panaskan Fase A dan B terpisah pada 70°C, homogenisasi perlahan, dinginkan hingga <40°C sebelum memasukkan Fase C. Sesuaikan pH akhir ke 5.2–5.6.",
+          "Formula ini bebas parfum, bebas alkohol denat, dan bebas essential oil sehingga aman untuk uji tempel kulit sensitif.",
       };
 
       latestFormulaTableRef.current = sampleTable;
@@ -3982,7 +4344,7 @@ export function InteractiveVoiceCallOverlay({
       onCreateGoogleDocRef.current?.(sampleDoc);
 
       console.log(
-        "[VOICE SELF-TEST] Rendered FormulaTableCard & GoogleDocCard dry-run in chat room."
+        "[VOICE SELF-TEST] Rendered Detailed 100.00% FormulaTableCard & GoogleDocCard dry-run in chat room."
       );
       return { tableCreated: true, googleDocCreated: true };
     };
@@ -4031,16 +4393,6 @@ export function InteractiveVoiceCallOverlay({
     if (nextVoice === selectedVoice) return;
     selectedVoiceRef.current = nextVoice;
     setSelectedVoice(nextVoice);
-    if (callActiveRef.current) {
-      disconnectAllVoiceSessions({ nextFsm: "CONNECTING" });
-      void startLiveSessionRef.current();
-    }
-  };
-
-  const handleToggleSearch = () => {
-    const next = !searchEnabled;
-    searchEnabledRef.current = next;
-    setSearchEnabled(next);
     if (callActiveRef.current) {
       disconnectAllVoiceSessions({ nextFsm: "CONNECTING" });
       void startLiveSessionRef.current();
@@ -4112,7 +4464,6 @@ export function InteractiveVoiceCallOverlay({
       aria-label="Mode Suara Gemini Live Formylab"
       data-live-status={legacyStatusAttr}
       data-live-fsm={fsmState}
-      data-live-search={searchEnabled ? "on" : "off"}
     >
       {/* Compact Frameless Audio-Reactive 3D Particle Sphere floating above composer */}
       <button
@@ -4131,7 +4482,7 @@ export function InteractiveVoiceCallOverlay({
         />
       </button>
 
-      {/* Compact Live Connection Status + Voice Switcher (Aoede / Zephyr / Kore / Puck) + Google Search Toggle */}
+      {/* Clean Unified Control Bar: Status Indicator + 4 Voice Chips ONLY (all 4 skills active automatically) */}
       <div className="pointer-events-auto flex items-center gap-1.5 flex-wrap justify-center">
         <div
           role="status"
@@ -4195,26 +4546,6 @@ export function InteractiveVoiceCallOverlay({
             );
           })}
         </div>
-
-        {/* Quick Google Search Toggle Chip (Default OFF for minimum pure-voice latency) */}
-        <button
-          type="button"
-          onClick={handleToggleSearch}
-          aria-pressed={searchEnabled}
-          title={
-            searchEnabled
-              ? "Google Search aktif untuk fakta/berita terkini (klik untuk matikan)"
-              : "Aktifkan Google Search di sesi suara (default mati agar respons tercepat)"
-          }
-          className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10.5px] font-medium backdrop-blur-md border transition-colors cursor-pointer whitespace-nowrap ${
-            searchEnabled
-              ? "bg-[#0E807E] text-white border-[#0E807E]"
-              : "bg-white/88 text-[#2E524C] border-[#0B2B26]/12 hover:text-[#0B2B26] hover:border-[#0B2B26]/25"
-          }`}
-        >
-          <Globe className="w-3 h-3 shrink-0" aria-hidden="true" />
-          <span>Search</span>
-        </button>
       </div>
 
       {/* Explicit Visible Error Banner (NEVER silently falls back to robotic TTS or REST) */}

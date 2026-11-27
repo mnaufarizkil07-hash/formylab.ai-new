@@ -66,7 +66,10 @@ interface LiveVoiceCallModalProps {
     usedGoogleSearch: boolean;
   }) => void;
   onLiveWebSources?: (turnId: string, sources: WebSourceCitation[]) => void;
-  onCreateFormulaTable?: (table: FormulaTableArtifact) => void;
+  onCreateFormulaTable?: (
+    table: FormulaTableArtifact,
+    replaceMessageId?: string
+  ) => void;
   onCreateChatNote?: (note: ChatNoteArtifact) => void;
   onCreateGoogleDoc?: (doc: GoogleDocArtifact) => void;
 }

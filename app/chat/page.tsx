@@ -1080,21 +1080,42 @@ export default function ChatPage() {
   );
 
   const handleCreateFormulaTable = useCallback(
-    (table: FormulaTableArtifact) => {
+    (table: FormulaTableArtifact, replaceMessageId?: string) => {
       const normalized = normalizeFormulaTableArtifact(table);
       if (!normalized) return;
       const targetId = activeSessionIdRef.current;
       const modelBadge = selectedModelRef.current;
+      const msgId = replaceMessageId || normalized.id || generateUniqueId("ftable");
+      const encoded = encodeFormulaTableMessage({ ...normalized, id: msgId });
 
       setSessions((prev) => {
         const next = prev.map((sess) => {
           if (sess.id !== targetId) return sess;
+          const exists = sess.messages.some((m) => m.id === msgId);
+          if (exists) {
+            return {
+              ...sess,
+              messages: sess.messages.map((m) =>
+                m.id === msgId
+                  ? {
+                      ...m,
+                      content: encoded,
+                      timestamp: normalized.isLoading
+                        ? "Menyusun Tabel..."
+                        : "Tabel Formula",
+                    }
+                  : m
+              ),
+            };
+          }
           const tableMsg: ChatMessage = {
-            id: generateUniqueId("ftable"),
+            id: msgId,
             role: "assistant",
-            content: encodeFormulaTableMessage(normalized),
+            content: encoded,
             modelBadge,
-            timestamp: "Tabel Formula",
+            timestamp: normalized.isLoading
+              ? "Menyusun Tabel..."
+              : "Tabel Formula",
           };
           return {
             ...sess,
