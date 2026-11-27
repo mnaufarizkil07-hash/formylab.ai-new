@@ -1,4 +1,12 @@
-import { Type, type FunctionDeclaration } from "@google/genai";
+import {
+  ActivityHandling,
+  EndSensitivity,
+  Modality,
+  StartSensitivity,
+  Type,
+  type FunctionDeclaration,
+  type Tool,
+} from "@google/genai";
 import {
   type FormulaTableArtifact,
   formatFormulaTableForHistoryContext,
@@ -10,6 +18,12 @@ import {
 } from "./chatNoteUtils";
 
 export type LiveVoiceName = "Aoede" | "Zephyr" | "Kore" | "Puck";
+
+export const LIVE_NATIVE_AUDIO_MODELS = [
+  "gemini-2.5-flash-native-audio-preview-12-2025",
+  "gemini-2.5-flash-native-audio-preview-09-2025",
+  "gemini-3.8-live",
+] as const;
 
 export type LiveVoiceFsmState =
   | "IDLE"
@@ -52,29 +66,38 @@ export const LIVE_FSM_STATUS_LABELS: Record<LiveVoiceFsmState, string> = {
   ERROR: "Koneksi Live Terputus",
 };
 
-// Audio capture, adaptive soft attenuator & playback ring buffer constants
+// Audio capture, continuous adaptive noise gate (60ms onset + 160ms pre-roll + 600ms hang) & playback ring buffer constants
 export const LIVE_INPUT_TARGET_SAMPLE_RATE = 16000;
 export const LIVE_INPUT_CHUNK_SAMPLES = 320; // exact 20ms @ 16kHz
 export const LIVE_HIGHPASS_CUTOFF_HZ = 70;
 export const LIVE_HIGHPASS_Q = 0.7;
 export const LIVE_INPUT_NOISE_CALIBRATION_MS = 300;
+export const LIVE_INPUT_NOISE_FLOOR_INITIAL = 0.008;
+export const LIVE_INPUT_NOISE_FLOOR_MIN = 0.004;
+export const LIVE_INPUT_NOISE_FLOOR_MAX = 0.022;
+export const LIVE_INPUT_NOISE_MULTIPLIER = 2.8;
+export const LIVE_INPUT_MIN_SPEECH_RMS = 0.028;
+export const LIVE_INPUT_ONSET_FRAMES = 3; // 3 consecutive 20ms frames = 60ms onset confirmation
 export const LIVE_INPUT_PREROLL_MS = 160; // 8 frames @ 20ms = 2560 samples @ 16kHz
-export const LIVE_INPUT_HANG_TIME_MS = 650;
-export const LIVE_INPUT_QUIET_ATTENUATION = 0.08;
-export const LIVE_INPUT_MIN_SPEECH_RMS = 0.008;
-export const LIVE_INPUT_NOISE_MULTIPLIER = 1.8;
+export const LIVE_INPUT_HANG_TIME_MS = 600;
+export const LIVE_INPUT_QUIET_ATTENUATION = 0.012;
 export const LIVE_INPUT_RMS_REPORT_INTERVAL_MS = 60;
 
 export const LIVE_PLAYBACK_SAMPLE_RATE = 24000;
-export const LIVE_PLAYBACK_PREBUFFER_MS = 45;
-export const LIVE_PLAYBACK_PREBUFFER_SAMPLES = 1080; // exact 45ms @ 24kHz
+export const LIVE_PLAYBACK_PREBUFFER_MS = 85;
+export const LIVE_PLAYBACK_PREBUFFER_SAMPLES = 2040; // exact 85ms @ 24kHz
+export const LIVE_PLAYBACK_UNDERRUN_BUMP_MS = 120;
+export const LIVE_PLAYBACK_MAX_PREBUFFER_MS = 140;
+export const LIVE_PLAYBACK_UNDERRUN_FADEOUT_MS = 3;
 export const LIVE_PLAYBACK_RING_SECONDS = 30;
 export const LIVE_PLAYBACK_FADE_IN_MS = 3;
 export const LIVE_PLAYBACK_FADE_OUT_MS = 5;
 
-// Echo guard, watchdogs, memory & rotation constants
+// Echo guard, mutex settle, dedup, watchdogs, memory & rotation constants
 export const LIVE_TRANSCRIPT_THROTTLE_MS = 80;
-export const LIVE_ECHO_GUARD_TAIL_MS = 150;
+export const LIVE_ECHO_GUARD_TAIL_MS = 200;
+export const LIVE_VOICE_SWITCH_SETTLE_MS = 80;
+export const LIVE_TABLE_DEDUP_WINDOW_MS = 6_000;
 export const LIVE_SPEECH_QUIET_CONFIRM_MS = 180;
 export const LIVE_STANDBY_PREWARM_TURN = 7;
 export const LIVE_HOTSWAP_TARGET_TURN = 8;
@@ -157,6 +180,62 @@ export function hasNonLatinScript(raw: string): boolean {
 export function sanitizeLiveTranscriptText(raw: string): string {
   if (!raw) return "";
   return raw.replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Returns true ONLY if an AI transcript contains actual letters/digits after stripping
+ * whitespace, dots, ellipsis, dashes, and punctuation — preventing empty `"..."` AI bubbles.
+ */
+export function hasMeaningfulAssistantText(raw: string): boolean {
+  const clean = sanitizeLiveTranscriptText(raw);
+  if (!clean) return false;
+  return clean.replace(/[\s.,!?;:\-–—…]+/g, "").length > 0;
+}
+
+export interface FormulaTableDedupEntry {
+  topic: string;
+  tableType: string;
+  atMs: number;
+}
+
+/**
+ * 6-second deduplication + in-flight guard for `create_formula_table` tool calls.
+ * Prevents duplicate FormulaTableCard renders when Gemini accidentally emits two back-to-back
+ * table calls for the same topic.
+ */
+export function isDuplicateFormulaTableRequest(
+  prev: FormulaTableDedupEntry | null,
+  next: { topic: string; tableType: string; nowMs: number },
+  inFlight: boolean,
+  windowMs = LIVE_TABLE_DEDUP_WINDOW_MS
+): boolean {
+  if (inFlight) return true;
+  if (!prev) return false;
+  if (next.nowMs - prev.atMs >= windowMs) return false;
+  if (prev.tableType !== next.tableType) return false;
+
+  const norm = (s: string) =>
+    (s || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  const a = norm(prev.topic);
+  const b = norm(next.topic);
+  if (!a || !b || a === b || a.includes(b) || b.includes(a)) {
+    return true;
+  }
+
+  const tokensA = new Set(a.split(" ").filter((t) => t.length >= 2));
+  const tokensB = new Set(b.split(" ").filter((t) => t.length >= 2));
+  if (tokensA.size === 0 || tokensB.size === 0) return true;
+
+  let overlap = 0;
+  tokensA.forEach((tok) => {
+    if (tokensB.has(tok)) overlap += 1;
+  });
+  const smaller = Math.min(tokensA.size, tokensB.size);
+  return overlap / smaller >= 0.5;
 }
 
 /**
@@ -799,6 +878,143 @@ export function buildLiveVoiceSystemInstruction(
   return lines.join("\n");
 }
 
+const VALID_LIVE_VOICES = new Set<LiveVoiceName>([
+  "Aoede",
+  "Zephyr",
+  "Kore",
+  "Puck",
+]);
+
+export function normalizeLiveVoiceName(raw?: string | null): LiveVoiceName {
+  if (raw && VALID_LIVE_VOICES.has(raw as LiveVoiceName)) {
+    return raw as LiveVoiceName;
+  }
+  return "Aoede";
+}
+
+export interface UnifiedLiveVoiceConfig {
+  voiceName: LiveVoiceName;
+  models: readonly string[];
+  model: string;
+  responseModalities: Modality[];
+  speechConfig: {
+    voiceConfig: {
+      prebuiltVoiceConfig: {
+        voiceName: LiveVoiceName;
+      };
+    };
+  };
+  systemInstruction: string;
+  tools: Tool[];
+  thinkingConfig: LiveThinkingConfigValue | undefined;
+  sdkRealtimeInputConfig:
+    | {
+        automaticActivityDetection: {
+          disabled: boolean;
+          startOfSpeechSensitivity: StartSensitivity;
+          endOfSpeechSensitivity: EndSensitivity;
+          prefixPaddingMs: number;
+          silenceDurationMs: number;
+        };
+        activityHandling: ActivityHandling;
+      }
+    | undefined;
+  wsRealtimeInputConfig:
+    | {
+        automaticActivityDetection: {
+          disabled: boolean;
+          startOfSpeechSensitivity: "START_SENSITIVITY_HIGH";
+          endOfSpeechSensitivity: "END_SENSITIVITY_HIGH";
+          prefixPaddingMs: number;
+          silenceDurationMs: number;
+        };
+        activityHandling: "START_OF_ACTIVITY_INTERRUPTS";
+      }
+    | undefined;
+  playbackPrebufferMs: number;
+  echoGuardTailMs: number;
+}
+
+/**
+ * Single Unified Live Voice Configuration Factory (`createLiveVoiceConfig`):
+ * Guarantees ALL 4 voice chips (`Aoede`, `Zephyr`, `Kore`, `Puck`) share 100% IDENTICAL
+ * model list, High-Sensitivity Server VAD, 85ms Adaptive Playback RingBuffer, dynamic-date
+ * systemInstruction, model-aware anti-thinking config, and ALL 4 auto tools with ZERO
+ * voice-specific branches.
+ */
+export function createLiveVoiceConfig(
+  voiceName: LiveVoiceName,
+  options?: {
+    memorySummary?: string;
+    now?: Date;
+    modelId?: string;
+    disableThinkingConfig?: boolean;
+    disableCustomVad?: boolean;
+  }
+): UnifiedLiveVoiceConfig {
+  const normalizedVoice = normalizeLiveVoiceName(voiceName);
+  const model = options?.modelId || LIVE_NATIVE_AUDIO_MODELS[0];
+  const systemInstruction = buildLiveVoiceSystemInstruction(
+    options?.memorySummary,
+    options?.now
+  );
+  const tools: Tool[] = [
+    {
+      functionDeclarations: buildLiveVoiceFunctionDeclarations(),
+    },
+  ];
+  const thinkingConfig = options?.disableThinkingConfig
+    ? undefined
+    : getLiveThinkingConfigForModel(model);
+
+  const sdkRealtimeInputConfig = options?.disableCustomVad
+    ? undefined
+    : {
+        automaticActivityDetection: {
+          disabled: false,
+          startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
+          endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_HIGH,
+          prefixPaddingMs: 60,
+          silenceDurationMs: 180,
+        },
+        activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
+      };
+
+  const wsRealtimeInputConfig = options?.disableCustomVad
+    ? undefined
+    : {
+        automaticActivityDetection: {
+          disabled: false,
+          startOfSpeechSensitivity: "START_SENSITIVITY_HIGH" as const,
+          endOfSpeechSensitivity: "END_SENSITIVITY_HIGH" as const,
+          prefixPaddingMs: 60,
+          silenceDurationMs: 180,
+        },
+        activityHandling: "START_OF_ACTIVITY_INTERRUPTS" as const,
+      };
+
+  return {
+    voiceName: normalizedVoice,
+    models: LIVE_NATIVE_AUDIO_MODELS,
+    model,
+    responseModalities: [Modality.AUDIO],
+    speechConfig: {
+      voiceConfig: {
+        prebuiltVoiceConfig: {
+          voiceName: normalizedVoice,
+        },
+      },
+    },
+    systemInstruction,
+    tools,
+    thinkingConfig,
+    sdkRealtimeInputConfig,
+    wsRealtimeInputConfig,
+    playbackPrebufferMs: LIVE_PLAYBACK_PREBUFFER_MS,
+    echoGuardTailMs: LIVE_ECHO_GUARD_TAIL_MS,
+  };
+}
+
 /**
  * Zero-latency (0 ms) local keyword classifier for `PILAR AI AKTIF` badges
  * below voice turns — never makes a second LLM call.
@@ -857,8 +1073,9 @@ export function summarizeVoiceMetrics(
 /**
  * Pure TypeScript reference implementation of our 24kHz Circular Ring Buffer Playback
  * engine (mirrors `FormylabLivePcmPlaybackProcessor` inside the AudioWorklet) so we can
- * deterministically unit-test 120ms pre-buffering, short-turn `turnComplete` flush,
- * 3ms fade-in, 5ms fade-out barge-in stop, and exact `bufferDrained` signaling.
+ * deterministically unit-test 85ms initial pre-buffering, Adaptive Underrun Cushion
+ * (3ms micro fade-out + auto bump 85ms -> 120ms, max 140ms), short-turn `turnComplete`
+ * flush, 3ms fade-in, 5ms fade-out barge-in stop, and exact `bufferDrained` signaling.
  */
 export interface PlaybackRingBufferEngine {
   push: (samples: Float32Array) => void;
@@ -867,21 +1084,25 @@ export interface PlaybackRingBufferEngine {
   pullBlock: (frameSize?: number) => {
     output: Float32Array;
     drainedEvent: boolean;
+    underrunEvent: { preBufferMs: number } | null;
     playing: boolean;
     bufferedSamples: number;
+    preBufferMs: number;
   };
   getBufferedSamples: () => number;
+  getPreBufferMs: () => number;
 }
 
 export function createPlaybackRingBufferEngine(
   sampleRate = LIVE_PLAYBACK_SAMPLE_RATE,
-  prebufferMs = LIVE_PLAYBACK_PREBUFFER_MS,
+  initialPrebufferMs = LIVE_PLAYBACK_PREBUFFER_MS,
   capacitySeconds = LIVE_PLAYBACK_RING_SECONDS
 ): PlaybackRingBufferEngine {
   const capacity = Math.max(4096, Math.round(sampleRate * capacitySeconds));
-  const prebufferSamples = Math.max(
+  let currentPreBufferMs = initialPrebufferMs;
+  let prebufferSamples = Math.max(
     128,
-    Math.round((sampleRate * prebufferMs) / 1000)
+    Math.round((sampleRate * currentPreBufferMs) / 1000)
   );
   const fadeInSamples = Math.max(
     1,
@@ -890,6 +1111,10 @@ export function createPlaybackRingBufferEngine(
   const fadeOutSamples = Math.max(
     1,
     Math.round((sampleRate * LIVE_PLAYBACK_FADE_OUT_MS) / 1000)
+  );
+  const underrunFadeSamples = Math.max(
+    1,
+    Math.round((sampleRate * LIVE_PLAYBACK_UNDERRUN_FADEOUT_MS) / 1000)
   );
 
   const ring = new Float32Array(capacity);
@@ -902,6 +1127,9 @@ export function createPlaybackRingBufferEngine(
   let fadeInProgress = 0;
   let fadingOut = false;
   let fadeOutRemaining = 0;
+  let lastOutputSample = 0;
+  let underrunFadeRemaining = 0;
+  let underrunStartSample = 0;
 
   return {
     push(samples: Float32Array) {
@@ -912,7 +1140,6 @@ export function createPlaybackRingBufferEngine(
 
       for (let i = 0; i < samples.length; i++) {
         if (available >= capacity) {
-          // Drop oldest sample if 30s buffer ever overflows
           readPos = (readPos + 1) % capacity;
           available -= 1;
         }
@@ -926,6 +1153,7 @@ export function createPlaybackRingBufferEngine(
       serverTurnComplete = true;
     },
     stopWithFadeOut() {
+      underrunFadeRemaining = 0;
       if (playing && available > 0) {
         fadingOut = true;
         fadeOutRemaining = Math.min(fadeOutSamples, available);
@@ -938,22 +1166,26 @@ export function createPlaybackRingBufferEngine(
         serverTurnComplete = false;
         fadingOut = false;
         fadeOutRemaining = 0;
+        lastOutputSample = 0;
       }
     },
     pullBlock(frameSize = 128) {
       const output = new Float32Array(frameSize);
       let drainedEvent = false;
+      let underrunEvent: { preBufferMs: number } | null = null;
 
       if (fadingOut) {
         for (let i = 0; i < frameSize; i++) {
           if (fadeOutRemaining > 0 && available > 0) {
             const gain = fadeOutRemaining / fadeOutSamples;
             output[i] = ring[readPos] * gain;
+            lastOutputSample = output[i];
             readPos = (readPos + 1) % capacity;
             available -= 1;
             fadeOutRemaining -= 1;
           } else {
             output[i] = 0;
+            lastOutputSample = 0;
           }
         }
         if (fadeOutRemaining <= 0) {
@@ -964,8 +1196,16 @@ export function createPlaybackRingBufferEngine(
           hadAudio = false;
           serverTurnComplete = false;
           fadingOut = false;
+          lastOutputSample = 0;
         }
-        return { output, drainedEvent: false, playing, bufferedSamples: available };
+        return {
+          output,
+          drainedEvent: false,
+          underrunEvent: null,
+          playing,
+          bufferedSamples: available,
+          preBufferMs: currentPreBufferMs,
+        };
       }
 
       if (!playing) {
@@ -975,9 +1215,35 @@ export function createPlaybackRingBufferEngine(
         ) {
           playing = true;
           fadeInProgress = 0;
-        } else if (serverTurnComplete && hadAudio && available === 0) {
-          hadAudio = false;
-          drainedEvent = true;
+          underrunFadeRemaining = 0;
+        } else {
+          // Continue smooth 3ms micro fade-out tail if an underrun just happened
+          if (underrunFadeRemaining > 0) {
+            for (let i = 0; i < frameSize; i++) {
+              if (underrunFadeRemaining > 0) {
+                const gain = underrunFadeRemaining / underrunFadeSamples;
+                output[i] = underrunStartSample * gain;
+                underrunFadeRemaining -= 1;
+              } else {
+                output[i] = 0;
+              }
+            }
+            if (underrunFadeRemaining <= 0) {
+              lastOutputSample = 0;
+            }
+          }
+          if (serverTurnComplete && hadAudio && available === 0) {
+            hadAudio = false;
+            drainedEvent = true;
+          }
+          return {
+            output,
+            drainedEvent,
+            underrunEvent: null,
+            playing,
+            bufferedSamples: available,
+            preBufferMs: currentPreBufferMs,
+          };
         }
       }
 
@@ -992,24 +1258,66 @@ export function createPlaybackRingBufferEngine(
               fadeInProgress += 1;
             }
             output[i] = s;
+            lastOutputSample = s;
           } else {
-            output[i] = 0;
+            // Mid-sentence underrun before turnComplete -> start 3ms micro fade-out (zero click)
+            if (!serverTurnComplete && underrunFadeRemaining === 0 && lastOutputSample !== 0) {
+              underrunStartSample = lastOutputSample;
+              underrunFadeRemaining = underrunFadeSamples;
+            }
+            if (underrunFadeRemaining > 0) {
+              const gain = underrunFadeRemaining / underrunFadeSamples;
+              output[i] = underrunStartSample * gain;
+              underrunFadeRemaining -= 1;
+              if (underrunFadeRemaining <= 0) {
+                lastOutputSample = 0;
+              }
+            } else {
+              output[i] = 0;
+              lastOutputSample = 0;
+            }
           }
         }
 
         if (available === 0) {
           playing = false;
-          if (hadAudio) {
-            hadAudio = false;
-            drainedEvent = true;
+          if (serverTurnComplete) {
+            if (hadAudio) {
+              hadAudio = false;
+              drainedEvent = true;
+            }
+          } else if (hadAudio) {
+            // Adaptive Underrun Cushion: bump preBufferMs 85 -> 120 (max 140)
+            const nextPreBufferMs = Math.min(
+              LIVE_PLAYBACK_MAX_PREBUFFER_MS,
+              currentPreBufferMs < LIVE_PLAYBACK_UNDERRUN_BUMP_MS
+                ? LIVE_PLAYBACK_UNDERRUN_BUMP_MS
+                : currentPreBufferMs + 20
+            );
+            currentPreBufferMs = nextPreBufferMs;
+            prebufferSamples = Math.max(
+              128,
+              Math.round((sampleRate * currentPreBufferMs) / 1000)
+            );
+            underrunEvent = { preBufferMs: currentPreBufferMs };
           }
         }
       }
 
-      return { output, drainedEvent, playing, bufferedSamples: available };
+      return {
+        output,
+        drainedEvent,
+        underrunEvent,
+        playing,
+        bufferedSamples: available,
+        preBufferMs: currentPreBufferMs,
+      };
     },
     getBufferedSamples() {
       return available;
+    },
+    getPreBufferMs() {
+      return currentPreBufferMs;
     },
   };
 }
@@ -1281,11 +1589,21 @@ export function getVoiceMemoryStorageKey(
 }
 
 /**
- * Pure TypeScript Adaptive Soft Attenuator + 160ms Pre-Roll Buffer + 650ms Hang-Time
- * + 60ms RMS Telemetry engine (mirrors `FormylabLivePcmCaptureProcessor` in the input
- * AudioWorkletNode) so quiet room hum is gently attenuated to 0.08x (never hard-muted)
- * while normal speech ("halo") immediately flushes 160ms pre-roll at 1.0x full volume.
+ * Pure TypeScript Continuous Adaptive Noise Gate + 60ms Onset Confirmation (3 frames)
+ * + 160ms Pre-Roll Buffer + 600ms Hang-Time + 60ms RMS Telemetry engine (mirrors
+ * `FormylabLivePcmCaptureProcessor` in the input AudioWorkletNode):
+ * - Continuously adapts `noiseFloor` while closed (`clamp(0.004..0.022)`).
+ * - Speech threshold = `Math.max(noiseFloor * 2.8, 0.028)`.
+ * - Requires 3 consecutive 20ms frames >= threshold (60ms onset confirmation) before
+ *   opening gate to `1.0x` and flushing 160ms pre-roll (eliminating clicks & room hum).
+ * - Attenuates quiet background strongly to `0.012x` so room hum (RMS 0.01–0.02) NEVER
+ *   triggers Server VAD self-talk hallucinations ("What?", "mana?", "apa ya?").
+ * - Emits `gateEvent` strictly on gate transitions (`closed -> open` and `open -> closed`).
  */
+export type AdaptiveGateEvent =
+  | { type: "speechStart"; peakRms: number }
+  | { type: "speechEnd" };
+
 export interface AdaptiveSoftAttenuatorFrameResult {
   packets: Array<{
     pcm: Int16Array;
@@ -1299,6 +1617,7 @@ export interface AdaptiveSoftAttenuatorFrameResult {
     threshold: number;
     speaking: boolean;
   } | null;
+  gateEvent: AdaptiveGateEvent | null;
   gateOpen: boolean;
   noiseFloor: number;
   threshold: number;
@@ -1311,19 +1630,15 @@ export interface AdaptiveSoftAttenuator {
 
 export function createAdaptiveSoftAttenuator(options?: {
   frameDurationMs?: number;
-  calibrationMs?: number;
   preRollMs?: number;
   hangTimeMs?: number;
   quietGain?: number;
   minSpeechRms?: number;
   noiseMultiplier?: number;
+  onsetFrames?: number;
   rmsReportIntervalMs?: number;
 }): AdaptiveSoftAttenuator {
   const frameDurationMs = options?.frameDurationMs ?? 20;
-  const calibrationFrames = Math.max(
-    1,
-    Math.round((options?.calibrationMs ?? LIVE_INPUT_NOISE_CALIBRATION_MS) / frameDurationMs)
-  );
   const preRollMaxFrames = Math.max(
     1,
     Math.round((options?.preRollMs ?? LIVE_INPUT_PREROLL_MS) / frameDurationMs)
@@ -1332,14 +1647,18 @@ export function createAdaptiveSoftAttenuator(options?: {
   const quietGain = options?.quietGain ?? LIVE_INPUT_QUIET_ATTENUATION;
   const minSpeechRms = options?.minSpeechRms ?? LIVE_INPUT_MIN_SPEECH_RMS;
   const noiseMultiplier = options?.noiseMultiplier ?? LIVE_INPUT_NOISE_MULTIPLIER;
+  const onsetRequiredFrames = Math.max(
+    1,
+    options?.onsetFrames ?? LIVE_INPUT_ONSET_FRAMES
+  );
   const rmsReportIntervalMs =
     options?.rmsReportIntervalMs ?? LIVE_INPUT_RMS_REPORT_INTERVAL_MS;
 
-  let calibratedCount = 0;
-  let calibrationSum = 0;
-  let noiseFloor = 0.004;
+  let noiseFloor = LIVE_INPUT_NOISE_FLOOR_INITIAL;
   let gateOpen = false;
   let hangRemainingMs = 0;
+  let onsetCount = 0;
+  let onsetPeakRms = 0;
   let currentGain = quietGain;
   let preRollQueue: Array<{ samples: Float32Array; rawRms: number }> = [];
   let rmsAccumMs = 0;
@@ -1350,10 +1669,11 @@ export function createAdaptiveSoftAttenuator(options?: {
     targetGain: number
   ): Int16Array => {
     const out = new Int16Array(src.length);
-    const step = src.length > 0 ? (targetGain - currentGain) / Math.min(src.length, 48) : 0;
+    const rampLen = Math.min(src.length, 48);
+    const step = rampLen > 0 ? (targetGain - currentGain) / rampLen : 0;
     let g = currentGain;
     for (let i = 0; i < src.length; i++) {
-      if (i < 48) {
+      if (i < rampLen) {
         g += step;
       } else {
         g = targetGain;
@@ -1367,11 +1687,11 @@ export function createAdaptiveSoftAttenuator(options?: {
 
   return {
     reset() {
-      calibratedCount = 0;
-      calibrationSum = 0;
-      noiseFloor = 0.004;
+      noiseFloor = LIVE_INPUT_NOISE_FLOOR_INITIAL;
       gateOpen = false;
       hangRemainingMs = 0;
+      onsetCount = 0;
+      onsetPeakRms = 0;
       currentGain = quietGain;
       preRollQueue = [];
       rmsAccumMs = 0;
@@ -1386,76 +1706,103 @@ export function createAdaptiveSoftAttenuator(options?: {
       const rawRms =
         raw20msFrame.length > 0 ? Math.sqrt(sumSq / raw20msFrame.length) : 0;
 
-      // Auto-calibrate noise floor during first 300ms (15 frames @ 20ms)
-      if (calibratedCount < calibrationFrames) {
-        calibrationSum += Math.min(0.03, rawRms);
-        calibratedCount += 1;
-        noiseFloor = Math.max(
-          0.0015,
-          Math.min(0.025, calibrationSum / calibratedCount)
-        );
-      }
-
       const threshold = Math.max(noiseFloor * noiseMultiplier, minSpeechRms);
       const packets: AdaptiveSoftAttenuatorFrameResult["packets"] = [];
+      let gateEvent: AdaptiveGateEvent | null = null;
 
-      if (rawRms >= threshold) {
-        hangRemainingMs = hangTimeMs;
-        if (!gateOpen) {
-          gateOpen = true;
-          // Flush 160ms pre-roll buffer at full 1.0x volume so word onset ("halo") is 100% preserved
-          for (const buffered of preRollQueue) {
-            packets.push({
-              pcm: encodeWithSmoothGain(buffered.samples, 1.0),
-              rawRms: buffered.rawRms,
-              threshold,
-              isPreRoll: true,
-            });
+      if (gateOpen) {
+        if (rawRms >= threshold) {
+          hangRemainingMs = hangTimeMs;
+          packets.push({
+            pcm: encodeWithSmoothGain(raw20msFrame, 1.0),
+            rawRms,
+            threshold,
+            isPreRoll: false,
+          });
+        } else {
+          // Hold 1.0x full volume during 600ms hang-time so word endings never clip
+          hangRemainingMs -= frameDurationMs;
+          packets.push({
+            pcm: encodeWithSmoothGain(raw20msFrame, 1.0),
+            rawRms,
+            threshold,
+            isPreRoll: false,
+          });
+          if (hangRemainingMs <= 0) {
+            gateOpen = false;
+            hangRemainingMs = 0;
+            onsetCount = 0;
+            onsetPeakRms = 0;
+            gateEvent = { type: "speechEnd" };
           }
-          preRollQueue = [];
-        }
-        packets.push({
-          pcm: encodeWithSmoothGain(raw20msFrame, 1.0),
-          rawRms,
-          threshold,
-          isPreRoll: false,
-        });
-      } else if (gateOpen) {
-        // Hold 1.0x full volume during 650ms hang-time so short words & endings never clip
-        hangRemainingMs -= frameDurationMs;
-        packets.push({
-          pcm: encodeWithSmoothGain(raw20msFrame, 1.0),
-          rawRms,
-          threshold,
-          isPreRoll: false,
-        });
-        if (hangRemainingMs <= 0) {
-          gateOpen = false;
-          hangRemainingMs = 0;
         }
       } else {
-        // Gently adapt noise floor while quiet
-        if (calibratedCount >= calibrationFrames) {
+        if (rawRms >= threshold) {
+          onsetCount += 1;
+          if (rawRms > onsetPeakRms) {
+            onsetPeakRms = rawRms;
+          }
+          if (onsetCount >= onsetRequiredFrames) {
+            // 60ms onset confirmed -> open gate ONCE, flush 160ms pre-roll + live at 1.0x
+            gateOpen = true;
+            hangRemainingMs = hangTimeMs;
+            gateEvent = { type: "speechStart", peakRms: onsetPeakRms };
+            for (const buffered of preRollQueue) {
+              packets.push({
+                pcm: encodeWithSmoothGain(buffered.samples, 1.0),
+                rawRms: buffered.rawRms,
+                threshold,
+                isPreRoll: true,
+              });
+            }
+            preRollQueue = [];
+            packets.push({
+              pcm: encodeWithSmoothGain(raw20msFrame, 1.0),
+              rawRms,
+              threshold,
+              isPreRoll: false,
+            });
+          } else {
+            // Tentative onset frame (1 or 2): keep raw frame in pre-roll & stay strongly attenuated
+            preRollQueue.push({
+              samples: new Float32Array(raw20msFrame),
+              rawRms,
+            });
+            if (preRollQueue.length > preRollMaxFrames) {
+              preRollQueue.shift();
+            }
+            packets.push({
+              pcm: encodeWithSmoothGain(raw20msFrame, quietGain),
+              rawRms,
+              threshold,
+              isPreRoll: false,
+            });
+          }
+        } else {
+          // Quiet background while gate is closed: continuously adapt noiseFloor [0.004..0.022]
+          onsetCount = 0;
+          onsetPeakRms = 0;
           noiseFloor = Math.max(
-            0.0015,
-            Math.min(0.025, noiseFloor * 0.96 + rawRms * 0.04)
+            LIVE_INPUT_NOISE_FLOOR_MIN,
+            Math.min(
+              LIVE_INPUT_NOISE_FLOOR_MAX,
+              noiseFloor * 0.96 + rawRms * 0.04
+            )
           );
+          preRollQueue.push({
+            samples: new Float32Array(raw20msFrame),
+            rawRms,
+          });
+          if (preRollQueue.length > preRollMaxFrames) {
+            preRollQueue.shift();
+          }
+          packets.push({
+            pcm: encodeWithSmoothGain(raw20msFrame, quietGain),
+            rawRms,
+            threshold,
+            isPreRoll: false,
+          });
         }
-        // Store unattenuated frame in 160ms circular pre-roll ring
-        preRollQueue.push({
-          samples: new Float32Array(raw20msFrame),
-          rawRms,
-        });
-        if (preRollQueue.length > preRollMaxFrames) {
-          preRollQueue.shift();
-        }
-        // Softly attenuate background hum to 0.08x (NOT hard mute 0)
-        packets.push({
-          pcm: encodeWithSmoothGain(raw20msFrame, quietGain),
-          rawRms,
-          threshold,
-          isPreRoll: false,
-        });
       }
 
       rmsAccumMs += frameDurationMs;
@@ -1478,6 +1825,7 @@ export function createAdaptiveSoftAttenuator(options?: {
       return {
         packets,
         rmsTelemetry,
+        gateEvent,
         gateOpen,
         noiseFloor,
         threshold,

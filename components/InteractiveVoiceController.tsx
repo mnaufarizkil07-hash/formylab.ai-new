@@ -13,7 +13,6 @@ import {
 } from "lucide-react";
 import {
   GoogleGenAI,
-  Modality,
   type LiveConnectConfig,
   type LiveServerMessage,
   type Session,
@@ -40,6 +39,7 @@ import {
   isGoogleDriveConnected,
 } from "../lib/googleDocsClient";
 import {
+  FormulaTableDedupEntry,
   LIVE_ECHO_GUARD_TAIL_MS,
   LIVE_FSM_STATUS_LABELS,
   LIVE_HIGHPASS_CUTOFF_HZ,
@@ -48,8 +48,11 @@ import {
   LIVE_INPUT_CHUNK_SAMPLES,
   LIVE_INPUT_HANG_TIME_MS,
   LIVE_INPUT_MIN_SPEECH_RMS,
-  LIVE_INPUT_NOISE_CALIBRATION_MS,
+  LIVE_INPUT_NOISE_FLOOR_INITIAL,
+  LIVE_INPUT_NOISE_FLOOR_MAX,
+  LIVE_INPUT_NOISE_FLOOR_MIN,
   LIVE_INPUT_NOISE_MULTIPLIER,
+  LIVE_INPUT_ONSET_FRAMES,
   LIVE_INPUT_PREROLL_MS,
   LIVE_INPUT_QUIET_ATTENUATION,
   LIVE_INPUT_RMS_REPORT_INTERVAL_MS,
@@ -57,9 +60,12 @@ import {
   LIVE_MAX_AUTO_RECONNECTS,
   LIVE_PLAYBACK_FADE_IN_MS,
   LIVE_PLAYBACK_FADE_OUT_MS,
+  LIVE_PLAYBACK_MAX_PREBUFFER_MS,
   LIVE_PLAYBACK_PREBUFFER_MS,
   LIVE_PLAYBACK_RING_SECONDS,
   LIVE_PLAYBACK_SAMPLE_RATE,
+  LIVE_PLAYBACK_UNDERRUN_BUMP_MS,
+  LIVE_PLAYBACK_UNDERRUN_FADEOUT_MS,
   LIVE_STANDBY_MAX_AGE_MS,
   LIVE_STANDBY_PREWARM_TURN,
   LIVE_TOOL_RECOVERY_MS,
@@ -67,29 +73,28 @@ import {
   LIVE_TRANSCRIPT_THROTTLE_MS,
   LIVE_TURN_WATCHDOG_MS,
   LIVE_VOICE_OPTIONS,
+  LIVE_VOICE_SWITCH_SETTLE_MS,
   LiveMemoryMessage,
   LiveThinkingConfigValue,
   LiveVoiceFsmState,
   LiveVoiceName,
-  SpeechEndProfilerState,
   VoiceTurnMetric,
   appendTranscriptFragment,
   base64PcmToFloat32,
   buildDeterministicMemoryPrompt,
   classifyLiveVoicePillars,
-  computeInt16PcmRms,
   createAdaptiveSoftAttenuator,
   createContinuousResampler,
-  createSpeechEndProfilerState,
+  createLiveVoiceConfig,
   extractLatestFormulaTableFromMessages,
   extractLocalFactSummaryFallback,
   formatLiveConnectionError,
-  getLiveThinkingConfigForModel,
   getVoiceMemoryStorageKey,
   hasGoogleSearchGrounding,
+  hasMeaningfulAssistantText,
   int16PcmToBase64,
+  isDuplicateFormulaTableRequest,
   isNonLatinHallucinationFragment,
-  observeMicRmsForProfiler,
   parsePcmSampleRate,
   recallChatHistoryLocal,
   sanitizeLiveTranscriptText,
@@ -817,13 +822,14 @@ interface LiveTokenApiResponse {
 const LIVE_FALLBACK_PREBUFFER_LEAD_SEC = LIVE_PLAYBACK_PREBUFFER_MS / 1000;
 
 /**
- * Smooth 24kHz Circular Ring Buffer Playback AudioWorklet (inline Blob URL, 100% Vercel-safe):
+ * Smooth 24kHz Circular Ring Buffer Playback AudioWorklet with Adaptive Underrun Cushion:
  * - Capacity: ~30 seconds of audio (720,000 Float32 samples @ 24kHz).
- * - Jitter Pre-Buffer: 120ms (2,880 samples @ 24kHz) before starting speaker output
- *   (or plays immediately if server sends `turnComplete` first for ultra-short answers).
- * - Micro fade-in (3ms) when starting speech and fade-out (5ms) on barge-in/stop (zero pops/clicks).
- * - Automatically resamples cleanly if the browser's output AudioContext runs at 48kHz/44.1kHz.
- * - Posts `{ type: "bufferDrained" }` ONLY when ring buffer empties after having received audio.
+ * - Initial Jitter Pre-Buffer: 85ms (2,040 samples @ 24kHz) before starting speaker output.
+ * - Adaptive Underrun Cushion: if buffer empties mid-sentence BEFORE `turnComplete`, applies
+ *   a 3ms micro fade-out (zero audible click/pop) and automatically bumps `preBufferMs`
+ *   from 85ms -> 120ms (max 140ms) for the rest of the session.
+ * - Micro fade-in (3ms) when starting/resuming and fade-out (5ms) on barge-in/stop.
+ * - Posts `{ type: "bufferDrained" }` ONLY when `turnComplete` is set and ring buffer empties.
  */
 const PCM_PLAYBACK_RINGBUFFER_WORKLET_CODE = `
 class FormylabLivePcmPlaybackProcessor extends AudioWorkletProcessor {
@@ -834,15 +840,22 @@ class FormylabLivePcmPlaybackProcessor extends AudioWorkletProcessor {
     this._readPos = 0;
     this._writePos = 0;
     this._available = 0;
-    this._prebufferSamples = Math.max(128, Math.round(sampleRate * (${LIVE_PLAYBACK_PREBUFFER_MS} / 1000)));
+    this._preBufferMs = ${LIVE_PLAYBACK_PREBUFFER_MS};
+    this._prebufferSamples = Math.max(128, Math.round(sampleRate * (this._preBufferMs / 1000)));
+    this._underrunBumpMs = ${LIVE_PLAYBACK_UNDERRUN_BUMP_MS};
+    this._maxPreBufferMs = ${LIVE_PLAYBACK_MAX_PREBUFFER_MS};
     this._fadeInSamples = Math.max(1, Math.round(sampleRate * (${LIVE_PLAYBACK_FADE_IN_MS} / 1000)));
     this._fadeOutSamples = Math.max(1, Math.round(sampleRate * (${LIVE_PLAYBACK_FADE_OUT_MS} / 1000)));
+    this._underrunFadeSamples = Math.max(1, Math.round(sampleRate * (${LIVE_PLAYBACK_UNDERRUN_FADEOUT_MS} / 1000)));
     this._playing = false;
     this._hadAudio = false;
     this._serverTurnComplete = false;
     this._fadeInProgress = 0;
     this._fadingOut = false;
     this._fadeOutRemaining = 0;
+    this._lastOutputSample = 0;
+    this._underrunFadeRemaining = 0;
+    this._underrunStartSample = 0;
 
     this.port.onmessage = (event) => {
       const msg = event.data;
@@ -870,6 +883,7 @@ class FormylabLivePcmPlaybackProcessor extends AudioWorkletProcessor {
       }
 
       if (msg.type === "stop") {
+        this._underrunFadeRemaining = 0;
         if (this._playing && this._available > 0) {
           this._fadingOut = true;
           this._fadeOutRemaining = Math.min(this._fadeOutSamples, this._available);
@@ -890,6 +904,9 @@ class FormylabLivePcmPlaybackProcessor extends AudioWorkletProcessor {
     this._fadeInProgress = 0;
     this._fadingOut = false;
     this._fadeOutRemaining = 0;
+    this._lastOutputSample = 0;
+    this._underrunFadeRemaining = 0;
+    this._underrunStartSample = 0;
   }
 
   _writeOne(val) {
@@ -934,11 +951,13 @@ class FormylabLivePcmPlaybackProcessor extends AudioWorkletProcessor {
         if (this._fadeOutRemaining > 0 && this._available > 0) {
           const gain = this._fadeOutRemaining / this._fadeOutSamples;
           ch[i] = this._ring[this._readPos] * gain;
+          this._lastOutputSample = ch[i];
           this._readPos = (this._readPos + 1) % this._capacity;
           this._available -= 1;
           this._fadeOutRemaining -= 1;
         } else {
           ch[i] = 0;
+          this._lastOutputSample = 0;
         }
       }
       if (this._fadeOutRemaining <= 0) {
@@ -954,8 +973,24 @@ class FormylabLivePcmPlaybackProcessor extends AudioWorkletProcessor {
       ) {
         this._playing = true;
         this._fadeInProgress = 0;
+        this._underrunFadeRemaining = 0;
       } else {
-        ch.fill(0);
+        if (this._underrunFadeRemaining > 0) {
+          for (let i = 0; i < frames; i++) {
+            if (this._underrunFadeRemaining > 0) {
+              const gain = this._underrunFadeRemaining / this._underrunFadeSamples;
+              ch[i] = this._underrunStartSample * gain;
+              this._underrunFadeRemaining -= 1;
+            } else {
+              ch[i] = 0;
+            }
+          }
+          if (this._underrunFadeRemaining <= 0) {
+            this._lastOutputSample = 0;
+          }
+        } else {
+          ch.fill(0);
+        }
         if (this._serverTurnComplete && this._hadAudio && this._available === 0) {
           this._hadAudio = false;
           this.port.postMessage({ type: "bufferDrained" });
@@ -974,16 +1009,45 @@ class FormylabLivePcmPlaybackProcessor extends AudioWorkletProcessor {
           this._fadeInProgress += 1;
         }
         ch[i] = s;
+        this._lastOutputSample = s;
       } else {
-        ch[i] = 0;
+        // Mid-sentence jitter underrun before turnComplete -> 3ms micro fade-out (zero click)
+        if (!this._serverTurnComplete && this._underrunFadeRemaining === 0 && this._lastOutputSample !== 0) {
+          this._underrunStartSample = this._lastOutputSample;
+          this._underrunFadeRemaining = this._underrunFadeSamples;
+        }
+        if (this._underrunFadeRemaining > 0) {
+          const gain = this._underrunFadeRemaining / this._underrunFadeSamples;
+          ch[i] = this._underrunStartSample * gain;
+          this._underrunFadeRemaining -= 1;
+          if (this._underrunFadeRemaining <= 0) {
+            this._lastOutputSample = 0;
+          }
+        } else {
+          ch[i] = 0;
+          this._lastOutputSample = 0;
+        }
       }
     }
 
     if (this._available === 0) {
       this._playing = false;
-      if (this._hadAudio) {
-        this._hadAudio = false;
-        this.port.postMessage({ type: "bufferDrained" });
+      if (this._serverTurnComplete) {
+        if (this._hadAudio) {
+          this._hadAudio = false;
+          this.port.postMessage({ type: "bufferDrained" });
+        }
+      } else if (this._hadAudio) {
+        // Adaptive Underrun Cushion: bump preBufferMs 85ms -> 120ms (max 140ms)
+        const nextMs = Math.min(
+          this._maxPreBufferMs,
+          this._preBufferMs < this._underrunBumpMs
+            ? this._underrunBumpMs
+            : this._preBufferMs + 20
+        );
+        this._preBufferMs = nextMs;
+        this._prebufferSamples = Math.max(128, Math.round(sampleRate * (this._preBufferMs / 1000)));
+        this.port.postMessage({ type: "underrun", preBufferMs: this._preBufferMs });
       }
     }
 
@@ -1012,14 +1076,14 @@ function getRecentlyFailedLiveModels(): string[] {
 }
 
 /**
- * Off-Main-Thread 16kHz Int16 PCM Mic Capture AudioWorklet with Adaptive Soft Noise Attenuator:
+ * Off-Main-Thread 16kHz Int16 PCM Mic Capture AudioWorklet with Continuous Adaptive Noise Gate:
  * - Continuous fractional-phase accumulator resampler (320 samples / 20ms @ 16kHz).
- * - Auto-calibrates room noiseFloor during first 300ms (15 frames).
- * - Quiet background (< Math.max(noiseFloor * 1.8, 0.008)) is softly attenuated to 0.08x (never hard-muted)
- *   while buffering raw audio into a 160ms pre-roll ring (8 frames).
- * - The instant speech hits threshold, flushes 160ms pre-roll + live audio at 1.0x full volume,
- *   and holds 1.0x for 650ms hang-time so short words ("halo", "oke") are never clipped.
- * - Reports peak RMS every 60ms to animate the green orb smoothly while LISTENING.
+ * - Continuously adapts `noiseFloor` while closed (`clamp(0.004..0.022)`).
+ * - Speech threshold: `Math.max(noiseFloor * 2.8, 0.028)`.
+ * - Requires 60ms onset confirmation (3 consecutive 20ms frames >= threshold) before opening
+ *   gate to 1.0x and flushing 160ms pre-roll (eliminating clicks & room hum self-talk).
+ * - Holds 1.0x for 600ms hang-time after speech ends; attenuates quiet floor strongly to 0.012x.
+ * - Posts `{ type: "gate", event: "speechStart" | "speechEnd" }` STRICTLY on gate state transitions!
  */
 const PCM_CAPTURE_WORKLET_CODE = `
 class FormylabLivePcmCaptureProcessor extends AudioWorkletProcessor {
@@ -1031,17 +1095,18 @@ class FormylabLivePcmCaptureProcessor extends AudioWorkletProcessor {
     this._frameMs = 20;
     this._rawFrame = new Float32Array(this._packetSamples);
     this._rawIndex = 0;
-    // Continuous virtual stream V[0] = _lastSample, V[1..len] = ch[0..len-1]
     this._phase = 0.0;
     this._lastSample = 0.0;
 
-    // Adaptive Soft Attenuator + 160ms Pre-Roll + 650ms Hang-Time
-    this._calibrationFrames = Math.max(1, Math.round(${LIVE_INPUT_NOISE_CALIBRATION_MS} / this._frameMs));
-    this._calibratedCount = 0;
-    this._calibrationSum = 0;
-    this._noiseFloor = 0.004;
+    // Continuous Adaptive Noise Gate + 60ms Onset + 160ms Pre-Roll + 600ms Hang-Time
+    this._noiseFloor = ${LIVE_INPUT_NOISE_FLOOR_INITIAL};
+    this._noiseFloorMin = ${LIVE_INPUT_NOISE_FLOOR_MIN};
+    this._noiseFloorMax = ${LIVE_INPUT_NOISE_FLOOR_MAX};
     this._minSpeechRms = ${LIVE_INPUT_MIN_SPEECH_RMS};
     this._noiseMult = ${LIVE_INPUT_NOISE_MULTIPLIER};
+    this._onsetRequired = ${LIVE_INPUT_ONSET_FRAMES};
+    this._onsetCount = 0;
+    this._onsetPeakRms = 0;
     this._quietGain = ${LIVE_INPUT_QUIET_ATTENUATION};
     this._preRollMaxFrames = Math.max(1, Math.round(${LIVE_INPUT_PREROLL_MS} / this._frameMs));
     this._preRollQueue = [];
@@ -1074,9 +1139,9 @@ class FormylabLivePcmCaptureProcessor extends AudioWorkletProcessor {
     return out;
   }
 
-  _emitPacket(pcm, rawRms, threshold, isPreRoll) {
+  _emitPacket(pcm, rawRms, threshold, isPreRoll, gateOpen) {
     this.port.postMessage(
-      { type: "pcm", pcm, rawRms, threshold, isPreRoll },
+      { type: "pcm", pcm, rawRms, threshold, isPreRoll, gateOpen },
       [pcm.buffer]
     );
   }
@@ -1088,46 +1153,69 @@ class FormylabLivePcmCaptureProcessor extends AudioWorkletProcessor {
       sumSq += s * s;
     }
     const rawRms = frame.length > 0 ? Math.sqrt(sumSq / frame.length) : 0;
-
-    if (this._calibratedCount < this._calibrationFrames) {
-      this._calibrationSum += Math.min(0.03, rawRms);
-      this._calibratedCount += 1;
-      this._noiseFloor = Math.max(0.0015, Math.min(0.025, this._calibrationSum / this._calibratedCount));
-    }
-
     const threshold = Math.max(this._noiseFloor * this._noiseMult, this._minSpeechRms);
 
-    if (rawRms >= threshold) {
-      this._hangRemainingMs = this._hangTimeMs;
-      if (!this._gateOpen) {
-        this._gateOpen = true;
-        for (let q = 0; q < this._preRollQueue.length; q++) {
-          const item = this._preRollQueue[q];
-          const prePcm = this._encodeWithSmoothGain(item.samples, 1.0);
-          this._emitPacket(prePcm, item.rawRms, threshold, true);
+    if (this._gateOpen) {
+      if (rawRms >= threshold) {
+        this._hangRemainingMs = this._hangTimeMs;
+        const livePcm = this._encodeWithSmoothGain(frame, 1.0);
+        this._emitPacket(livePcm, rawRms, threshold, false, true);
+      } else {
+        this._hangRemainingMs -= this._frameMs;
+        const hangPcm = this._encodeWithSmoothGain(frame, 1.0);
+        this._emitPacket(hangPcm, rawRms, threshold, false, true);
+        if (this._hangRemainingMs <= 0) {
+          this._gateOpen = false;
+          this._hangRemainingMs = 0;
+          this._onsetCount = 0;
+          this._onsetPeakRms = 0;
+          this.port.postMessage({ type: "gate", event: "speechEnd" });
         }
-        this._preRollQueue = [];
-      }
-      const livePcm = this._encodeWithSmoothGain(frame, 1.0);
-      this._emitPacket(livePcm, rawRms, threshold, false);
-    } else if (this._gateOpen) {
-      this._hangRemainingMs -= this._frameMs;
-      const hangPcm = this._encodeWithSmoothGain(frame, 1.0);
-      this._emitPacket(hangPcm, rawRms, threshold, false);
-      if (this._hangRemainingMs <= 0) {
-        this._gateOpen = false;
-        this._hangRemainingMs = 0;
       }
     } else {
-      if (this._calibratedCount >= this._calibrationFrames) {
-        this._noiseFloor = Math.max(0.0015, Math.min(0.025, this._noiseFloor * 0.96 + rawRms * 0.04));
+      if (rawRms >= threshold) {
+        this._onsetCount += 1;
+        if (rawRms > this._onsetPeakRms) {
+          this._onsetPeakRms = rawRms;
+        }
+        if (this._onsetCount >= this._onsetRequired) {
+          this._gateOpen = true;
+          this._hangRemainingMs = this._hangTimeMs;
+          this.port.postMessage({
+            type: "gate",
+            event: "speechStart",
+            peakRms: this._onsetPeakRms,
+          });
+          for (let q = 0; q < this._preRollQueue.length; q++) {
+            const item = this._preRollQueue[q];
+            const prePcm = this._encodeWithSmoothGain(item.samples, 1.0);
+            this._emitPacket(prePcm, item.rawRms, threshold, true, true);
+          }
+          this._preRollQueue = [];
+          const livePcm = this._encodeWithSmoothGain(frame, 1.0);
+          this._emitPacket(livePcm, rawRms, threshold, false, true);
+        } else {
+          this._preRollQueue.push({ samples: new Float32Array(frame), rawRms });
+          if (this._preRollQueue.length > this._preRollMaxFrames) {
+            this._preRollQueue.shift();
+          }
+          const quietPcm = this._encodeWithSmoothGain(frame, this._quietGain);
+          this._emitPacket(quietPcm, rawRms, threshold, false, false);
+        }
+      } else {
+        this._onsetCount = 0;
+        this._onsetPeakRms = 0;
+        this._noiseFloor = Math.max(
+          this._noiseFloorMin,
+          Math.min(this._noiseFloorMax, this._noiseFloor * 0.96 + rawRms * 0.04)
+        );
+        this._preRollQueue.push({ samples: new Float32Array(frame), rawRms });
+        if (this._preRollQueue.length > this._preRollMaxFrames) {
+          this._preRollQueue.shift();
+        }
+        const quietPcm = this._encodeWithSmoothGain(frame, this._quietGain);
+        this._emitPacket(quietPcm, rawRms, threshold, false, false);
       }
-      this._preRollQueue.push({ samples: new Float32Array(frame), rawRms });
-      if (this._preRollQueue.length > this._preRollMaxFrames) {
-        this._preRollQueue.shift();
-      }
-      const quietPcm = this._encodeWithSmoothGain(frame, this._quietGain);
-      this._emitPacket(quietPcm, rawRms, threshold, false);
     }
 
     this._rmsAccumMs += this._frameMs;
@@ -2173,6 +2261,15 @@ export function InteractiveVoiceCallOverlay({
   }, [chatSessionId]);
 
   // ============================================================================
+  // SINGLE-INIT CONNECTION MUTEX + TABLE DEDUP + ADAPTIVE PREBUFFER REFS
+  // ============================================================================
+  const switchVersionRef = useRef<number>(0);
+  const connectionLockRef = useRef<Promise<void>>(Promise.resolve());
+  const playbackPrebufferMsRef = useRef<number>(LIVE_PLAYBACK_PREBUFFER_MS);
+  const tableGenInFlightRef = useRef<boolean>(false);
+  const lastTableGenRef = useRef<FormulaTableDedupEntry | null>(null);
+
+  // ============================================================================
   // MODULE 5: DIAGNOSTICS RING BUFFER & PROFILER REFS
   // ============================================================================
   const metricsHistoryRef = useRef<VoiceTurnMetric[]>([]);
@@ -2184,13 +2281,13 @@ export function InteractiveVoiceCallOverlay({
   const currentTurnFirstAudioMsRef = useRef<number>(0);
   const currentTurnQueueDelayMsRef = useRef<number>(0);
   const pendingHotSwapFlagForNextTurnRef = useRef<boolean>(false);
-  const speechProfilerRef = useRef<SpeechEndProfilerState>(
-    createSpeechEndProfilerState()
-  );
+  const lastActiveSpeechTsRef = useRef<number>(0);
   const lastSpeechEndedAtRef = useRef<number>(0);
 
   // Forward-declared async action refs to avoid circular useCallback deps
-  const startLiveSessionRef = useRef<() => Promise<void>>(async () => {});
+  const startLiveSessionRef = useRef<(targetVoice?: LiveVoiceName) => Promise<void>>(
+    async () => {}
+  );
   const prepareStandbySessionRef = useRef<() => Promise<void>>(async () => {});
   const performAtomicHotSwapIfReadyRef = useRef<() => boolean>(() => false);
   const reconnectActiveSessionInPlaceRef = useRef<() => Promise<void>>(
@@ -2299,7 +2396,7 @@ export function InteractiveVoiceCallOverlay({
 
   const flushAssistantTranscriptNow = useCallback(() => {
     const clean = sanitizeLiveTranscriptText(assistantTurnTextRef.current);
-    if (!clean) return;
+    if (!hasMeaningfulAssistantText(clean)) return;
     const turnId = ensureAssistantMessageId();
     queueMicrotask(() => {
       onLiveAssistantStreamRef.current?.(turnId, clean);
@@ -2359,9 +2456,13 @@ export function InteractiveVoiceCallOverlay({
       const finalUserText = sanitizeUserTranscript(userTurnTextRef.current);
       const finalUserId = finalUserText ? ensureUserMessageId() : undefined;
 
-      const finalAiText = sanitizeLiveTranscriptText(
+      const existingAiId = currentAiMessageIdRef.current;
+      const rawFinalAiText = sanitizeLiveTranscriptText(
         assistantTurnTextRef.current
       );
+      const finalAiText = hasMeaningfulAssistantText(rawFinalAiText)
+        ? rawFinalAiText
+        : "";
       const finalAiId = finalAiText ? ensureAssistantMessageId() : undefined;
       const usedGoogleSearch =
         turnUsedGoogleSearchRef.current ||
@@ -2392,6 +2493,11 @@ export function InteractiveVoiceCallOverlay({
       if (!finalUserText && existingUserId) {
         queueMicrotask(() => {
           onLiveRemoveMessageRef.current?.(existingUserId);
+        });
+      }
+      if (!finalAiText && existingAiId) {
+        queueMicrotask(() => {
+          onLiveRemoveMessageRef.current?.(existingAiId);
         });
       }
 
@@ -2738,23 +2844,21 @@ export function InteractiveVoiceCallOverlay({
           const quietRefTs =
             lastSpeechEndedAtRef.current > 0
               ? lastSpeechEndedAtRef.current
-              : speechProfilerRef.current.hasDetectedSpeechInTurn &&
-                  speechProfilerRef.current.quietSinceMs
-                ? speechProfilerRef.current.quietSinceMs
+              : lastActiveSpeechTsRef.current > 0
+                ? lastActiveSpeechTsRef.current
                 : 0;
           const sinceSilenceMs =
             quietRefTs > 0 ? Math.max(0, Math.round(nowPerf - quietRefTs)) : 0;
 
+          const activePrebufferMs = playbackPrebufferMsRef.current;
           currentTurnFirstAudioMsRef.current = sinceSilenceMs;
-          currentTurnQueueDelayMsRef.current = LIVE_PLAYBACK_PREBUFFER_MS;
+          currentTurnQueueDelayMsRef.current = activePrebufferMs;
 
           console.log(
-            `[VOICE S#${activeSessionIndexRef.current} T#${turnNum}] 1st audio: +${sinceSilenceMs}ms | prebuffer: ${LIVE_PLAYBACK_PREBUFFER_MS}ms`
+            `[VOICE S#${activeSessionIndexRef.current} T#${turnNum}] 1st audio: +${sinceSilenceMs}ms | prebuffer: ${activePrebufferMs}ms`
           );
 
-          speechProfilerRef.current = createSpeechEndProfilerState(
-            speechProfilerRef.current.noiseFloor
-          );
+          lastActiveSpeechTsRef.current = 0;
           lastSpeechEndedAtRef.current = 0;
         }
 
@@ -2838,12 +2942,16 @@ export function InteractiveVoiceCallOverlay({
   );
 
   /**
-   * Complete Dual-Session Teardown (`disconnectAllVoiceSessions`):
+   * Complete Async Dual-Session Teardown (`disconnectAllVoiceSessions`):
    * Closes BOTH `activeSessionRef` and `standbySlotRef`, aborts token fetches, clears all
-   * timers, stops RingBuffer playback, and tears down both AudioWorklets, `MediaStream`, and `AudioContext`s.
+   * timers, stops RingBuffer playback, disconnects both AudioWorklets & MediaStream tracks,
+   * and properly awaits `inputCtx.close()` & `outputCtx.close()` so zero audio contexts leak.
    */
   const disconnectAllVoiceSessions = useCallback(
-    (options?: { keepMicAndAudioCtx?: boolean; nextFsm?: LiveVoiceFsmState }) => {
+    async (options?: {
+      keepMicAndAudioCtx?: boolean;
+      nextFsm?: LiveVoiceFsmState;
+    }): Promise<void> => {
       const keepAudio = options?.keepMicAndAudioCtx === true;
 
       sessionGenerationRef.current += 1;
@@ -2895,8 +3003,10 @@ export function InteractiveVoiceCallOverlay({
       micLockedRef.current = false;
       isPlaybackDrainedRef.current = true;
       receivedAudioAfterToolRef.current = false;
-      speechProfilerRef.current = createSpeechEndProfilerState();
+      lastActiveSpeechTsRef.current = 0;
       lastSpeechEndedAtRef.current = 0;
+      playbackPrebufferMsRef.current = LIVE_PLAYBACK_PREBUFFER_MS;
+      tableGenInFlightRef.current = false;
 
       if (activeSessionRef.current) {
         const s = activeSessionRef.current;
@@ -2933,6 +3043,7 @@ export function InteractiveVoiceCallOverlay({
       if (livePlaybackWorkletNodeRef.current) {
         try {
           livePlaybackWorkletNodeRef.current.port.onmessage = null;
+          livePlaybackWorkletNodeRef.current.port.close();
           livePlaybackWorkletNodeRef.current.disconnect();
         } catch {
           // ignore
@@ -2953,6 +3064,7 @@ export function InteractiveVoiceCallOverlay({
       if (liveWorkletNodeRef.current) {
         try {
           liveWorkletNodeRef.current.port.onmessage = null;
+          liveWorkletNodeRef.current.port.close();
           liveWorkletNodeRef.current.disconnect();
         } catch {
           // ignore
@@ -3015,12 +3127,19 @@ export function InteractiveVoiceCallOverlay({
         liveMicStreamRef.current = null;
       }
 
+      const closePromises: Promise<void>[] = [];
+
       if (liveInputCtxRef.current) {
         const ctx = liveInputCtxRef.current;
         liveInputCtxRef.current = null;
         try {
           if (ctx.state !== "closed") {
-            ctx.close().catch(() => {});
+            closePromises.push(
+              Promise.race([
+                ctx.close().catch(() => {}),
+                new Promise<void>((resolve) => setTimeout(resolve, 250)),
+              ])
+            );
           }
         } catch {
           // ignore
@@ -3032,7 +3151,12 @@ export function InteractiveVoiceCallOverlay({
         liveOutputCtxRef.current = null;
         try {
           if (ctx.state !== "closed") {
-            ctx.close().catch(() => {});
+            closePromises.push(
+              Promise.race([
+                ctx.close().catch(() => {}),
+                new Promise<void>((resolve) => setTimeout(resolve, 250)),
+              ])
+            );
           }
         } catch {
           // ignore
@@ -3042,6 +3166,10 @@ export function InteractiveVoiceCallOverlay({
       liveMicAnalyserRef.current = null;
       liveOutputAnalyserRef.current = null;
       activeAnalyserRef.current = null;
+
+      if (closePromises.length > 0) {
+        await Promise.all(closePromises);
+      }
     },
     [
       clearPrewarmInterval,
@@ -3164,125 +3292,153 @@ export function InteractiveVoiceCallOverlay({
                       ? "general"
                       : "formulation";
 
-                const shimmerMsgId = `ftable-${Date.now()}-${Math.random()
-                  .toString(36)
-                  .slice(2, 6)}`;
-
-                // 1) Immediately show lightweight shimmer loading card in chat room
-                const loadingCard: FormulaTableArtifact = {
-                  id: shimmerMsgId,
-                  title: topic || "Menyusun Tabel R&D...",
-                  subtitle:
-                    "Menyusun bahan INCI lengkap, validasi total 100.00%, target pH & prosedur...",
-                  tableType,
-                  columns: FORMULATION_REQUIRED_COLUMNS,
-                  rows: [],
-                  isLoading: true,
-                };
-                queueMicrotask(() => {
-                  onCreateFormulaTableRef.current?.(loadingCard, shimmerMsgId);
-                });
-
-                // 2) Call Hybrid Backend `/api/generate-detailed-table` for rich R&D output
-                let detailedTable: FormulaTableArtifact | null = null;
-                let backendError = "";
-
-                try {
-                  const res = await fetch("/api/generate-detailed-table", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                      topic,
-                      key_ingredients: keyIngredients,
-                      constraints,
-                      table_type: tableType,
-                      conversationContext: getDeterministicMemoryPrompt().slice(
-                        0,
-                        1800
-                      ),
-                    }),
-                  });
-                  const data = (await res.json().catch(() => ({}))) as {
-                    success?: boolean;
-                    table?: unknown;
-                    error?: string;
+                // 6-second deduplication + in-flight guard (prevents duplicate FormulaTableCard renders)
+                if (
+                  isDuplicateFormulaTableRequest(
+                    lastTableGenRef.current,
+                    { topic, tableType, nowMs: Date.now() },
+                    tableGenInFlightRef.current
+                  )
+                ) {
+                  console.log(
+                    `[VOICE S#${activeSessionIndexRef.current} T#${turnNum}] Dedup guard: skip duplicate create_formula_table ("${topic}")`
+                  );
+                  return {
+                    status: "ok",
+                    resultMessage:
+                      "Tabel formulasi untuk topik ini sudah sedang disiapkan atau baru saja ditampilkan di room chat. Jelaskan saja intinya secara singkat dalam 1 sampai 2 kalimat tanpa membuat tabel ganda.",
                   };
-                  if (res.ok && data.success && data.table) {
-                    detailedTable = normalizeFormulaTableArtifact({
-                      ...(data.table as Record<string, unknown>),
-                      id: shimmerMsgId,
-                      isLoading: false,
-                    });
-                  } else {
-                    backendError =
-                      data.error ||
-                      `Gagal menyusun tabel R&D (HTTP ${res.status}).`;
-                  }
-                } catch (fetchErr: unknown) {
-                  backendError =
-                    fetchErr instanceof Error
-                      ? fetchErr.message
-                      : String(fetchErr);
                 }
 
-                // Backwards-compatible rescue if Gemini sent legacy inline columns/rows
-                if (!detailedTable && Array.isArray(args.rows) && args.rows.length > 0) {
-                  const legacy = normalizeFormulaTableArtifact(args);
-                  if (legacy) {
-                    const balanced =
-                      tableType === "formulation"
-                        ? validateAndBalanceFormulationRows(
-                            legacy.columns,
-                            legacy.rows
-                          )
-                        : null;
-                    detailedTable = {
-                      ...legacy,
-                      id: shimmerMsgId,
-                      tableType,
-                      rows: balanced ? balanced.rows : legacy.rows,
-                      totalPercentage: balanced?.totalPercentage,
-                      isLoading: false,
+                tableGenInFlightRef.current = true;
+                try {
+                  const shimmerMsgId = `ftable-${Date.now()}-${Math.random()
+                    .toString(36)
+                    .slice(2, 6)}`;
+
+                  // 1) Immediately show lightweight shimmer loading card in chat room
+                  const loadingCard: FormulaTableArtifact = {
+                    id: shimmerMsgId,
+                    title: topic || "Menyusun Tabel R&D...",
+                    subtitle:
+                      "Menyusun bahan INCI lengkap, validasi total 100.00%, target pH & prosedur...",
+                    tableType,
+                    columns: FORMULATION_REQUIRED_COLUMNS,
+                    rows: [],
+                    isLoading: true,
+                  };
+                  queueMicrotask(() => {
+                    onCreateFormulaTableRef.current?.(loadingCard, shimmerMsgId);
+                  });
+
+                  // 2) Call Hybrid Backend `/api/generate-detailed-table` for rich R&D output
+                  let detailedTable: FormulaTableArtifact | null = null;
+                  let backendError = "";
+
+                  try {
+                    const res = await fetch("/api/generate-detailed-table", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({
+                        topic,
+                        key_ingredients: keyIngredients,
+                        constraints,
+                        table_type: tableType,
+                        conversationContext: getDeterministicMemoryPrompt().slice(
+                          0,
+                          1800
+                        ),
+                      }),
+                    });
+                    const data = (await res.json().catch(() => ({}))) as {
+                      success?: boolean;
+                      table?: unknown;
+                      error?: string;
+                    };
+                    if (res.ok && data.success && data.table) {
+                      detailedTable = normalizeFormulaTableArtifact({
+                        ...(data.table as Record<string, unknown>),
+                        id: shimmerMsgId,
+                        isLoading: false,
+                      });
+                    } else {
+                      backendError =
+                        data.error ||
+                        `Gagal menyusun tabel R&D (HTTP ${res.status}).`;
+                    }
+                  } catch (fetchErr: unknown) {
+                    backendError =
+                      fetchErr instanceof Error
+                        ? fetchErr.message
+                        : String(fetchErr);
+                  }
+
+                  // Backwards-compatible rescue if Gemini sent legacy inline columns/rows
+                  if (!detailedTable && Array.isArray(args.rows) && args.rows.length > 0) {
+                    const legacy = normalizeFormulaTableArtifact(args);
+                    if (legacy) {
+                      const balanced =
+                        tableType === "formulation"
+                          ? validateAndBalanceFormulationRows(
+                              legacy.columns,
+                              legacy.rows
+                            )
+                          : null;
+                      detailedTable = {
+                        ...legacy,
+                        id: shimmerMsgId,
+                        tableType,
+                        rows: balanced ? balanced.rows : legacy.rows,
+                        totalPercentage: balanced?.totalPercentage,
+                        isLoading: false,
+                      };
+                    }
+                  }
+
+                  if (!detailedTable) {
+                    queueMicrotask(() => {
+                      onLiveRemoveMessageRef.current?.(shimmerMsgId);
+                    });
+                    return {
+                      status: "error",
+                      resultMessage:
+                        backendError ||
+                        "Gagal menghasilkan tabel formulasi rinci. Minta maaf singkat dan tawarkan mencoba ulang.",
+                      fallbackChatText:
+                        "Maaf, penyusunan tabel R&D sempat terkendala. Boleh ulangi permintaanmu sebentar?",
                     };
                   }
-                }
 
-                if (!detailedTable) {
-                  queueMicrotask(() => {
-                    onLiveRemoveMessageRef.current?.(shimmerMsgId);
-                  });
-                  return {
-                    status: "error",
-                    resultMessage:
-                      backendError ||
-                      "Gagal menghasilkan tabel formulasi rinci. Minta maaf singkat dan tawarkan mencoba ulang.",
-                    fallbackChatText:
-                      "Maaf, penyusunan tabel R&D sempat terkendala. Boleh ulangi permintaanmu sebentar?",
+                  // 3) Replace shimmer in-place with complete detailed R&D FormulaTableCard
+                  latestFormulaTableRef.current = detailedTable;
+                  lastTableGenRef.current = {
+                    topic: detailedTable.title || topic,
+                    tableType,
+                    atMs: Date.now(),
                   };
+                  queueMicrotask(() => {
+                    onCreateFormulaTableRef.current?.(detailedTable!, shimmerMsgId);
+                  });
+
+                  const keyItemsSummary = detailedTable.rows
+                    .slice(0, 6)
+                    .map((r) => `${r[1] || r[0]}${r[2] ? ` ${r[2]}` : ""}`)
+                    .join(", ");
+                  const phInfo = detailedTable.specs?.targetPh
+                    ? ` Target pH ${detailedTable.specs.targetPh}.`
+                    : "";
+                  const totalInfo = detailedTable.totalPercentage
+                    ? ` Total komposisi tepat ${detailedTable.totalPercentage}.`
+                    : "";
+
+                  return {
+                    status: "ok",
+                    resultMessage: `Tabel R&D lengkap "${detailedTable.title}" (${detailedTable.rows.length} baris) sudah tampil di room chat.${totalInfo}${phInfo} Sorotan utama: ${keyItemsSummary}. Jelaskan inti formulanya dalam 1 sampai 2 kalimat santai tanpa membacakan seluruh tabel.`,
+                    fallbackChatText: `Tabel R&D "${detailedTable.title}" sudah tampil lengkap di chat (${detailedTable.rows.length} baris${detailedTable.totalPercentage ? `, total ${detailedTable.totalPercentage}` : ""}). Ada bahan atau tekstur yang ingin kamu sesuaikan?`,
+                  };
+                } finally {
+                  tableGenInFlightRef.current = false;
                 }
-
-                // 3) Replace shimmer in-place with complete detailed R&D FormulaTableCard
-                latestFormulaTableRef.current = detailedTable;
-                queueMicrotask(() => {
-                  onCreateFormulaTableRef.current?.(detailedTable!, shimmerMsgId);
-                });
-
-                const keyItemsSummary = detailedTable.rows
-                  .slice(0, 6)
-                  .map((r) => `${r[1] || r[0]}${r[2] ? ` ${r[2]}` : ""}`)
-                  .join(", ");
-                const phInfo = detailedTable.specs?.targetPh
-                  ? ` Target pH ${detailedTable.specs.targetPh}.`
-                  : "";
-                const totalInfo = detailedTable.totalPercentage
-                  ? ` Total komposisi tepat ${detailedTable.totalPercentage}.`
-                  : "";
-
-                return {
-                  status: "ok",
-                  resultMessage: `Tabel R&D lengkap "${detailedTable.title}" (${detailedTable.rows.length} baris) sudah tampil di room chat.${totalInfo}${phInfo} Sorotan utama: ${keyItemsSummary}. Jelaskan inti formulanya dalam 1 sampai 2 kalimat santai tanpa membacakan seluruh tabel.`,
-                  fallbackChatText: `Tabel R&D "${detailedTable.title}" sudah tampil lengkap di chat (${detailedTable.rows.length} baris${detailedTable.totalPercentage ? `, total ${detailedTable.totalPercentage}` : ""}). Ada bahan atau tekstur yang ingin kamu sesuaikan?`,
-                };
               }
 
               if (
@@ -3364,32 +3520,77 @@ export function InteractiveVoiceCallOverlay({
                     resultMessage: "Kata kunci pencarian kosong.",
                   };
                 }
-                const res = await fetch("/api/live-search", {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ query }),
-                });
-                const data = (await res.json().catch(() => ({}))) as {
+
+                console.log(`[VOICE SEARCH] Query: "${query}"`);
+
+                const searchController = new AbortController();
+                const searchFetchTimer = setTimeout(
+                  () => searchController.abort(),
+                  14_000
+                );
+
+                let res: Response;
+                let rawText = "";
+                try {
+                  res = await fetch("/api/live-search", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    signal: searchController.signal,
+                    body: JSON.stringify({ query }),
+                  });
+                  rawText = await res.text();
+                } catch (fetchErr: unknown) {
+                  const errMsg =
+                    fetchErr instanceof Error &&
+                    (fetchErr.name === "AbortError" || /abort/i.test(fetchErr.message))
+                      ? "Client timeout setelah 14000ms"
+                      : fetchErr instanceof Error
+                        ? fetchErr.message
+                        : String(fetchErr);
+                  console.warn(`[VOICE SEARCH] FAILED -> HTTP 0 | ${errMsg}`);
+                  return {
+                    status: "error",
+                    resultMessage:
+                      "Pencarian internet sedang gagal atau timeout saat ini. Sampaikan dengan jujur ke pengguna bahwa pencarian internet sedang mengalami kendala sehingga kamu belum bisa memverifikasi data real-time, dan DILARANG menebak atau memakai fakta lama.",
+                  };
+                } finally {
+                  clearTimeout(searchFetchTimer);
+                }
+
+                let data: {
                   ok?: boolean;
-                  success?: boolean;
+                  modelUsed?: string;
+                  query?: string;
                   summary?: string;
                   sources?: unknown[];
-                  fallbackNote?: string;
-                  model?: string;
-                  error?: string;
-                };
+                  errorCode?: string;
+                  errorDetail?: string;
+                } = {};
+                try {
+                  data = JSON.parse(rawText);
+                } catch {
+                  data = {};
+                }
 
-                const isSearchOk = Boolean(data.ok || data.success) && Boolean(data.summary);
+                const isSearchOk =
+                  res.ok &&
+                  data.ok === true &&
+                  typeof data.summary === "string" &&
+                  data.summary.trim().length > 0 &&
+                  !data.summary.startsWith("GAGAL_SEARCH:");
+
                 if (!isSearchOk) {
-                  const unavailableMsg =
-                    data.fallbackNote ||
-                    "Pencarian internet sedang gagal atau sibuk saat ini. Sampaikan dengan jujur ke pengguna bahwa pencarian internet sedang mengalami kendala sehingga kamu belum bisa memverifikasi data real-time, dan DILARANG menebak atau memakai fakta lama.";
-                  console.log(
-                    `[VOICE S#${activeSessionIndexRef.current} T#${turnNum}] /api/live-search -> unavailable (HTTP ${res.status}${data.error ? `: ${data.error.slice(0, 80)}` : ""})`
+                  const diagDetail =
+                    data.errorDetail ||
+                    rawText.replace(/\s+/g, " ").trim().slice(0, 300) ||
+                    "Respons kosong";
+                  console.warn(
+                    `[VOICE SEARCH] FAILED -> HTTP ${res.status} | ${diagDetail}`
                   );
                   return {
                     status: "error",
-                    resultMessage: unavailableMsg,
+                    resultMessage:
+                      "Pencarian internet sedang gagal atau sibuk saat ini. Sampaikan dengan jujur ke pengguna bahwa pencarian internet sedang mengalami kendala sehingga kamu belum bisa memverifikasi data real-time, dan DILARANG menebak atau memakai fakta lama.",
                   };
                 }
 
@@ -3403,7 +3604,7 @@ export function InteractiveVoiceCallOverlay({
                   : [];
 
                 console.log(
-                  `[VOICE S#${activeSessionIndexRef.current} T#${turnNum}] /api/live-search -> ok (${cleanSources.length} sources${data.model ? `, ${data.model}` : ""})`
+                  `[VOICE SEARCH] OK (${data.modelUsed || "gemini-2.5-flash"}, sources: ${cleanSources.length}): ${data.summary}`
                 );
 
                 if (cleanSources.length > 0) {
@@ -3508,17 +3709,21 @@ export function InteractiveVoiceCallOverlay({
         functionResponses.length > 0
       ) {
         const currentGen = sessionGenerationRef.current;
+        const includesSearchTool = functionResponses.some(
+          (fr) => fr.name === "search_web_info"
+        );
+        const recoveryMs = includesSearchTool ? 15_000 : LIVE_TOOL_RECOVERY_MS;
         try {
           targetSession.sendToolResponse({ functionResponses });
           // Clear spinner immediately so UI never hangs on "Live · Menyiapkan Tabel...",
-          // while keeping mic locked until Gemini speaks OR the 8,000ms recovery timeout fires!
+          // while keeping mic locked until Gemini speaks OR the recovery timeout fires!
           receivedAudioAfterToolRef.current = false;
           isServerTurnCompleteRef.current = false;
           micLockedRef.current = true;
           micUnlockAtRef.current = Number.POSITIVE_INFINITY;
           setFsm("LISTENING");
 
-          // Arm 8,000ms recovery timer (cancelled instantly when first audio/modelTurn arrives)
+          // Arm post-tool recovery timer (15,000ms for search_web_info, 8,000ms otherwise)
           clearToolRecoveryTimer();
           toolRecoveryTimerRef.current = setTimeout(() => {
             toolRecoveryTimerRef.current = null;
@@ -3538,7 +3743,9 @@ export function InteractiveVoiceCallOverlay({
               return;
             }
             console.warn(
-              `[VOICE S#${activeSessionIndexRef.current} T#${turnNum}] Tool recovery 8s: tidak ada audio konfirmasi — membuka mikrofon`
+              `[VOICE S#${activeSessionIndexRef.current} T#${turnNum}] Tool recovery ${Math.round(
+                recoveryMs / 1000
+              )}s: tidak ada audio konfirmasi — membuka mikrofon`
             );
             isServerTurnCompleteRef.current = true;
             isPlaybackDrainedRef.current = true;
@@ -3553,7 +3760,7 @@ export function InteractiveVoiceCallOverlay({
               finalizeCurrentTurnAsync();
             }
             handleTurnFullyUnlocked(turnNum);
-          }, LIVE_TOOL_RECOVERY_MS);
+          }, recoveryMs);
         } catch {
           micLockedRef.current = false;
           micUnlockAtRef.current = 0;
@@ -3690,28 +3897,36 @@ export function InteractiveVoiceCallOverlay({
           break;
         }
 
+        // Build LiveConnectConfig via single unified factory across Aoede, Zephyr, Kore, Puck
+        const unifiedCfg = createLiveVoiceConfig(
+          tokenCfg.voiceName || selectedVoiceRef.current,
+          {
+            memorySummary,
+            modelId: tokenCfg.model,
+            disableThinkingConfig,
+            disableCustomVad,
+          }
+        );
+
         const resolvedThinkingConfig = disableThinkingConfig
           ? undefined
-          : tokenCfg.thinkingConfig ?? getLiveThinkingConfigForModel(tokenCfg.model);
+          : tokenCfg.thinkingConfig ?? unifiedCfg.thinkingConfig;
 
         const liveConfig: LiveConnectConfig = {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: {
-                voiceName: tokenCfg.voiceName || selectedVoiceRef.current,
-              },
-            },
-          },
-          ...(tokenCfg.systemInstruction
-            ? { systemInstruction: tokenCfg.systemInstruction }
-            : {}),
-          // ALWAYS register ALL 4 Unified Function Declarations on EVERY voice chip!
-          ...(Array.isArray(tokenCfg.tools) && tokenCfg.tools.length > 0
-            ? { tools: tokenCfg.tools }
-            : {}),
-          ...(tokenCfg.realtimeInputConfig
-            ? { realtimeInputConfig: tokenCfg.realtimeInputConfig }
+          responseModalities: unifiedCfg.responseModalities,
+          speechConfig: unifiedCfg.speechConfig,
+          systemInstruction:
+            tokenCfg.systemInstruction || unifiedCfg.systemInstruction,
+          // ALWAYS register ALL 4 Unified Function Declarations identically across all 4 voice chips!
+          tools:
+            Array.isArray(tokenCfg.tools) && tokenCfg.tools.length > 0
+              ? tokenCfg.tools
+              : unifiedCfg.tools,
+          ...(tokenCfg.realtimeInputConfig ?? unifiedCfg.wsRealtimeInputConfig
+            ? {
+                realtimeInputConfig: (tokenCfg.realtimeInputConfig ??
+                  unifiedCfg.wsRealtimeInputConfig) as LiveConnectConfig["realtimeInputConfig"],
+              }
             : {}),
           inputAudioTranscription: {},
           outputAudioTranscription: {},
@@ -3845,7 +4060,7 @@ export function InteractiveVoiceCallOverlay({
                   }
                 }
 
-                // 6. Streaming AI Speech Transcription (ONE single bubble per turn + clean spacing)
+                // 6. Streaming AI Speech Transcription (ONE single bubble per turn + empty '...' filter)
                 if (content.outputTranscription?.text) {
                   const rawAiChunk = content.outputTranscription.text;
                   if (
@@ -3854,7 +4069,7 @@ export function InteractiveVoiceCallOverlay({
                     lastCommittedAiMessageIdRef.current
                   ) {
                     // Late trailing outputTranscription arrived after turnComplete:
-                    // merge cleanly into the SAME AI bubble with proper spacing!
+                    // merge cleanly into the SAME AI bubble ONLY if meaningful!
                     lastCommittedAiTextRef.current = appendTranscriptFragment(
                       lastCommittedAiTextRef.current,
                       rawAiChunk
@@ -3863,7 +4078,7 @@ export function InteractiveVoiceCallOverlay({
                       lastCommittedAiTextRef.current
                     );
                     const targetAiId = lastCommittedAiMessageIdRef.current;
-                    if (mergedClean && targetAiId) {
+                    if (hasMeaningfulAssistantText(mergedClean) && targetAiId) {
                       queueMicrotask(() => {
                         onLiveAssistantStreamRef.current?.(
                           targetAiId,
@@ -3878,8 +4093,7 @@ export function InteractiveVoiceCallOverlay({
                       rawAiChunk
                     );
                     if (
-                      sanitizeLiveTranscriptText(assistantTurnTextRef.current)
-                        .length > 0
+                      hasMeaningfulAssistantText(assistantTurnTextRef.current)
                     ) {
                       ensureActiveTurnNumber();
                       ensureAssistantMessageId();
@@ -4369,8 +4583,11 @@ export function InteractiveVoiceCallOverlay({
         playbackNode.connect(outAnalyser);
 
         playbackNode.port.onmessage = (event: MessageEvent) => {
-          const payload = event.data as { type?: string } | null;
-          if (!payload || payload.type !== "bufferDrained") return;
+          const payload = event.data as {
+            type?: string;
+            preBufferMs?: number;
+          } | null;
+          if (!payload) return;
           if (
             !isMountedRef.current ||
             !callActiveRef.current ||
@@ -4378,20 +4595,36 @@ export function InteractiveVoiceCallOverlay({
           ) {
             return;
           }
-          isPlaybackDrainedRef.current = true;
           const currentGen = sessionGenerationRef.current;
           const turnNum = activePlaybackTurnNumberRef.current;
 
-          if (isServerTurnCompleteRef.current) {
-            scheduleEchoGuardUnlock(currentGen, turnNum);
-          } else {
-            // Network jitter mid-turn: NEVER unlock mic! Arm 10s emergency watchdog only.
+          if (payload.type === "underrun") {
+            if (typeof payload.preBufferMs === "number" && payload.preBufferMs > 0) {
+              playbackPrebufferMsRef.current = payload.preBufferMs;
+              console.log(
+                `[VOICE] Playback adaptive cushion -> prebuffer: ${payload.preBufferMs}ms`
+              );
+            }
+            // Mid-sentence network jitter underrun: keep mic locked & arm 10s emergency watchdog
             micLockedRef.current = true;
             micUnlockAtRef.current = Number.POSITIVE_INFINITY;
             armTurnWatchdog(currentGen, turnNum);
+            return;
+          }
+
+          if (payload.type === "bufferDrained") {
+            isPlaybackDrainedRef.current = true;
+            if (isServerTurnCompleteRef.current) {
+              scheduleEchoGuardUnlock(currentGen, turnNum);
+            } else {
+              micLockedRef.current = true;
+              micUnlockAtRef.current = Number.POSITIVE_INFINITY;
+              armTurnWatchdog(currentGen, turnNum);
+            }
           }
         };
 
+        playbackPrebufferMsRef.current = LIVE_PLAYBACK_PREBUFFER_MS;
         playbackRingBufferReadyRef.current = true;
         console.log(
           `[VOICE] Playback RingBuffer ready (prebuffer: ${LIVE_PLAYBACK_PREBUFFER_MS}ms)`
@@ -4484,62 +4717,63 @@ export function InteractiveVoiceCallOverlay({
         }
       };
 
+      const isMicUplinkOpen = () => {
+        const nowPerf = performance.now();
+        return (
+          Boolean(activeSessionRef.current) &&
+          callActiveRef.current &&
+          audioPipelineGenerationRef.current === pipelineGen &&
+          !isMicMutedRef.current &&
+          !micLockedRef.current &&
+          isServerTurnCompleteRef.current &&
+          isPlaybackDrainedRef.current &&
+          fsmStateRef.current === "LISTENING" &&
+          activePlaybackNodesRef.current === 0 &&
+          nowPerf >= micUnlockAtRef.current
+        );
+      };
+
+      const handleGateTransition = (
+        event: "speechStart" | "speechEnd",
+        peakRms?: number
+      ) => {
+        if (!isMicUplinkOpen()) return;
+        const nowPerf = performance.now();
+        if (event === "speechStart") {
+          lastActiveSpeechTsRef.current = nowPerf;
+          console.log(
+            `[VOICE] Speech detected (peak RMS: ${(peakRms ?? 0).toFixed(2)})`
+          );
+        } else if (event === "speechEnd") {
+          lastSpeechEndedAtRef.current =
+            lastActiveSpeechTsRef.current > 0
+              ? lastActiveSpeechTsRef.current
+              : Math.max(0, nowPerf - LIVE_INPUT_HANG_TIME_MS);
+          console.log("[VOICE] Speech ended -> waiting AI...");
+        }
+      };
+
       const sendPcmChunkToActiveSession = (
         int16: Int16Array,
-        rawRmsOverride?: number,
-        thresholdOverride?: number,
-        isPreRoll = false
+        rawRms?: number,
+        threshold?: number,
+        isPreRoll = false,
+        gateOpen = false
       ) => {
         const activeSession = activeSessionRef.current;
-        if (
-          !activeSession ||
-          !callActiveRef.current ||
-          audioPipelineGenerationRef.current !== pipelineGen ||
-          isMicMutedRef.current ||
-          int16.length === 0
-        ) {
+        if (!activeSession || int16.length === 0 || !isMicUplinkOpen()) {
           return;
         }
 
-        // Strict Zero Self-Interruption Echo Guard:
-        // NEVER send mic frames while server turn isn't complete, playback ring buffer isn't drained,
-        // FSM isn't LISTENING, or 150ms room-echo guard tail is still active!
-        const nowPerf = performance.now();
+        // Track last active voice frame silently for sub-600ms latency measurement (ZERO log spam)
         if (
-          micLockedRef.current ||
-          !isServerTurnCompleteRef.current ||
-          !isPlaybackDrainedRef.current ||
-          fsmStateRef.current !== "LISTENING" ||
-          activePlaybackNodesRef.current > 0 ||
-          nowPerf < micUnlockAtRef.current
+          !isPreRoll &&
+          gateOpen &&
+          typeof rawRms === "number" &&
+          typeof threshold === "number" &&
+          rawRms >= threshold
         ) {
-          return;
-        }
-
-        // Accurate RMS speech start/end profiler on live (non-preroll) frames
-        if (!isPreRoll) {
-          const measuredRms =
-            typeof rawRmsOverride === "number"
-              ? rawRmsOverride
-              : computeInt16PcmRms(int16);
-          const nextProfiler = observeMicRmsForProfiler(
-            speechProfilerRef.current,
-            measuredRms,
-            nowPerf,
-            undefined,
-            thresholdOverride
-          );
-          speechProfilerRef.current = nextProfiler;
-
-          if (nextProfiler.speechStartedEvent) {
-            console.log(
-              `[VOICE] Speech detected (peak RMS: ${nextProfiler.peakRmsInTurn.toFixed(2)})`
-            );
-          }
-          if (nextProfiler.speechEndedEvent && nextProfiler.lastSpeechEndedAtMs > 0) {
-            lastSpeechEndedAtRef.current = nextProfiler.lastSpeechEndedAtMs;
-            console.log("[VOICE] Speech ended -> waiting AI...");
-          }
+          lastActiveSpeechTsRef.current = performance.now();
         }
 
         const base64Audio = int16PcmToBase64(int16);
@@ -4598,7 +4832,15 @@ export function InteractiveVoiceCallOverlay({
               return;
             }
             if (typeof payload === "object") {
-              if (payload.type === "rms" && typeof payload.rms === "number") {
+              if (
+                payload.type === "gate" &&
+                (payload.event === "speechStart" || payload.event === "speechEnd")
+              ) {
+                handleGateTransition(
+                  payload.event,
+                  typeof payload.peakRms === "number" ? payload.peakRms : undefined
+                );
+              } else if (payload.type === "rms" && typeof payload.rms === "number") {
                 handleRmsTelemetryForOrb(
                   payload.rms,
                   typeof payload.threshold === "number"
@@ -4615,7 +4857,8 @@ export function InteractiveVoiceCallOverlay({
                   typeof payload.threshold === "number"
                     ? payload.threshold
                     : undefined,
-                  payload.isPreRoll === true
+                  payload.isPreRoll === true,
+                  payload.gateOpen === true
                 );
               }
             }
@@ -4669,6 +4912,14 @@ export function InteractiveVoiceCallOverlay({
                 floatFrame[i] = pkt[i] / 32768;
               }
               const res = fallbackAttenuator.processFrame(floatFrame);
+              if (res.gateEvent) {
+                handleGateTransition(
+                  res.gateEvent.type,
+                  res.gateEvent.type === "speechStart"
+                    ? res.gateEvent.peakRms
+                    : undefined
+                );
+              }
               if (res.rmsTelemetry) {
                 handleRmsTelemetryForOrb(
                   res.rmsTelemetry.rms,
@@ -4680,7 +4931,8 @@ export function InteractiveVoiceCallOverlay({
                   outPkt.pcm,
                   outPkt.rawRms,
                   outPkt.threshold,
-                  outPkt.isPreRoll
+                  outPkt.isPreRoll,
+                  res.gateOpen
                 );
               }
             }
@@ -4695,224 +4947,246 @@ export function InteractiveVoiceCallOverlay({
     []
   );
 
-  const startLiveVoiceSession = useCallback(async () => {
-    disconnectAllVoiceSessions({ nextFsm: "CONNECTING" });
-    const pipelineGen = audioPipelineGenerationRef.current;
-    autoReconnectCountRef.current = 0;
-    voiceStopSpeechRef.current?.();
-
-    if (!isMountedRef.current || !callActiveRef.current || !isOpen) return;
-
-    setLiveError("");
-    setFsm("CONNECTING");
-
-    if (
-      typeof navigator === "undefined" ||
-      !navigator.mediaDevices ||
-      typeof navigator.mediaDevices.getUserMedia !== "function"
-    ) {
-      setLiveError(
-        "Browser tidak mengizinkan akses mikrofon (butuh HTTPS / tab penuh)."
-      );
-      setFsm("ERROR");
-      return;
-    }
-
-    let micStream: MediaStream;
-    try {
-      micStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true, // Keeps normal speaking volume healthy; quiet hum handled by 0.08x soft attenuator
-          channelCount: 1,
-        },
-      });
-    } catch (err: unknown) {
-      if (audioPipelineGenerationRef.current !== pipelineGen) return;
-      if (isMicPermissionDenied(err)) {
-        setLiveError(formatLiveConnectionError("NotAllowedError"));
-      } else {
-        setLiveError(formatLiveConnectionError("NotFoundError"));
+  /**
+   * Single-Init Mutex Serialized Voice Connection (`startLiveVoiceSession`):
+   * - Increments `switchVersionRef` immediately so any superseded in-flight open/switch aborts cleanly.
+   * - Chains onto `connectionLockRef` so teardown (`await disconnectAllVoiceSessions`) + 80ms settle
+   *   + new AudioContext/Worklet/Token init NEVER run concurrently!
+   * - Guarantees `[VOICE] Playback RingBuffer ready` and `/api/live-token` execute EXACTLY ONCE
+   *   per Voice Mode open or voice chip switch (`Aoede` / `Zephyr` / `Kore` / `Puck`).
+   */
+  const startLiveVoiceSession = useCallback(
+    async (targetVoice?: LiveVoiceName) => {
+      if (targetVoice) {
+        selectedVoiceRef.current = targetVoice;
       }
-      setFsm("ERROR");
-      return;
-    }
+      const myVersion = ++switchVersionRef.current;
 
-    if (
-      !isMountedRef.current ||
-      !callActiveRef.current ||
-      !isOpen ||
-      audioPipelineGenerationRef.current !== pipelineGen
-    ) {
-      micStream.getTracks().forEach((t) => t.stop());
-      return;
-    }
-
-    liveMicStreamRef.current = micStream;
-    micStream.getAudioTracks().forEach((track) => {
-      track.enabled = !isMicMutedRef.current;
-    });
-
-    const AudioCtx =
-      window.AudioContext ||
-      (window as unknown as { webkitAudioContext?: typeof AudioContext })
-        .webkitAudioContext;
-    if (!AudioCtx) {
-      disconnectAllVoiceSessions({ nextFsm: "ERROR" });
-      setLiveError(
-        "Browser tidak mendukung Web Audio API untuk audio Live 24kHz."
-      );
-      return;
-    }
-
-    let outCtx: AudioContext;
-    try {
-      outCtx = new AudioCtx({ sampleRate: LIVE_PLAYBACK_SAMPLE_RATE });
-    } catch {
-      outCtx = new AudioCtx();
-    }
-    liveOutputCtxRef.current = outCtx;
-    if (outCtx.state === "suspended") {
-      await outCtx.resume().catch(() => {});
-    }
-
-    if (
-      !isMountedRef.current ||
-      !callActiveRef.current ||
-      !isOpen ||
-      audioPipelineGenerationRef.current !== pipelineGen
-    ) {
-      return;
-    }
-
-    const outAnalyser = outCtx.createAnalyser();
-    outAnalyser.fftSize = 256;
-    outAnalyser.smoothingTimeConstant = 0.78;
-    outAnalyser.connect(outCtx.destination);
-    liveOutputAnalyserRef.current = outAnalyser;
-    liveNextPlayTimeRef.current = 0;
-    isServerTurnCompleteRef.current = true;
-    isPlaybackDrainedRef.current = true;
-    activePlaybackNodesRef.current = 0;
-    micUnlockAtRef.current = 0;
-
-    // Initialize 24kHz Ring Buffer Playback AudioWorklet + 16kHz Mic Capture Pipeline in parallel
-    try {
-      await Promise.all([
-        attachPlaybackRingBuffer(outCtx, outAnalyser, pipelineGen),
-        attachMicCapturePipeline(micStream, pipelineGen),
-      ]);
-    } catch (err: unknown) {
-      if (audioPipelineGenerationRef.current !== pipelineGen) return;
-      disconnectAllVoiceSessions({ nextFsm: "ERROR" });
-      setLiveError(
-        formatLiveConnectionError(
-          err instanceof Error ? err.message : String(err)
-        )
-      );
-      return;
-    }
-
-    if (
-      !isMountedRef.current ||
-      !callActiveRef.current ||
-      !isOpen ||
-      audioPipelineGenerationRef.current !== pipelineGen
-    ) {
-      return;
-    }
-
-    // Module 4: Inject FULL deterministic memory from second 1 (including persisted summary,
-    // recovered active formula table, and last 16 clean dialog messages)!
-    const primarySessionId = ++nextSessionIdRef.current;
-    const initialMemory = getDeterministicMemoryPrompt();
-    try {
-      const opened = await openGeminiLiveSession({
-        purpose: "primary",
-        sessionIndex: primarySessionId,
-        audioPipelineGen: pipelineGen,
-        memorySummary: initialMemory,
-      });
-
-      if (
+      // Immediately cancel any previous pending connect / token fetch so the lock frees promptly
+      const isSuperseded = () =>
+        switchVersionRef.current !== myVersion ||
         !isMountedRef.current ||
-        !callActiveRef.current ||
-        !isOpen ||
-        audioPipelineGenerationRef.current !== pipelineGen
-      ) {
-        try {
-          opened.session.close();
-        } catch {
-          // ignore
-        }
-        return;
-      }
+        !callActiveRef.current;
 
-      activeSessionRef.current = opened.session;
-      activeSessionIndexRef.current = primarySessionId;
-      activeSessionStartedAtRef.current = Date.now();
-      sessionTurnCountRef.current = 0;
-      micLockedRef.current = false;
-      isPlaybackDrainedRef.current = true;
-      isServerTurnCompleteRef.current = true;
-      setLiveError("");
-      setFsm("LISTENING");
+      const task = connectionLockRef.current
+        .catch(() => {})
+        .then(async () => {
+          if (isSuperseded()) return;
 
-      console.log(
-        `[VOICE S#${primarySessionId}] Connected (model: ${opened.model}, voice: ${opened.voiceName}, tools: ALL 4 AUTO)`
-      );
+          // 1) Full async teardown of previous WebSocket, AudioWorklets, MediaStream & AudioContexts
+          await disconnectAllVoiceSessions({ nextFsm: "CONNECTING" });
+          if (isSuperseded()) return;
 
-      // Age-based background pre-warming timer (pre-warm standby if session reaches 150s age)
-      clearPrewarmInterval();
-      prewarmIntervalRef.current = setInterval(() => {
-        if (
-          !isMountedRef.current ||
-          !callActiveRef.current ||
-          audioPipelineGenerationRef.current !== pipelineGen ||
-          !activeSessionRef.current
-        ) {
-          return;
-        }
-        const ageMs = Date.now() - activeSessionStartedAtRef.current;
-        if (
-          ageMs >= LIVE_STANDBY_MAX_AGE_MS &&
-          !standbySlotRef.current &&
-          !standbyPrewarmingRef.current
-        ) {
-          void prepareStandbySessionRef.current();
-        }
-      }, 5000);
-    } catch (err: unknown) {
-      if (err instanceof Error && err.message === "SESSION_CANCELLED") {
-        return;
-      }
-      if (
-        isMountedRef.current &&
-        callActiveRef.current &&
-        audioPipelineGenerationRef.current === pipelineGen
-      ) {
-        disconnectAllVoiceSessions({
-          keepMicAndAudioCtx: true,
-          nextFsm: "ERROR",
+          // 2) Clean 80ms settle pause so browser audio graph & OS mic device release cleanly
+          await new Promise<void>((resolve) =>
+            setTimeout(resolve, LIVE_VOICE_SWITCH_SETTLE_MS)
+          );
+          if (isSuperseded()) return;
+
+          const pipelineGen = audioPipelineGenerationRef.current;
+          autoReconnectCountRef.current = 0;
+          voiceStopSpeechRef.current?.();
+
+          setLiveError("");
+          setFsm("CONNECTING");
+
+          if (
+            typeof navigator === "undefined" ||
+            !navigator.mediaDevices ||
+            typeof navigator.mediaDevices.getUserMedia !== "function"
+          ) {
+            setLiveError(
+              "Browser tidak mengizinkan akses mikrofon (butuh HTTPS / tab penuh)."
+            );
+            setFsm("ERROR");
+            return;
+          }
+
+          let micStream: MediaStream;
+          try {
+            micStream = await navigator.mediaDevices.getUserMedia({
+              audio: {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true, // Keeps normal speaking volume healthy; continuous noise gate suppresses room hum
+                channelCount: 1,
+              },
+            });
+          } catch (err: unknown) {
+            if (isSuperseded() || audioPipelineGenerationRef.current !== pipelineGen) {
+              return;
+            }
+            if (isMicPermissionDenied(err)) {
+              setLiveError(formatLiveConnectionError("NotAllowedError"));
+            } else {
+              setLiveError(formatLiveConnectionError("NotFoundError"));
+            }
+            setFsm("ERROR");
+            return;
+          }
+
+          if (isSuperseded() || audioPipelineGenerationRef.current !== pipelineGen) {
+            micStream.getTracks().forEach((t) => t.stop());
+            return;
+          }
+
+          liveMicStreamRef.current = micStream;
+          micStream.getAudioTracks().forEach((track) => {
+            track.enabled = !isMicMutedRef.current;
+          });
+
+          const AudioCtx =
+            window.AudioContext ||
+            (window as unknown as { webkitAudioContext?: typeof AudioContext })
+              .webkitAudioContext;
+          if (!AudioCtx) {
+            await disconnectAllVoiceSessions({ nextFsm: "ERROR" });
+            setLiveError(
+              "Browser tidak mendukung Web Audio API untuk audio Live 24kHz."
+            );
+            return;
+          }
+
+          let outCtx: AudioContext;
+          try {
+            outCtx = new AudioCtx({ sampleRate: LIVE_PLAYBACK_SAMPLE_RATE });
+          } catch {
+            outCtx = new AudioCtx();
+          }
+          liveOutputCtxRef.current = outCtx;
+          if (outCtx.state === "suspended") {
+            await outCtx.resume().catch(() => {});
+          }
+
+          if (isSuperseded() || audioPipelineGenerationRef.current !== pipelineGen) {
+            await disconnectAllVoiceSessions();
+            return;
+          }
+
+          const outAnalyser = outCtx.createAnalyser();
+          outAnalyser.fftSize = 256;
+          outAnalyser.smoothingTimeConstant = 0.78;
+          outAnalyser.connect(outCtx.destination);
+          liveOutputAnalyserRef.current = outAnalyser;
+          liveNextPlayTimeRef.current = 0;
+          isServerTurnCompleteRef.current = true;
+          isPlaybackDrainedRef.current = true;
+          activePlaybackNodesRef.current = 0;
+          micUnlockAtRef.current = 0;
+
+          // Initialize 24kHz Adaptive Ring Buffer Playback AudioWorklet + 16kHz Mic Capture Pipeline in parallel
+          try {
+            await Promise.all([
+              attachPlaybackRingBuffer(outCtx, outAnalyser, pipelineGen),
+              attachMicCapturePipeline(micStream, pipelineGen),
+            ]);
+          } catch (err: unknown) {
+            if (isSuperseded() || audioPipelineGenerationRef.current !== pipelineGen) {
+              return;
+            }
+            await disconnectAllVoiceSessions({ nextFsm: "ERROR" });
+            setLiveError(
+              formatLiveConnectionError(
+                err instanceof Error ? err.message : String(err)
+              )
+            );
+            return;
+          }
+
+          if (isSuperseded() || audioPipelineGenerationRef.current !== pipelineGen) {
+            await disconnectAllVoiceSessions();
+            return;
+          }
+
+          // Inject FULL deterministic memory from second 1 (including persisted summary,
+          // recovered active formula table, and last 16 clean dialog messages)!
+          const primarySessionId = ++nextSessionIdRef.current;
+          const initialMemory = getDeterministicMemoryPrompt();
+          try {
+            const opened = await openGeminiLiveSession({
+              purpose: "primary",
+              sessionIndex: primarySessionId,
+              audioPipelineGen: pipelineGen,
+              memorySummary: initialMemory,
+            });
+
+            if (isSuperseded() || audioPipelineGenerationRef.current !== pipelineGen) {
+              try {
+                opened.session.close();
+              } catch {
+                // ignore
+              }
+              return;
+            }
+
+            activeSessionRef.current = opened.session;
+            activeSessionIndexRef.current = primarySessionId;
+            activeSessionStartedAtRef.current = Date.now();
+            sessionTurnCountRef.current = 0;
+            micLockedRef.current = false;
+            isPlaybackDrainedRef.current = true;
+            isServerTurnCompleteRef.current = true;
+            setLiveError("");
+            setFsm("LISTENING");
+
+            console.log(
+              `[VOICE S#${primarySessionId}] Connected (model: ${opened.model}, voice: ${opened.voiceName}, tools: ALL 4 AUTO)`
+            );
+
+            // Age-based background pre-warming timer (pre-warm standby if session reaches 150s age)
+            clearPrewarmInterval();
+            prewarmIntervalRef.current = setInterval(() => {
+              if (
+                !isMountedRef.current ||
+                !callActiveRef.current ||
+                audioPipelineGenerationRef.current !== pipelineGen ||
+                !activeSessionRef.current
+              ) {
+                return;
+              }
+              const ageMs = Date.now() - activeSessionStartedAtRef.current;
+              if (
+                ageMs >= LIVE_STANDBY_MAX_AGE_MS &&
+                !standbySlotRef.current &&
+                !standbyPrewarmingRef.current
+              ) {
+                void prepareStandbySessionRef.current();
+              }
+            }, 5000);
+          } catch (err: unknown) {
+            if (err instanceof Error && err.message === "SESSION_CANCELLED") {
+              return;
+            }
+            if (
+              !isSuperseded() &&
+              audioPipelineGenerationRef.current === pipelineGen
+            ) {
+              await disconnectAllVoiceSessions({
+                keepMicAndAudioCtx: true,
+                nextFsm: "ERROR",
+              });
+              setLiveError(
+                err instanceof Error
+                  ? err.message
+                  : formatLiveConnectionError(String(err))
+              );
+            }
+          }
         });
-        setLiveError(
-          err instanceof Error
-            ? err.message
-            : formatLiveConnectionError(String(err))
-        );
-      }
-    }
-  }, [
-    attachMicCapturePipeline,
-    attachPlaybackRingBuffer,
-    clearPrewarmInterval,
-    disconnectAllVoiceSessions,
-    getDeterministicMemoryPrompt,
-    isOpen,
-    openGeminiLiveSession,
-    setFsm,
-  ]);
+
+      connectionLockRef.current = task;
+      await task;
+    },
+    [
+      attachMicCapturePipeline,
+      attachPlaybackRingBuffer,
+      clearPrewarmInterval,
+      disconnectAllVoiceSessions,
+      getDeterministicMemoryPrompt,
+      openGeminiLiveSession,
+      setFsm,
+    ]
+  );
 
   useEffect(() => {
     startLiveSessionRef.current = startLiveVoiceSession;
@@ -5017,13 +5291,14 @@ export function InteractiveVoiceCallOverlay({
     };
   }, []);
 
-  // Open / close lifecycle — single active session guaranteed (StrictMode-safe via bootTimerRef)
+  // Open / close lifecycle — single active session guaranteed via mutex + bootTimerRef
   useEffect(() => {
     isMountedRef.current = true;
     callActiveRef.current = isOpen;
 
     if (!isOpen) {
-      disconnectAllVoiceSessions({ nextFsm: "IDLE" });
+      switchVersionRef.current += 1;
+      void disconnectAllVoiceSessions({ nextFsm: "IDLE" });
       queueMicrotask(() => {
         setLiveError("");
       });
@@ -5038,13 +5313,14 @@ export function InteractiveVoiceCallOverlay({
     bootTimerRef.current = setTimeout(() => {
       bootTimerRef.current = null;
       if (!isMountedRef.current || !callActiveRef.current) return;
-      void startLiveSessionRef.current();
+      void startLiveSessionRef.current(selectedVoiceRef.current);
     }, 40);
 
     return () => {
       isMountedRef.current = false;
       callActiveRef.current = false;
-      disconnectAllVoiceSessions();
+      switchVersionRef.current += 1;
+      void disconnectAllVoiceSessions();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
@@ -5056,15 +5332,14 @@ export function InteractiveVoiceCallOverlay({
     selectedVoiceRef.current = nextVoice;
     setSelectedVoice(nextVoice);
     if (callActiveRef.current) {
-      disconnectAllVoiceSessions({ nextFsm: "CONNECTING" });
-      void startLiveSessionRef.current();
+      // Single-init mutex: aborts previous connect/audio graph, awaits full close + 80ms settle, connects ONCE
+      void startLiveSessionRef.current(nextVoice);
     }
   };
 
   const handleOrbInteract = () => {
     if (fsmState === "ERROR") {
-      disconnectAllVoiceSessions({ nextFsm: "CONNECTING" });
-      void startLiveSessionRef.current();
+      void startLiveSessionRef.current(selectedVoiceRef.current);
       return;
     }
     if (liveOutputCtxRef.current?.state === "suspended") {
@@ -5225,8 +5500,7 @@ export function InteractiveVoiceCallOverlay({
           <button
             type="button"
             onClick={() => {
-              disconnectAllVoiceSessions({ nextFsm: "CONNECTING" });
-              void startLiveSessionRef.current();
+              void startLiveSessionRef.current(selectedVoiceRef.current);
             }}
             className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-[#b91c1c] hover:bg-[#991b1b] text-white text-[10.5px] font-medium whitespace-nowrap cursor-pointer transition-colors shrink-0"
           >

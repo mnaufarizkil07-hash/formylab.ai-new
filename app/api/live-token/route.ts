@@ -1,61 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
+import { GoogleGenAI } from "@google/genai";
 import {
-  ActivityHandling,
-  EndSensitivity,
-  GoogleGenAI,
-  Modality,
-  StartSensitivity,
-  type Tool,
-} from "@google/genai";
-import {
+  LIVE_NATIVE_AUDIO_MODELS,
   LiveVoiceName,
-  buildLiveVoiceFunctionDeclarations,
-  buildLiveVoiceSystemInstruction,
-  getLiveThinkingConfigForModel,
+  createLiveVoiceConfig,
+  normalizeLiveVoiceName,
 } from "../../../components/liveVoiceHelpers";
-
-/**
- * Native Audio Live models ordered for ultra-low-latency (< 1s) Vercel-compatible connections:
- * Supports Ephemeral Tokens, High-Sensitivity Server VAD, model-aware anti-thinking config,
- * and ALL 4 Unified Skills permanently active across all 4 voice chips.
- * (No contextWindowCompression overhead — Hot-Swap every 8 turns keeps context lightweight.)
- */
-const LIVE_NATIVE_AUDIO_MODELS = [
-  "gemini-2.5-flash-native-audio-preview-12-2025",
-  "gemini-2.5-flash-native-audio-preview-09-2025",
-  "gemini-3.8-live",
-] as const;
-
-const ALLOWED_VOICES = new Set<LiveVoiceName>([
-  "Aoede",
-  "Zephyr",
-  "Kore",
-  "Puck",
-]);
-
-// High-Sensitivity Native Server VAD paired with client Adaptive Soft Noise Attenuator (0.08x + 160ms pre-roll):
-// Catches normal-volume "halo" 100% instantly while cutting turn latency under 1s.
-const SDK_SERVER_VAD_CONFIG = {
-  automaticActivityDetection: {
-    disabled: false,
-    startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
-    endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_HIGH,
-    prefixPaddingMs: 60,
-    silenceDurationMs: 180,
-  },
-  activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
-};
-
-const WS_SERVER_VAD_CONFIG = {
-  automaticActivityDetection: {
-    disabled: false,
-    startOfSpeechSensitivity: "START_SENSITIVITY_HIGH",
-    endOfSpeechSensitivity: "END_SENSITIVITY_HIGH",
-    prefixPaddingMs: 60,
-    silenceDurationMs: 180,
-  },
-  activityHandling: "START_OF_ACTIVITY_INTERRUPTS",
-};
 
 export async function POST(req: NextRequest) {
   try {
@@ -87,11 +37,8 @@ export async function POST(req: NextRequest) {
       ) {
         memorySummary = body.recentContext.trim().slice(0, 7500);
       }
-      if (
-        typeof body?.voiceName === "string" &&
-        ALLOWED_VOICES.has(body.voiceName as LiveVoiceName)
-      ) {
-        requestedVoice = body.voiceName as LiveVoiceName;
+      if (typeof body?.voiceName === "string") {
+        requestedVoice = normalizeLiveVoiceName(body.voiceName);
       }
       if (Array.isArray(body?.excludeModels)) {
         const known = new Set<string>(LIVE_NATIVE_AUDIO_MODELS);
@@ -124,16 +71,6 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const systemInstruction = buildLiveVoiceSystemInstruction(memorySummary);
-
-    // Unified Tool Array: ALL 4 skills (`create_formula_table`, `save_to_google_docs`,
-    // `search_web_info`, `recall_chat_history`) permanently active on EVERY voice chip!
-    const unifiedTools: Tool[] = [
-      {
-        functionDeclarations: buildLiveVoiceFunctionDeclarations(),
-      },
-    ];
-
     const ai = new GoogleGenAI({
       apiKey,
       httpOptions: {
@@ -163,16 +100,21 @@ export async function POST(req: NextRequest) {
     for (let idx = 0; idx < candidateModels.length; idx++) {
       const modelId = candidateModels[idx];
       const remainingCandidatesCount = candidateModels.length - idx - 1;
-      const resolvedThinkingConfig = disableThinkingConfig
-        ? undefined
-        : getLiveThinkingConfigForModel(modelId);
 
-      const thinkingPatch = resolvedThinkingConfig
-        ? { thinkingConfig: resolvedThinkingConfig }
+      // Single Unified Config Factory across Aoede, Zephyr, Kore, Puck (zero voice-specific branches)
+      const unified = createLiveVoiceConfig(requestedVoice, {
+        memorySummary,
+        modelId,
+        disableThinkingConfig,
+        disableCustomVad,
+      });
+
+      const thinkingPatch = unified.thinkingConfig
+        ? { thinkingConfig: unified.thinkingConfig }
         : {};
-      const vadPatch = disableCustomVad
-        ? {}
-        : { realtimeInputConfig: SDK_SERVER_VAD_CONFIG };
+      const vadPatch = unified.sdkRealtimeInputConfig
+        ? { realtimeInputConfig: unified.sdkRealtimeInputConfig }
+        : {};
 
       // Tier 1: Constrained Ephemeral Token with All 4 Unified Tools + Model-Aware Anti-Thinking + High-Sensitivity VAD
       try {
@@ -182,18 +124,12 @@ export async function POST(req: NextRequest) {
             expireTime,
             newSessionExpireTime,
             liveConnectConstraints: {
-              model: modelId,
+              model: unified.model,
               config: {
-                responseModalities: [Modality.AUDIO],
-                speechConfig: {
-                  voiceConfig: {
-                    prebuiltVoiceConfig: {
-                      voiceName: requestedVoice,
-                    },
-                  },
-                },
-                systemInstruction,
-                tools: unifiedTools,
+                responseModalities: unified.responseModalities,
+                speechConfig: unified.speechConfig,
+                systemInstruction: unified.systemInstruction,
+                tools: unified.tools,
                 inputAudioTranscription: {},
                 outputAudioTranscription: {},
                 ...thinkingPatch,
@@ -207,14 +143,13 @@ export async function POST(req: NextRequest) {
           return NextResponse.json({
             success: true,
             token: tokenRes.name,
-            model: modelId,
-            voiceName: requestedVoice,
-            systemInstruction,
-            tools: unifiedTools,
-            thinkingConfig: resolvedThinkingConfig,
-            realtimeInputConfig: disableCustomVad
-              ? undefined
-              : WS_SERVER_VAD_CONFIG,
+            model: unified.model,
+            voiceName: unified.voiceName,
+            systemInstruction: unified.systemInstruction,
+            tools: unified.tools,
+            thinkingConfig: unified.thinkingConfig,
+            realtimeInputConfig: unified.wsRealtimeInputConfig,
+            playbackPrebufferMs: unified.playbackPrebufferMs,
             expireTime,
             remainingCandidatesCount,
           });
@@ -233,7 +168,7 @@ export async function POST(req: NextRequest) {
             expireTime,
             newSessionExpireTime,
             liveConnectConstraints: {
-              model: modelId,
+              model: unified.model,
             },
           },
         });
@@ -242,14 +177,13 @@ export async function POST(req: NextRequest) {
           return NextResponse.json({
             success: true,
             token: tokenRes.name,
-            model: modelId,
-            voiceName: requestedVoice,
-            systemInstruction,
-            tools: unifiedTools,
-            thinkingConfig: resolvedThinkingConfig,
-            realtimeInputConfig: disableCustomVad
-              ? undefined
-              : WS_SERVER_VAD_CONFIG,
+            model: unified.model,
+            voiceName: unified.voiceName,
+            systemInstruction: unified.systemInstruction,
+            tools: unified.tools,
+            thinkingConfig: unified.thinkingConfig,
+            realtimeInputConfig: unified.wsRealtimeInputConfig,
+            playbackPrebufferMs: unified.playbackPrebufferMs,
             expireTime,
             remainingCandidatesCount,
           });

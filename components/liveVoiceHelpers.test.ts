@@ -10,27 +10,38 @@ import {
   LIVE_INPUT_HANG_TIME_MS,
   LIVE_INPUT_MIN_SPEECH_RMS,
   LIVE_INPUT_NOISE_CALIBRATION_MS,
+  LIVE_INPUT_NOISE_FLOOR_INITIAL,
+  LIVE_INPUT_NOISE_FLOOR_MAX,
+  LIVE_INPUT_NOISE_FLOOR_MIN,
   LIVE_INPUT_NOISE_MULTIPLIER,
+  LIVE_INPUT_ONSET_FRAMES,
   LIVE_INPUT_PREROLL_MS,
   LIVE_INPUT_QUIET_ATTENUATION,
   LIVE_INPUT_RMS_REPORT_INTERVAL_MS,
   LIVE_MAX_AUTO_RECONNECTS,
   LIVE_MEMORY_RECENT_MESSAGES,
+  LIVE_NATIVE_AUDIO_MODELS,
   LIVE_PLAYBACK_FADE_IN_MS,
   LIVE_PLAYBACK_FADE_OUT_MS,
+  LIVE_PLAYBACK_MAX_PREBUFFER_MS,
   LIVE_PLAYBACK_PREBUFFER_MS,
   LIVE_PLAYBACK_PREBUFFER_SAMPLES,
   LIVE_PLAYBACK_RING_SECONDS,
   LIVE_PLAYBACK_SAMPLE_RATE,
+  LIVE_PLAYBACK_UNDERRUN_BUMP_MS,
+  LIVE_PLAYBACK_UNDERRUN_FADEOUT_MS,
   LIVE_SPEECH_QUIET_CONFIRM_MS,
   LIVE_STANDBY_MAX_AGE_MS,
   LIVE_STANDBY_PREWARM_TURN,
   LIVE_STATUS_LABELS,
+  LIVE_TABLE_DEDUP_WINDOW_MS,
   LIVE_TOOL_RECOVERY_MS,
   LIVE_TOOL_TIMEOUT_MS,
   LIVE_TRANSCRIPT_THROTTLE_MS,
   LIVE_TURN_WATCHDOG_MS,
   LIVE_VOICE_OPTIONS,
+  LIVE_VOICE_SWITCH_SETTLE_MS,
+  type LiveVoiceName,
   appendTranscriptFragment,
   base64PcmToFloat32,
   buildConversationMemorySummary,
@@ -41,6 +52,7 @@ import {
   computeInt16PcmRms,
   createAdaptiveSoftAttenuator,
   createContinuousResampler,
+  createLiveVoiceConfig,
   createPlaybackRingBufferEngine,
   createSpeechEndProfilerState,
   downsampleFloat32ToInt16Pcm,
@@ -52,8 +64,10 @@ import {
   getScopedChatStorageKey,
   getVoiceMemoryStorageKey,
   hasGoogleSearchGrounding,
+  hasMeaningfulAssistantText,
   hasNonLatinScript,
   int16PcmToBase64,
+  isDuplicateFormulaTableRequest,
   isNonLatinHallucinationFragment,
   isValidAutoSessionTitle,
   observeMicRmsForProfiler,
@@ -75,27 +89,36 @@ import {
   validateAndBalanceFormulationRows,
 } from "./chatNoteUtils";
 
-test("Live Voice constants match sub-1s sensitivity & latency tuning (70Hz highpass, 45ms/1080-sample prebuffer, 150ms echo tail, 160ms pre-roll, 650ms hang-time, 0.08x soft attenuation)", () => {
+test("Live Voice constants match unified stability tuning (70Hz highpass, 85ms/2040-sample adaptive prebuffer, 200ms echo tail, 60ms onset, 160ms pre-roll, 600ms hang-time, 0.012x quiet attenuation, 80ms switch settle, 6s table dedup)", () => {
   assert.equal(LIVE_INPUT_CHUNK_SAMPLES, 320); // exact 20ms @ 16kHz
   assert.equal(LIVE_HIGHPASS_CUTOFF_HZ, 70);
   assert.equal(LIVE_HIGHPASS_Q, 0.7);
   assert.equal(LIVE_INPUT_NOISE_CALIBRATION_MS, 300);
+  assert.equal(LIVE_INPUT_NOISE_FLOOR_INITIAL, 0.008);
+  assert.equal(LIVE_INPUT_NOISE_FLOOR_MIN, 0.004);
+  assert.equal(LIVE_INPUT_NOISE_FLOOR_MAX, 0.022);
+  assert.equal(LIVE_INPUT_NOISE_MULTIPLIER, 2.8);
+  assert.equal(LIVE_INPUT_MIN_SPEECH_RMS, 0.028);
+  assert.equal(LIVE_INPUT_ONSET_FRAMES, 3); // 60ms onset confirmation
   assert.equal(LIVE_INPUT_PREROLL_MS, 160);
-  assert.equal(LIVE_INPUT_HANG_TIME_MS, 650);
-  assert.equal(LIVE_INPUT_QUIET_ATTENUATION, 0.08);
-  assert.equal(LIVE_INPUT_MIN_SPEECH_RMS, 0.008);
-  assert.equal(LIVE_INPUT_NOISE_MULTIPLIER, 1.8);
+  assert.equal(LIVE_INPUT_HANG_TIME_MS, 600);
+  assert.equal(LIVE_INPUT_QUIET_ATTENUATION, 0.012);
   assert.equal(LIVE_INPUT_RMS_REPORT_INTERVAL_MS, 60);
 
   assert.equal(LIVE_PLAYBACK_SAMPLE_RATE, 24000);
-  assert.equal(LIVE_PLAYBACK_PREBUFFER_MS, 45);
-  assert.equal(LIVE_PLAYBACK_PREBUFFER_SAMPLES, 1080); // exact 45ms @ 24kHz
+  assert.equal(LIVE_PLAYBACK_PREBUFFER_MS, 85);
+  assert.equal(LIVE_PLAYBACK_PREBUFFER_SAMPLES, 2040); // exact 85ms @ 24kHz
+  assert.equal(LIVE_PLAYBACK_UNDERRUN_BUMP_MS, 120);
+  assert.equal(LIVE_PLAYBACK_MAX_PREBUFFER_MS, 140);
+  assert.equal(LIVE_PLAYBACK_UNDERRUN_FADEOUT_MS, 3);
   assert.equal(LIVE_PLAYBACK_RING_SECONDS, 30);
   assert.equal(LIVE_PLAYBACK_FADE_IN_MS, 3);
   assert.equal(LIVE_PLAYBACK_FADE_OUT_MS, 5);
 
   assert.equal(LIVE_TRANSCRIPT_THROTTLE_MS, 80);
-  assert.equal(LIVE_ECHO_GUARD_TAIL_MS, 150);
+  assert.equal(LIVE_ECHO_GUARD_TAIL_MS, 200);
+  assert.equal(LIVE_VOICE_SWITCH_SETTLE_MS, 80);
+  assert.equal(LIVE_TABLE_DEDUP_WINDOW_MS, 6_000);
   assert.equal(LIVE_SPEECH_QUIET_CONFIRM_MS, 180);
   assert.equal(LIVE_STANDBY_PREWARM_TURN, 7);
   assert.equal(LIVE_HOTSWAP_TARGET_TURN, 8);
@@ -115,6 +138,45 @@ test("Live Voice constants match sub-1s sensitivity & latency tuning (70Hz highp
   assert.equal(LIVE_FSM_STATUS_LABELS.LISTENING, "Live · Mendengarkan");
   assert.equal(LIVE_FSM_STATUS_LABELS.AI_SPEAKING, "Live · AI Berbicara");
   assert.equal(LIVE_FSM_STATUS_LABELS.TOOL_EXECUTING, "Live · Menyiapkan Aksi...");
+});
+
+test("createLiveVoiceConfig produces 100% identical model, VAD, prebuffer, systemInstruction, and 4 tools across Aoede, Zephyr, Kore, and Puck", () => {
+  const fixedDate = new Date("2026-04-12T05:00:00Z");
+  const voices: LiveVoiceName[] = ["Aoede", "Zephyr", "Kore", "Puck"];
+  const configs = voices.map((v) =>
+    createLiveVoiceConfig(v, {
+      memorySummary: "Nama user: Rina.",
+      now: fixedDate,
+    })
+  );
+
+  const base = configs[0];
+  assert.equal(base.model, LIVE_NATIVE_AUDIO_MODELS[0]);
+  assert.equal(base.playbackPrebufferMs, 85);
+  assert.equal(base.echoGuardTailMs, 200);
+  assert.deepEqual(base.thinkingConfig, { thinkingBudget: 0 });
+  assert.equal(
+    base.wsRealtimeInputConfig?.automaticActivityDetection.startOfSpeechSensitivity,
+    "START_SENSITIVITY_HIGH"
+  );
+  assert.equal(
+    base.wsRealtimeInputConfig?.automaticActivityDetection.silenceDurationMs,
+    180
+  );
+
+  for (let i = 0; i < configs.length; i++) {
+    const cfg = configs[i];
+    assert.equal(cfg.voiceName, voices[i]);
+    assert.equal(cfg.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName, voices[i]);
+    assert.deepEqual(cfg.models, base.models);
+    assert.equal(cfg.model, base.model);
+    assert.equal(cfg.systemInstruction, base.systemInstruction);
+    assert.deepEqual(cfg.tools, base.tools);
+    assert.deepEqual(cfg.thinkingConfig, base.thinkingConfig);
+    assert.deepEqual(cfg.wsRealtimeInputConfig, base.wsRealtimeInputConfig);
+    assert.equal(cfg.playbackPrebufferMs, base.playbackPrebufferMs);
+    assert.equal(cfg.echoGuardTailMs, base.echoGuardTailMs);
+  }
 });
 
 test("getLiveThinkingConfigForModel returns thinkingBudget:0 for gemini-2.5 native audio and thinkingLevel:minimal for gemini-3.*-live", () => {
@@ -137,77 +199,121 @@ test("getLiveThinkingConfigForModel returns thinkingBudget:0 for gemini-2.5 nati
   assert.equal(getLiveThinkingConfigForModel("unknown-model"), undefined);
 });
 
-test("createAdaptiveSoftAttenuator calibrates 300ms noiseFloor, attenuates quiet hum to 0.08x (never 0), flushes 160ms pre-roll at 1.0x on 'halo', holds 650ms hang-time, and reports RMS every 60ms", () => {
+test("createAdaptiveSoftAttenuator continuously adapts noiseFloor, blocks room hum (RMS 0.015) & 1-2 frame clicks, requires 60ms (3-frame) onset, attenuates quiet to 0.012x, and emits edge-triggered gate events once", () => {
   const attenuator = createAdaptiveSoftAttenuator();
-  const quietFrame = new Float32Array(320).fill(0.004);
-  const speechFrame = new Float32Array(320).fill(0.06);
+  const roomHumFrame = new Float32Array(320).fill(0.015);
+  const speechFrame = new Float32Array(320).fill(0.09);
 
-  // Feed 15 quiet frames (300ms calibration): RMS reports every 3rd frame (60ms), output attenuated ~0.08x (non-zero!)
-  let rmsReports = 0;
-  let lastQuietPcm: Int16Array | null = null;
-  for (let i = 0; i < 15; i++) {
-    const res = attenuator.processFrame(quietFrame);
+  // 40 frames (800ms) of persistent room hum (RMS 0.015):
+  // noiseFloor adapts upward toward ~0.014, threshold rises > 0.035, gate NEVER opens, ZERO gate events!
+  let gateStarts = 0;
+  let gateEnds = 0;
+  let lastHumPcm: Int16Array | null = null;
+  for (let i = 0; i < 40; i++) {
+    const res = attenuator.processFrame(roomHumFrame);
     assert.equal(res.gateOpen, false);
+    assert.equal(res.gateEvent, null);
     assert.equal(res.packets.length, 1);
-    assert.equal(res.packets[0].isPreRoll, false);
-    lastQuietPcm = res.packets[0].pcm;
-    if (res.rmsTelemetry) rmsReports += 1;
+    lastHumPcm = res.packets[0].pcm;
   }
-  assert.equal(rmsReports, 5); // 300ms / 60ms = 5 reports
-  assert.ok(lastQuietPcm);
-  // Softly attenuated to ~0.08x (NOT hard zero mute)
-  const quietSampleVal = Math.abs(lastQuietPcm![200]) / 32767;
-  assert.ok(quietSampleVal > 0.0001 && quietSampleVal < 0.001, `Expected ~0.00032, got ${quietSampleVal}`);
+  assert.ok(lastHumPcm);
+  // Strongly attenuated to ~0.012x (0.015 * 0.012 = 0.00018 -> silent to Server VAD!)
+  const humSampleVal = Math.abs(lastHumPcm![200]) / 32767;
+  assert.ok(humSampleVal < 0.0004, `Expected strong 0.012x attenuation (<0.0004), got ${humSampleVal}`);
 
-  // Normal voice onset ("halo"): immediately flushes 8 pre-roll frames (160ms) + 1 live frame at 1.0x!
-  const onsetRes = attenuator.processFrame(speechFrame);
-  assert.equal(onsetRes.gateOpen, true);
-  assert.equal(onsetRes.packets.length, 9); // 8 pre-roll (160ms) + 1 live frame
-  assert.equal(onsetRes.packets.filter((p) => p.isPreRoll).length, 8);
-  const liveSampleVal = Math.abs(onsetRes.packets[8].pcm[200]) / 32767;
-  assert.ok(Math.abs(liveSampleVal - 0.06) < 0.003);
+  // Brief 2-frame click/pop (40ms < 60ms onset): MUST NOT open gate!
+  assert.equal(attenuator.processFrame(speechFrame).gateOpen, false);
+  assert.equal(attenuator.processFrame(speechFrame).gateOpen, false);
+  assert.equal(attenuator.processFrame(roomHumFrame).gateOpen, false);
 
-  // After voice drops, holds 1.0x for 650ms hang-time (33 frames of 20ms -> stays open through 640ms, closes at 660ms)
-  for (let i = 0; i < 32; i++) {
-    const hangRes = attenuator.processFrame(quietFrame);
+  // Real speech ("halo"): 3 consecutive frames >= threshold -> opens gate ONCE on frame #3 & flushes 160ms pre-roll (8 frames) + live!
+  const f1 = attenuator.processFrame(speechFrame);
+  assert.equal(f1.gateOpen, false);
+  assert.equal(f1.gateEvent, null);
+  const f2 = attenuator.processFrame(speechFrame);
+  assert.equal(f2.gateOpen, false);
+  assert.equal(f2.gateEvent, null);
+  const f3 = attenuator.processFrame(speechFrame);
+  assert.equal(f3.gateOpen, true);
+  assert.equal(f3.gateEvent?.type, "speechStart");
+  gateStarts += 1;
+  assert.equal(f3.packets.length, 9); // 8 pre-roll (160ms, including f1 & f2!) + 1 live
+  assert.equal(f3.packets.filter((p) => p.isPreRoll).length, 8);
+  const liveSampleVal = Math.abs(f3.packets[8].pcm[200]) / 32767;
+  assert.ok(Math.abs(liveSampleVal - 0.09) < 0.004);
+
+  // After speech stops, holds 1.0x for 600ms hang-time (30 frames @ 20ms) then emits speechEnd ONCE
+  for (let i = 0; i < 29; i++) {
+    const hangRes = attenuator.processFrame(roomHumFrame);
     assert.equal(hangRes.gateOpen, true, `Expected gateOpen during hang-time frame ${i}`);
-    const val = Math.abs(hangRes.packets[0].pcm[200]) / 32767;
-    assert.ok(Math.abs(val - 0.004) < 0.001); // still 1.0x unattenuated during hang-time
+    assert.equal(hangRes.gateEvent, null);
   }
-  const closeRes = attenuator.processFrame(quietFrame);
+  const closeRes = attenuator.processFrame(roomHumFrame);
   assert.equal(closeRes.gateOpen, false);
+  assert.equal(closeRes.gateEvent?.type, "speechEnd");
+  gateEnds += 1;
+
+  // Subsequent quiet frames NEVER emit duplicate speechEnd events (eliminates '(28) Speech ended' spam!)
+  for (let i = 0; i < 25; i++) {
+    const quietAfter = attenuator.processFrame(roomHumFrame);
+    assert.equal(quietAfter.gateOpen, false);
+    assert.equal(quietAfter.gateEvent, null);
+  }
+  assert.equal(gateStarts, 1);
+  assert.equal(gateEnds, 1);
 });
 
-test("createPlaybackRingBufferEngine enforces 45ms (1080-sample) prebuffer, 3ms fade-in, short-reply turnComplete flush, edge-triggered bufferDrained, and 5ms fade-out stop", () => {
-  const engine = createPlaybackRingBufferEngine(24000, 45, 30);
+test("createPlaybackRingBufferEngine enforces 85ms (2040-sample) initial prebuffer, Adaptive Underrun Cushion (3ms micro fade-out + 85->120->140ms bump), short-reply flush, and 5ms stop fade-out", () => {
+  const engine = createPlaybackRingBufferEngine(24000, 85, 30);
+  assert.equal(engine.getPreBufferMs(), 85);
 
-  // Push 500 samples (< 1080 prebuffer threshold): output stays silent until threshold or turnComplete
-  engine.push(new Float32Array(500).fill(0.5));
+  // Push 1000 samples (< 2040 prebuffer threshold): output stays silent until 85ms or turnComplete
+  engine.push(new Float32Array(1000).fill(0.5));
   const beforePrebuffer = engine.pullBlock(128);
   assert.equal(beforePrebuffer.playing, false);
   assert.equal(beforePrebuffer.drainedEvent, false);
   assert.equal(beforePrebuffer.output[0], 0);
-  assert.equal(beforePrebuffer.bufferedSamples, 500);
+  assert.equal(beforePrebuffer.bufferedSamples, 1000);
 
-  // Push 700 more samples (total 1200 >= 1080): starts playing with 3ms (72-sample) fade-in ramp
-  engine.push(new Float32Array(700).fill(0.5));
+  // Push 1100 more samples (total 2100 >= 2040): starts playing with 3ms (72-sample) fade-in ramp
+  engine.push(new Float32Array(1100).fill(0.5));
   const firstPlayBlock = engine.pullBlock(128);
   assert.equal(firstPlayBlock.playing, true);
   assert.equal(firstPlayBlock.drainedEvent, false);
-  assert.equal(firstPlayBlock.output[0], 0); // click-free 0-crossing fade-in start
+  assert.equal(firstPlayBlock.output[0], 0);
   assert.ok(firstPlayBlock.output[1] > 0 && firstPlayBlock.output[1] < 0.05);
   assert.ok(Math.abs(firstPlayBlock.output[100] - 0.5) < 0.001);
 
-  // Drain buffer to empty: emits edge-triggered drainedEvent EXACTLY ONCE on empty
-  let drainCount = 0;
+  // Drain buffer WITHOUT markTurnComplete (simulated mid-sentence network jitter underrun):
+  // MUST perform 3ms micro fade-out (non-zero decaying tail, NOT hard drop to 0) AND bump preBufferMs 85 -> 120ms!
+  let underrunEvents = 0;
+  let lastUnderrunOutput: Float32Array | null = null;
   while (engine.getBufferedSamples() > 0) {
     const step = engine.pullBlock(128);
-    if (step.drainedEvent) drainCount += 1;
+    assert.equal(step.drainedEvent, false); // turnComplete not received yet!
+    if (step.underrunEvent) {
+      underrunEvents += 1;
+      lastUnderrunOutput = step.output;
+    }
   }
-  assert.equal(drainCount, 1);
+  assert.equal(underrunEvents, 1);
+  assert.equal(engine.getPreBufferMs(), 120);
+  assert.ok(lastUnderrunOutput);
+
+  // A second underrun caps at 140ms (2880+ samples needed at 120ms first)
+  engine.push(new Float32Array(2900).fill(0.4));
+  while (engine.getBufferedSamples() > 0) {
+    engine.pullBlock(128);
+  }
+  assert.equal(engine.getPreBufferMs(), 140);
+
+  // When server finally sends turnComplete after buffer emptied, next pull emits drainedEvent ONCE
+  engine.markTurnComplete();
+  const afterComplete = engine.pullBlock(128);
+  assert.equal(afterComplete.drainedEvent, true);
   assert.equal(engine.pullBlock(128).drainedEvent, false);
 
-  // Short reply (< 1080 samples) stays held until markTurnComplete(), then flushes immediately
+  // Short reply (< 140ms) stays held until markTurnComplete(), then flushes immediately
   engine.push(new Float32Array(256).fill(0.4));
   assert.equal(engine.pullBlock(128).playing, false);
   engine.markTurnComplete();
@@ -218,13 +324,84 @@ test("createPlaybackRingBufferEngine enforces 45ms (1080-sample) prebuffer, 3ms 
   assert.equal(shortSecond.drainedEvent, true);
 
   // Barge-in stopWithFadeOut() ramps smoothly down to 0 and clears buffer
-  engine.push(new Float32Array(2000).fill(0.6));
+  engine.push(new Float32Array(3500).fill(0.6));
   assert.equal(engine.pullBlock(128).playing, true);
   engine.stopWithFadeOut();
   const fadeBlock = engine.pullBlock(128);
   assert.ok(fadeBlock.output[0] > fadeBlock.output[60]);
   assert.equal(fadeBlock.output[127], 0);
   assert.equal(engine.getBufferedSamples(), 0);
+});
+
+test("hasMeaningfulAssistantText rejects empty '...' / punctuation-only AI bubbles while keeping real responses", () => {
+  assert.equal(hasMeaningfulAssistantText(""), false);
+  assert.equal(hasMeaningfulAssistantText("   "), false);
+  assert.equal(hasMeaningfulAssistantText("..."), false);
+  assert.equal(hasMeaningfulAssistantText("…"), false);
+  assert.equal(hasMeaningfulAssistantText(". , ! ? - —"), false);
+  assert.equal(hasMeaningfulAssistantText("<noise> ... "), false);
+  assert.equal(hasMeaningfulAssistantText("Oke siap!"), true);
+  assert.equal(hasMeaningfulAssistantText("Halo, mau racik serum apa hari ini?"), true);
+});
+
+test("isDuplicateFormulaTableRequest enforces 6-second deduplication and in-flight guard against duplicate FormulaTableCard renders", () => {
+  const baseEntry = {
+    topic: "Moisturizer Barrier Kulit Sensitif dengan Niacinamide & Ceramide",
+    tableType: "formulation",
+    atMs: 10_000,
+  };
+
+  // In-flight guard always blocks concurrent duplicate call
+  assert.equal(
+    isDuplicateFormulaTableRequest(
+      null,
+      { topic: "Serum Vitamin C", tableType: "formulation", nowMs: 10_500 },
+      true
+    ),
+    true
+  );
+
+  // Same/near-identical topic within < 6,000ms is blocked
+  assert.equal(
+    isDuplicateFormulaTableRequest(
+      baseEntry,
+      {
+        topic: "Moisturizer Barrier Kulit Sensitif Niacinamide",
+        tableType: "formulation",
+        nowMs: 14_500,
+      },
+      false
+    ),
+    true
+  );
+
+  // Different topic within 6s is allowed
+  assert.equal(
+    isDuplicateFormulaTableRequest(
+      baseEntry,
+      {
+        topic: "Sunscreen Gel SPF 50 PA++++",
+        tableType: "formulation",
+        nowMs: 12_000,
+      },
+      false
+    ),
+    false
+  );
+
+  // Same topic AFTER >= 6,000ms is allowed again
+  assert.equal(
+    isDuplicateFormulaTableRequest(
+      baseEntry,
+      {
+        topic: "Moisturizer Barrier Kulit Sensitif dengan Niacinamide & Ceramide",
+        tableType: "formulation",
+        nowMs: 16_000,
+      },
+      false
+    ),
+    false
+  );
 });
 
 test("appendTranscriptFragment merges chunks cleanly without glued words like fokuskan?Atau or tertentuSorry", () => {
