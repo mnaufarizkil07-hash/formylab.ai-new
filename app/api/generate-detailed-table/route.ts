@@ -15,10 +15,29 @@ import {
  */
 const DETAILED_TABLE_MODELS = [
   "gemini-2.5-flash",
-  "gemini-4-hydrogen",
   "gemini-3.1-flash-lite",
-  "gemini-3-flash-preview",
+  "gemini-4-hydrogen",
 ] as const;
+
+const DETAILED_TABLE_TIMEOUT_MS = 18_000;
+
+function raceTableTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`TABLE_GEN_TIMEOUT_${timeoutMs}MS`));
+    }, timeoutMs);
+    promise.then(
+      (val) => {
+        clearTimeout(timer);
+        resolve(val);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
 
 const FORMULATION_RESPONSE_SCHEMA = {
   type: Type.OBJECT,
@@ -279,17 +298,24 @@ export async function POST(req: NextRequest) {
         : COMPARISON_RESPONSE_SCHEMA;
 
     const attemptErrors: string[] = [];
+    const deadlineMs = Date.now() + DETAILED_TABLE_TIMEOUT_MS;
 
     for (const model of DETAILED_TABLE_MODELS) {
+      const remainingMs = deadlineMs - Date.now();
+      if (remainingMs < 2500) break;
+
       try {
-        const response = await ai.models.generateContent({
-          model,
-          contents: prompt,
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: schema,
-          },
-        });
+        const response = await raceTableTimeout(
+          ai.models.generateContent({
+            model,
+            contents: prompt,
+            config: {
+              responseMimeType: "application/json",
+              responseSchema: schema,
+            },
+          }),
+          remainingMs
+        );
 
         const parsed = parseJsonSafely(response.text || "");
         if (!parsed) {
@@ -372,11 +398,15 @@ export async function POST(req: NextRequest) {
           continue;
         }
 
-        return NextResponse.json({
-          success: true,
-          table: artifact,
-          model,
-        });
+        return NextResponse.json(
+          {
+            ok: true,
+            success: true,
+            table: artifact,
+            model,
+          },
+          { status: 200 }
+        );
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         attemptErrors.push(`[${model}] ${msg.slice(0, 180)}`);
@@ -385,20 +415,22 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json(
       {
+        ok: false,
         success: false,
         error:
           attemptErrors.join(" | ") ||
           "Gagal menghasilkan tabel R&D terperinci dari server.",
       },
-      { status: 502 }
+      { status: 200 }
     );
   } catch (err: unknown) {
     return NextResponse.json(
       {
+        ok: false,
         success: false,
         error: err instanceof Error ? err.message : String(err),
       },
-      { status: 500 }
+      { status: 200 }
     );
   }
 }

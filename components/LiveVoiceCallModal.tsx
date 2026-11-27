@@ -54,6 +54,8 @@ interface LiveVoiceCallModalProps {
   isAiThinking?: boolean;
   latestAiReply?: string;
   recentMessages?: LiveMemoryMessage[];
+  chatSessionId?: string;
+  userEmail?: string | null;
   onLiveUserStream?: (turnId: string, text: string) => void;
   onLiveAssistantStream?: (turnId: string, text: string) => void;
   onLiveRemoveMessage?: (turnId: string) => void;
@@ -81,6 +83,8 @@ export default function LiveVoiceCallModal({
   isMicMuted = false,
   latestAiReply,
   recentMessages,
+  chatSessionId,
+  userEmail,
   onLiveUserStream,
   onLiveAssistantStream,
   onLiveRemoveMessage,
@@ -98,6 +102,8 @@ export default function LiveVoiceCallModal({
       isMicMuted={isMicMuted}
       recentChatContext={latestAiReply}
       recentMessages={recentMessages}
+      chatSessionId={chatSessionId}
+      userEmail={userEmail}
       onLiveUserStream={onLiveUserStream}
       onLiveAssistantStream={onLiveAssistantStream}
       onLiveRemoveMessage={onLiveRemoveMessage}

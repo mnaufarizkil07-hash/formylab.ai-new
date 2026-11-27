@@ -3,21 +3,47 @@ import { GoogleGenAI } from "@google/genai";
 
 const MEMORY_MODELS = [
   "gemini-2.5-flash",
-  "gemini-3.1-flash-lite",
+  "gemini-2.5-flash-lite",
+  "gemini-3-flash-preview",
   "gemini-4-hydrogen",
 ] as const;
 
+const MEMORY_TIMEOUT_MS = 9_000;
+
+function raceWithTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`LIVE_MEMORY_TIMEOUT_${timeoutMs}MS`));
+    }, timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
 export async function POST(req: NextRequest) {
+  let previousSummary = "";
   try {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
       return NextResponse.json(
-        { success: false, summary: "", error: "GEMINI_API_KEY tidak tersedia." },
-        { status: 500 }
+        {
+          ok: false,
+          success: false,
+          summary: "",
+          error: "GEMINI_API_KEY tidak tersedia.",
+        },
+        { status: 200 }
       );
     }
 
-    let previousSummary = "";
     let transcript = "";
     try {
       const body = await req.json();
@@ -27,20 +53,20 @@ export async function POST(req: NextRequest) {
           : "";
       transcript =
         typeof body?.transcript === "string"
-          ? body.transcript.trim().slice(0, 4500)
+          ? body.transcript.trim().slice(0, 4800)
           : "";
     } catch {
       return NextResponse.json(
-        { success: false, summary: "", error: "JSON tidak valid." },
-        { status: 400 }
+        { ok: false, success: false, summary: "", error: "JSON tidak valid." },
+        { status: 200 }
       );
     }
 
     if (!transcript) {
-      return NextResponse.json({
-        success: true,
-        summary: previousSummary,
-      });
+      return NextResponse.json(
+        { ok: true, success: true, summary: previousSummary },
+        { status: 200 }
+      );
     }
 
     const ai = new GoogleGenAI({
@@ -62,40 +88,51 @@ export async function POST(req: NextRequest) {
       .filter(Boolean)
       .join("\n");
 
+    const deadlineMs = Date.now() + MEMORY_TIMEOUT_MS;
+
     for (const model of MEMORY_MODELS) {
+      const remainingMs = deadlineMs - Date.now();
+      if (remainingMs < 1500) break;
+
       try {
-        const res = await ai.models.generateContent({
-          model,
-          contents: prompt,
-        });
+        const res = await raceWithTimeout(
+          ai.models.generateContent({
+            model,
+            contents: prompt,
+            config: {
+              temperature: 0.1,
+            },
+          }),
+          remainingMs
+        );
         const clean = (res.text || "")
           .replace(/[*#`]+/g, "")
           .trim()
           .slice(0, 1200);
         if (clean) {
-          return NextResponse.json({
-            success: true,
-            summary: clean,
-            model,
-          });
+          return NextResponse.json(
+            { ok: true, success: true, summary: clean, model },
+            { status: 200 }
+          );
         }
       } catch {
         // Try next candidate model
       }
     }
 
-    return NextResponse.json({
-      success: true,
-      summary: previousSummary,
-    });
-  } catch (err: unknown) {
+    return NextResponse.json(
+      { ok: true, success: true, summary: previousSummary },
+      { status: 200 }
+    );
+  } catch {
     return NextResponse.json(
       {
+        ok: false,
         success: false,
-        summary: "",
-        error: err instanceof Error ? err.message : String(err),
+        summary: previousSummary,
+        error: "MEMORY_UNAVAILABLE",
       },
-      { status: 500 }
+      { status: 200 }
     );
   }
 }

@@ -44,10 +44,16 @@ import {
   LIVE_ECHO_GUARD_TAIL_MS,
   LIVE_FSM_STATUS_LABELS,
   LIVE_HIGHPASS_CUTOFF_HZ,
+  LIVE_HIGHPASS_Q,
   LIVE_HOTSWAP_TARGET_TURN,
   LIVE_INPUT_CHUNK_SAMPLES,
   LIVE_INPUT_TARGET_SAMPLE_RATE,
   LIVE_MAX_AUTO_RECONNECTS,
+  LIVE_PLAYBACK_FADE_IN_MS,
+  LIVE_PLAYBACK_FADE_OUT_MS,
+  LIVE_PLAYBACK_PREBUFFER_MS,
+  LIVE_PLAYBACK_RING_SECONDS,
+  LIVE_PLAYBACK_SAMPLE_RATE,
   LIVE_STANDBY_MAX_AGE_MS,
   LIVE_STANDBY_PREWARM_TURN,
   LIVE_TOOL_RECOVERY_MS,
@@ -60,13 +66,17 @@ import {
   LiveVoiceName,
   SpeechEndProfilerState,
   VoiceTurnMetric,
+  appendTranscriptFragment,
   base64PcmToFloat32,
   buildDeterministicMemoryPrompt,
   classifyLiveVoicePillars,
   computeInt16PcmRms,
   createContinuousResampler,
   createSpeechEndProfilerState,
+  extractLatestFormulaTableFromMessages,
+  extractLocalFactSummaryFallback,
   formatLiveConnectionError,
+  getVoiceMemoryStorageKey,
   hasGoogleSearchGrounding,
   int16PcmToBase64,
   isNonLatinHallucinationFragment,
@@ -74,7 +84,7 @@ import {
   parsePcmSampleRate,
   recallChatHistoryLocal,
   sanitizeLiveTranscriptText,
-  sanitizeLiveUserTranscript,
+  sanitizeUserTranscript,
   summarizeVoiceMetrics,
 } from "./liveVoiceHelpers";
 
@@ -760,6 +770,8 @@ interface InteractiveVoiceCallOverlayProps {
   isMicMuted?: boolean;
   recentChatContext?: string;
   recentMessages?: LiveMemoryMessage[];
+  chatSessionId?: string;
+  userEmail?: string | null;
   onLiveUserStream?: (turnId: string, text: string) => void;
   onLiveAssistantStream?: (turnId: string, text: string) => void;
   onLiveRemoveMessage?: (turnId: string) => void;
@@ -797,7 +809,184 @@ interface LiveTokenApiResponse {
   error?: string;
 }
 
-const LIVE_FIRST_CHUNK_LEAD_SEC = 0.02;
+const LIVE_FALLBACK_PREBUFFER_LEAD_SEC = LIVE_PLAYBACK_PREBUFFER_MS / 1000;
+
+/**
+ * Smooth 24kHz Circular Ring Buffer Playback AudioWorklet (inline Blob URL, 100% Vercel-safe):
+ * - Capacity: ~30 seconds of audio (720,000 Float32 samples @ 24kHz).
+ * - Jitter Pre-Buffer: 120ms (2,880 samples @ 24kHz) before starting speaker output
+ *   (or plays immediately if server sends `turnComplete` first for ultra-short answers).
+ * - Micro fade-in (3ms) when starting speech and fade-out (5ms) on barge-in/stop (zero pops/clicks).
+ * - Automatically resamples cleanly if the browser's output AudioContext runs at 48kHz/44.1kHz.
+ * - Posts `{ type: "bufferDrained" }` ONLY when ring buffer empties after having received audio.
+ */
+const PCM_PLAYBACK_RINGBUFFER_WORKLET_CODE = `
+class FormylabLivePcmPlaybackProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this._capacity = Math.max(48000, Math.round(sampleRate * ${LIVE_PLAYBACK_RING_SECONDS}));
+    this._ring = new Float32Array(this._capacity);
+    this._readPos = 0;
+    this._writePos = 0;
+    this._available = 0;
+    this._prebufferSamples = Math.max(128, Math.round(sampleRate * (${LIVE_PLAYBACK_PREBUFFER_MS} / 1000)));
+    this._fadeInSamples = Math.max(1, Math.round(sampleRate * (${LIVE_PLAYBACK_FADE_IN_MS} / 1000)));
+    this._fadeOutSamples = Math.max(1, Math.round(sampleRate * (${LIVE_PLAYBACK_FADE_OUT_MS} / 1000)));
+    this._playing = false;
+    this._hadAudio = false;
+    this._serverTurnComplete = false;
+    this._fadeInProgress = 0;
+    this._fadingOut = false;
+    this._fadeOutRemaining = 0;
+
+    this.port.onmessage = (event) => {
+      const msg = event.data;
+      if (!msg || typeof msg !== "object") return;
+
+      if (msg.type === "push" && msg.samples instanceof Float32Array) {
+        const src = msg.samples;
+        const srcRate = typeof msg.inputSampleRate === "number" && msg.inputSampleRate > 0
+          ? msg.inputSampleRate
+          : ${LIVE_PLAYBACK_SAMPLE_RATE};
+        this._fadingOut = false;
+        this._fadeOutRemaining = 0;
+        this._serverTurnComplete = false;
+        this._pushSamples(src, srcRate);
+        return;
+      }
+
+      if (msg.type === "turnComplete") {
+        this._serverTurnComplete = true;
+        if (!this._playing && this._available === 0 && this._hadAudio) {
+          this._hadAudio = false;
+          this.port.postMessage({ type: "bufferDrained" });
+        }
+        return;
+      }
+
+      if (msg.type === "stop") {
+        if (this._playing && this._available > 0) {
+          this._fadingOut = true;
+          this._fadeOutRemaining = Math.min(this._fadeOutSamples, this._available);
+        } else {
+          this._clearAll();
+        }
+      }
+    };
+  }
+
+  _clearAll() {
+    this._readPos = 0;
+    this._writePos = 0;
+    this._available = 0;
+    this._playing = false;
+    this._hadAudio = false;
+    this._serverTurnComplete = false;
+    this._fadeInProgress = 0;
+    this._fadingOut = false;
+    this._fadeOutRemaining = 0;
+  }
+
+  _writeOne(val) {
+    if (this._available >= this._capacity) {
+      this._readPos = (this._readPos + 1) % this._capacity;
+      this._available -= 1;
+    }
+    this._ring[this._writePos] = val;
+    this._writePos = (this._writePos + 1) % this._capacity;
+    this._available += 1;
+  }
+
+  _pushSamples(src, srcRate) {
+    const len = src.length;
+    if (len === 0) return;
+    if (Math.abs(srcRate - sampleRate) < 1) {
+      for (let i = 0; i < len; i++) {
+        this._writeOne(src[i]);
+      }
+    } else {
+      const ratio = srcRate / sampleRate;
+      const outLen = Math.max(1, Math.round(len / ratio));
+      for (let i = 0; i < outLen; i++) {
+        const pos = i * ratio;
+        const idx0 = Math.floor(pos);
+        const idx1 = Math.min(idx0 + 1, len - 1);
+        const frac = pos - idx0;
+        this._writeOne(src[idx0] + (src[idx1] - src[idx0]) * frac);
+      }
+    }
+    this._hadAudio = true;
+  }
+
+  process(_inputs, outputs) {
+    const output = outputs[0];
+    if (!output || !output[0]) return true;
+    const ch = output[0];
+    const frames = ch.length;
+
+    if (this._fadingOut) {
+      for (let i = 0; i < frames; i++) {
+        if (this._fadeOutRemaining > 0 && this._available > 0) {
+          const gain = this._fadeOutRemaining / this._fadeOutSamples;
+          ch[i] = this._ring[this._readPos] * gain;
+          this._readPos = (this._readPos + 1) % this._capacity;
+          this._available -= 1;
+          this._fadeOutRemaining -= 1;
+        } else {
+          ch[i] = 0;
+        }
+      }
+      if (this._fadeOutRemaining <= 0) {
+        this._clearAll();
+      }
+      return true;
+    }
+
+    if (!this._playing) {
+      if (
+        this._available >= this._prebufferSamples ||
+        (this._serverTurnComplete && this._available > 0)
+      ) {
+        this._playing = true;
+        this._fadeInProgress = 0;
+      } else {
+        ch.fill(0);
+        if (this._serverTurnComplete && this._hadAudio && this._available === 0) {
+          this._hadAudio = false;
+          this.port.postMessage({ type: "bufferDrained" });
+        }
+        return true;
+      }
+    }
+
+    for (let i = 0; i < frames; i++) {
+      if (this._available > 0) {
+        let s = this._ring[this._readPos];
+        this._readPos = (this._readPos + 1) % this._capacity;
+        this._available -= 1;
+        if (this._fadeInProgress < this._fadeInSamples) {
+          s *= this._fadeInProgress / this._fadeInSamples;
+          this._fadeInProgress += 1;
+        }
+        ch[i] = s;
+      } else {
+        ch[i] = 0;
+      }
+    }
+
+    if (this._available === 0) {
+      this._playing = false;
+      if (this._hadAudio) {
+        this._hadAudio = false;
+        this.port.postMessage({ type: "bufferDrained" });
+      }
+    }
+
+    return true;
+  }
+}
+registerProcessor("formylab-live-pcm-playback", FormylabLivePcmPlaybackProcessor);
+`;
 
 // Short-lived in-memory cooldown for models that failed WS setup (e.g., quota 1011)
 // so subsequent voice sessions connect on the first attempt without extra round-trip latency.
@@ -1676,6 +1865,8 @@ export function InteractiveVoiceCallOverlay({
   isMicMuted = false,
   recentChatContext,
   recentMessages,
+  chatSessionId,
+  userEmail,
   onLiveUserStream,
   onLiveAssistantStream,
   onLiveRemoveMessage,
@@ -1698,6 +1889,8 @@ export function InteractiveVoiceCallOverlay({
   const fsmStateRef = useRef<LiveVoiceFsmState>("IDLE");
   const recentContextRef = useRef<string>(recentChatContext || "");
   const recentMessagesRef = useRef<LiveMemoryMessage[]>(recentMessages || []);
+  const chatSessionIdRef = useRef<string>(chatSessionId || "default");
+  const userEmailRef = useRef<string | null>(userEmail ?? null);
 
   // Latest callback refs
   const onLiveUserStreamRef = useRef(onLiveUserStream);
@@ -1755,19 +1948,27 @@ export function InteractiveVoiceCallOverlay({
   }, [recentMessages]);
 
   useEffect(() => {
+    chatSessionIdRef.current = chatSessionId || "default";
+    userEmailRef.current = userEmail ?? null;
+  }, [chatSessionId, userEmail]);
+
+  useEffect(() => {
     selectedVoiceRef.current = selectedVoice;
   }, [selectedVoice]);
 
   // ============================================================================
-  // MODULE 1: DUAL-SESSION HOT-SWAP + DETERMINISTIC LONG-TERM MEMORY REFS
+  // MODULE 1 & 4: MONOTONIC DUAL-SESSION HOT-SWAP + PER-ROOM PERSISTENT MEMORY
   // ============================================================================
+  const nextSessionIdRef = useRef<number>(0);
   const activeSessionRef = useRef<Session | null>(null);
-  const standbySessionRef = useRef<Session | null>(null);
-  const standbyReadyRef = useRef<boolean>(false);
-  const standbyMemoryInjectedRef = useRef<boolean>(false);
+  const activeSessionIndexRef = useRef<number>(0);
+  const standbySlotRef = useRef<{
+    id: number;
+    session: Session;
+    ready: boolean;
+    memoryInjected: boolean;
+  } | null>(null);
   const standbyPrewarmingRef = useRef<boolean>(false);
-  const activeSessionIndexRef = useRef<number>(1);
-  const standbySessionIndexRef = useRef<number>(2);
   const activeSessionStartedAtRef = useRef<number>(0);
   const sessionTurnCountRef = useRef<number>(0);
   const autoReconnectCountRef = useRef<number>(0);
@@ -1785,7 +1986,7 @@ export function InteractiveVoiceCallOverlay({
   const tokenAbortControllerRef = useRef<AbortController | null>(null);
   const standbyAbortControllerRef = useRef<AbortController | null>(null);
 
-  // Dual AudioContext & Mic Pipeline Refs
+  // Dual AudioContext, Mic Capture & 24kHz Ring Buffer Playback Refs
   const liveInputCtxRef = useRef<AudioContext | null>(null);
   const liveOutputCtxRef = useRef<AudioContext | null>(null);
   const liveMicStreamRef = useRef<MediaStream | null>(null);
@@ -1801,8 +2002,13 @@ export function InteractiveVoiceCallOverlay({
   const liveScriptNodeRef = useRef<ScriptProcessorNode | null>(null);
   const liveSilentGainRef = useRef<GainNode | null>(null);
 
+  const livePlaybackWorkletNodeRef = useRef<AudioWorkletNode | null>(null);
+  const livePlaybackWorkletUrlRef = useRef<string | null>(null);
+  const playbackRingBufferReadyRef = useRef<boolean>(false);
+  const isPlaybackDrainedRef = useRef<boolean>(true);
+
   // ============================================================================
-  // MODULE 2: ZERO-WAIT PLAYBACK + SMART ECHO GUARD + WATCHDOG + TOOL RECOVERY REFS
+  // MODULE 1 & 2: RING BUFFER PLAYBACK + 350ms ECHO GUARD + 10s WATCHDOG + 8s TOOL RECOVERY
   // ============================================================================
   const liveScheduledSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const activePlaybackNodesRef = useRef<number>(0);
@@ -1842,6 +2048,13 @@ export function InteractiveVoiceCallOverlay({
   const latestFormulaTableRef = useRef<FormulaTableArtifact | null>(null);
   const pendingGoogleDocRef = useRef<GoogleDocArtifact | null>(null);
   const turnToolsCalledRef = useRef<string[]>([]);
+
+  // Reset in-memory room refs whenever the user switches to a different chat room
+  useEffect(() => {
+    longTermSummaryRef.current = "";
+    latestFormulaTableRef.current = null;
+    lastSummarizedTurnRef.current = 0;
+  }, [chatSessionId]);
 
   // ============================================================================
   // MODULE 5: DIAGNOSTICS RING BUFFER & PROFILER REFS
@@ -1944,7 +2157,7 @@ export function InteractiveVoiceCallOverlay({
   }, []);
 
   const flushUserTranscriptNow = useCallback(() => {
-    const clean = sanitizeLiveUserTranscript(userTurnTextRef.current);
+    const clean = sanitizeUserTranscript(userTurnTextRef.current);
     if (!clean) return;
     const turnId = ensureUserMessageId();
     queueMicrotask(() => {
@@ -1992,7 +2205,7 @@ export function InteractiveVoiceCallOverlay({
       clearTimeout(userFlushTimerRef.current);
       userFlushTimerRef.current = null;
     }
-    const clean = sanitizeLiveUserTranscript(userTurnTextRef.current);
+    const clean = sanitizeUserTranscript(userTurnTextRef.current);
     if (!clean) return;
     userTurnCommittedRef.current = true;
     flushUserTranscriptNow();
@@ -2027,7 +2240,7 @@ export function InteractiveVoiceCallOverlay({
       clearTranscriptThrottleTimers();
 
       const existingUserId = currentUserMessageIdRef.current;
-      const finalUserText = sanitizeLiveUserTranscript(userTurnTextRef.current);
+      const finalUserText = sanitizeUserTranscript(userTurnTextRef.current);
       const finalUserId = finalUserText ? ensureUserMessageId() : undefined;
 
       const finalAiText = sanitizeLiveTranscriptText(
@@ -2101,14 +2314,21 @@ export function InteractiveVoiceCallOverlay({
   );
 
   /**
-   * Instant Barge-In & Playback Stop:
-   * Immediately stops every active AudioBufferSourceNode, resets activePlaybackNodesRef = 0,
-   * clears Echo Guard tail & 5s watchdog, and resets nextPlayTime = 0.
+   * Instant Barge-In & Playback Stop (with smooth 5ms fade-out inside RingBuffer Worklet):
+   * Zero clicks/pops, immediately drains playback, resets Echo Guard & timers, unlocks mic.
    */
   const stopAllPlayback = useCallback(() => {
     clearEchoUnlockTimer();
     clearTurnWatchdogTimer();
     clearToolRecoveryTimer();
+
+    if (livePlaybackWorkletNodeRef.current) {
+      try {
+        livePlaybackWorkletNodeRef.current.port.postMessage({ type: "stop" });
+      } catch {
+        // ignore if port closed
+      }
+    }
 
     liveScheduledSourcesRef.current.forEach((node) => {
       try {
@@ -2122,6 +2342,7 @@ export function InteractiveVoiceCallOverlay({
     liveScheduledSourcesRef.current.clear();
 
     activePlaybackNodesRef.current = 0;
+    isPlaybackDrainedRef.current = true;
     micLockedRef.current = false;
     micUnlockAtRef.current = 0;
     liveNextPlayTimeRef.current = 0;
@@ -2132,21 +2353,47 @@ export function InteractiveVoiceCallOverlay({
     }
   }, [clearEchoUnlockTimer, clearToolRecoveryTimer, clearTurnWatchdogTimer]);
 
+  const persistLongTermMemory = useCallback((summaryText: string) => {
+    const clean = summaryText.trim();
+    if (!clean) return;
+    longTermSummaryRef.current = clean;
+    try {
+      const storageKey = getVoiceMemoryStorageKey(
+        chatSessionIdRef.current,
+        userEmailRef.current
+      );
+      localStorage.setItem(storageKey, clean);
+    } catch {
+      // ignore storage quota errors
+    }
+  }, []);
+
   /**
-   * Non-blocking background refresh of `[RINGKASAN FAKTA]` via `/api/live-memory`
-   * so long-term memory is always ready ahead of Turn #7 standby pre-warm.
+   * Non-blocking background refresh of `[RINGKASAN FAKTA JANGKA PANJANG]` via `/api/live-memory`
+   * with instant local fallback extractor + per-room localStorage persistence.
    */
   const refreshLongTermMemoryInBackground = useCallback(() => {
-    if (memoryRefreshInFlightRef.current) return;
     const msgs = recentMessagesRef.current;
-    if (!Array.isArray(msgs) || msgs.length < 4) return;
+    if (!Array.isArray(msgs) || msgs.length < 2) return;
+
+    // Immediately compute local fallback summary so memory is ALWAYS fresh even before network finishes
+    const localSummary = extractLocalFactSummaryFallback(
+      msgs,
+      latestFormulaTableRef.current,
+      longTermSummaryRef.current
+    );
+    if (localSummary && !longTermSummaryRef.current) {
+      persistLongTermMemory(localSummary);
+    }
+
+    if (memoryRefreshInFlightRef.current || msgs.length < 4) return;
     memoryRefreshInFlightRef.current = true;
 
     const transcript = msgs
-      .slice(-12)
+      .slice(-16)
       .map(
         (m) =>
-          `${m.role === "user" ? "User" : "Asisten"}: ${(m.content || "")
+          `${m.role === "user" ? "User" : "Formylab AI"}: ${(m.content || "")
             .replace(/\s+/g, " ")
             .trim()
             .slice(0, 320)}`
@@ -2162,23 +2409,31 @@ export function InteractiveVoiceCallOverlay({
       }),
     })
       .then((res) => (res.ok ? res.json() : null))
-      .then((data: { success?: boolean; summary?: string } | null) => {
-        if (data?.success && typeof data.summary === "string" && data.summary.trim()) {
-          longTermSummaryRef.current = data.summary.trim();
+      .then((data: { ok?: boolean; success?: boolean; summary?: string } | null) => {
+        if (
+          (data?.ok || data?.success) &&
+          typeof data.summary === "string" &&
+          data.summary.trim()
+        ) {
+          persistLongTermMemory(data.summary.trim());
+        } else if (localSummary) {
+          persistLongTermMemory(localSummary);
         }
       })
       .catch(() => {
-        // Non-blocking background helper; deterministic local memory always covers fallback
+        if (localSummary) {
+          persistLongTermMemory(localSummary);
+        }
       })
       .finally(() => {
         memoryRefreshInFlightRef.current = false;
       });
-  }, []);
+  }, [persistLongTermMemory]);
 
   /**
    * Post-Turn Lifecycle Hook:
    * - Unlocks mic & resets FSM to LISTENING.
-   * - Refreshes `[RINGKASAN FAKTA]` asynchronously every 3 completed turns.
+   * - Refreshes `[RINGKASAN FAKTA JANGKA PANJANG]` asynchronously every 2 completed turns.
    * - At Turn #7 on current session -> triggers silent background standby pre-warming.
    * - At Turn #8+ on current session -> performs atomic O(1) hot-swap (<5ms) if standby is ready
    *   AND verified with full deterministic memory!
@@ -2206,21 +2461,21 @@ export function InteractiveVoiceCallOverlay({
         sessionTurnCountRef.current += 1;
         const turnsOnCurrentSession = sessionTurnCountRef.current;
 
-        if (finishedTurnNum - lastSummarizedTurnRef.current >= 3) {
+        if (finishedTurnNum - lastSummarizedTurnRef.current >= 2) {
           lastSummarizedTurnRef.current = finishedTurnNum;
           refreshLongTermMemoryInBackground();
         }
 
+        const standbySlot = standbySlotRef.current;
         if (
           turnsOnCurrentSession >= LIVE_HOTSWAP_TARGET_TURN &&
-          standbyReadyRef.current &&
-          standbyMemoryInjectedRef.current &&
-          standbySessionRef.current
+          standbySlot?.ready &&
+          standbySlot.memoryInjected
         ) {
           performAtomicHotSwapIfReadyRef.current();
         } else if (
           turnsOnCurrentSession >= LIVE_STANDBY_PREWARM_TURN &&
-          !standbyReadyRef.current &&
+          !standbySlot &&
           !standbyPrewarmingRef.current
         ) {
           void prepareStandbySessionRef.current();
@@ -2236,12 +2491,23 @@ export function InteractiveVoiceCallOverlay({
   );
 
   /**
-   * Smart Echo Guard Tail (220ms):
-   * Unlocks mic ONLY when `isServerTurnCompleteRef === true` AND `activePlaybackNodesRef === 0`
-   * plus a 220ms room-echo safety tail.
+   * Zero Self-Interruption Smart Echo Guard (350ms Room-Echo Tail):
+   * Unlocks mic ONLY when ALL conditions hold simultaneously:
+   * 1) `isServerTurnCompleteRef.current === true`, AND
+   * 2) RingBuffer is 100% drained (`isPlaybackDrainedRef.current === true`) & fallback nodes === 0, AND
+   * 3) 350ms room-echo safety tail has passed so speaker reverberation NEVER re-enters Server VAD!
    */
   const scheduleEchoGuardUnlock = useCallback(
     (generation: number, finishedTurnNum: number) => {
+      if (
+        !isServerTurnCompleteRef.current ||
+        !isPlaybackDrainedRef.current ||
+        activePlaybackNodesRef.current > 0 ||
+        fsmStateRef.current === "TOOL_EXECUTING"
+      ) {
+        return;
+      }
+
       clearEchoUnlockTimer();
       clearTurnWatchdogTimer();
       micUnlockAtRef.current = performance.now() + LIVE_ECHO_GUARD_TAIL_MS;
@@ -2256,8 +2522,9 @@ export function InteractiveVoiceCallOverlay({
           return;
         }
         if (
-          activePlaybackNodesRef.current > 0 ||
           !isServerTurnCompleteRef.current ||
+          !isPlaybackDrainedRef.current ||
+          activePlaybackNodesRef.current > 0 ||
           fsmStateRef.current === "TOOL_EXECUTING"
         ) {
           return;
@@ -2269,9 +2536,8 @@ export function InteractiveVoiceCallOverlay({
   );
 
   /**
-   * Module 2: 5-Second Watchdog Timer:
-   * If 5 seconds pass after the final audio buffer finishes playing without receiving
-   * `turnComplete` from Gemini, logs a clear warning and force-resets FSM to `LISTENING`.
+   * Emergency 10-Second Watchdog Timer (armed ONLY after `bufferDrained` while waiting on `turnComplete`):
+   * Never unlocks early during normal network jitter!
    */
   const armTurnWatchdog = useCallback(
     (generation: number, turnNum: number) => {
@@ -2286,6 +2552,7 @@ export function InteractiveVoiceCallOverlay({
           return;
         }
         if (
+          !isPlaybackDrainedRef.current ||
           activePlaybackNodesRef.current > 0 ||
           isServerTurnCompleteRef.current ||
           fsmStateRef.current === "TOOL_EXECUTING"
@@ -2293,7 +2560,7 @@ export function InteractiveVoiceCallOverlay({
           return;
         }
         console.warn(
-          `[VOICE S#${activeSessionIndexRef.current} T#${turnNum}] Watchdog 5s: turnComplete tidak diterima — mereset FSM ke LISTENING`
+          `[VOICE S#${activeSessionIndexRef.current} T#${turnNum}] Watchdog 10s: turnComplete tidak diterima — mereset FSM ke LISTENING`
         );
         isServerTurnCompleteRef.current = true;
         finalizeCurrentTurnAsync();
@@ -2304,10 +2571,8 @@ export function InteractiveVoiceCallOverlay({
   );
 
   /**
-   * Zero-Wait 24kHz PCM Streaming Playback:
-   * - Tracks active nodes via `activePlaybackNodesRef` for Smart Echo Guard.
-   * - Resets `nextPlayTime = outCtx.currentTime + 0.02` on chunk #1 of every turn
-   *   (and whenever `nextPlayTime < currentTime`).
+   * Module 1: 24kHz Circular Ring Buffer Playback (120ms Jitter Pre-Buffer, 3ms Fade-In,
+   * 5ms Fade-Out, Zero Chunk Gaps) with automatic AudioBufferSourceNode fallback.
    */
   const enqueueLivePcmChunk = useCallback(
     (base64Pcm: string, mimeType: string | undefined, generation: number) => {
@@ -2330,33 +2595,19 @@ export function InteractiveVoiceCallOverlay({
         const float32 = base64PcmToFloat32(base64Pcm);
         if (float32.length === 0) return;
 
-        const sampleRate = parsePcmSampleRate(mimeType, 24000);
-        const audioBuffer = outCtx.createBuffer(1, float32.length, sampleRate);
-        audioBuffer.copyToChannel(new Float32Array(float32), 0);
+        const sampleRate = parsePcmSampleRate(mimeType, LIVE_PLAYBACK_SAMPLE_RATE);
 
-        const sourceNode = outCtx.createBufferSource();
-        sourceNode.buffer = audioBuffer;
-        sourceNode.connect(outAnalyser);
-
+        // Immediately cancel tool recovery, echo unlock, & watchdog timers on first audio arrival!
         clearEchoUnlockTimer();
         clearTurnWatchdogTimer();
         clearToolRecoveryTimer();
         receivedAudioAfterToolRef.current = true;
-
-        const isFirstChunkOfTurn = !loggedServerAudioForTurnRef.current;
-        const nowCtx = outCtx.currentTime;
-        if (isFirstChunkOfTurn || liveNextPlayTimeRef.current < nowCtx) {
-          liveNextPlayTimeRef.current = nowCtx + LIVE_FIRST_CHUNK_LEAD_SEC;
-        }
-
-        const startAt = liveNextPlayTimeRef.current;
-        liveNextPlayTimeRef.current = startAt + audioBuffer.duration;
         isServerTurnCompleteRef.current = false;
-
-        activePlaybackNodesRef.current += 1;
+        isPlaybackDrainedRef.current = false;
         micLockedRef.current = true;
         micUnlockAtRef.current = Number.POSITIVE_INFINITY;
 
+        const isFirstChunkOfTurn = !loggedServerAudioForTurnRef.current;
         if (isFirstChunkOfTurn) {
           loggedServerAudioForTurnRef.current = true;
           loggedTurnDoneForTurnRef.current = false;
@@ -2374,16 +2625,12 @@ export function InteractiveVoiceCallOverlay({
               : speechProfilerRef.current.quietSinceMs ?? 0;
           const sinceSilenceMs =
             quietRefTs > 0 ? Math.max(0, Math.round(nowPerf - quietRefTs)) : 0;
-          const queueDelayMs = Math.max(
-            0,
-            Math.round((startAt - outCtx.currentTime) * 1000)
-          );
 
           currentTurnFirstAudioMsRef.current = sinceSilenceMs;
-          currentTurnQueueDelayMsRef.current = queueDelayMs;
+          currentTurnQueueDelayMsRef.current = LIVE_PLAYBACK_PREBUFFER_MS;
 
           console.log(
-            `[VOICE S#${activeSessionIndexRef.current} T#${turnNum}] 1st audio: +${sinceSilenceMs}ms | queue: +${queueDelayMs}ms`
+            `[VOICE S#${activeSessionIndexRef.current} T#${turnNum}] 1st audio: +${sinceSilenceMs}ms | ring-prebuffer: ${LIVE_PLAYBACK_PREBUFFER_MS}ms`
           );
 
           speechProfilerRef.current = createSpeechEndProfilerState(
@@ -2396,6 +2643,37 @@ export function InteractiveVoiceCallOverlay({
         if (fsmStateRef.current !== "AI_SPEAKING") {
           setFsm("AI_SPEAKING");
         }
+
+        // Primary path: Push directly into 24kHz Circular Ring Buffer AudioWorklet (0 gaps/clicks)
+        const playbackWorklet = livePlaybackWorkletNodeRef.current;
+        if (playbackWorklet && playbackRingBufferReadyRef.current) {
+          playbackWorklet.port.postMessage(
+            {
+              type: "push",
+              samples: float32,
+              inputSampleRate: sampleRate,
+            },
+            [float32.buffer]
+          );
+          return;
+        }
+
+        // Graceful fallback if AudioWorklet playback isn't supported in browser
+        const audioBuffer = outCtx.createBuffer(1, float32.length, sampleRate);
+        audioBuffer.copyToChannel(new Float32Array(float32), 0);
+
+        const sourceNode = outCtx.createBufferSource();
+        sourceNode.buffer = audioBuffer;
+        sourceNode.connect(outAnalyser);
+
+        const nowCtx = outCtx.currentTime;
+        if (isFirstChunkOfTurn || liveNextPlayTimeRef.current < nowCtx) {
+          liveNextPlayTimeRef.current = nowCtx + LIVE_FALLBACK_PREBUFFER_LEAD_SEC;
+        }
+
+        const startAt = liveNextPlayTimeRef.current;
+        liveNextPlayTimeRef.current = startAt + audioBuffer.duration;
+        activePlaybackNodesRef.current += 1;
 
         liveScheduledSourcesRef.current.add(sourceNode);
         sourceNode.onended = () => {
@@ -2411,13 +2689,13 @@ export function InteractiveVoiceCallOverlay({
             isMountedRef.current &&
             callActiveRef.current
           ) {
+            isPlaybackDrainedRef.current = true;
             if (isServerTurnCompleteRef.current) {
               scheduleEchoGuardUnlock(
                 generation,
                 activePlaybackTurnNumberRef.current
               );
             } else {
-              // Keep mic locked and arm 5s watchdog until turnComplete or next audio chunk arrives
               micUnlockAtRef.current = Number.POSITIVE_INFINITY;
               armTurnWatchdog(generation, activePlaybackTurnNumberRef.current);
             }
@@ -2441,9 +2719,9 @@ export function InteractiveVoiceCallOverlay({
   );
 
   /**
-   * Module 1: Complete Dual-Session Teardown (`disconnectAllVoiceSessions`):
-   * Closes BOTH `activeSessionRef` and `standbySessionRef`, aborts token fetches, clears all
-   * timers, stops playback, and tears down `AudioWorkletNode`, `MediaStream`, and both `AudioContext`s.
+   * Complete Dual-Session Teardown (`disconnectAllVoiceSessions`):
+   * Closes BOTH `activeSessionRef` and `standbySlotRef`, aborts token fetches, clears all
+   * timers, stops RingBuffer playback, and tears down both AudioWorklets, `MediaStream`, and `AudioContext`s.
    */
   const disconnectAllVoiceSessions = useCallback(
     (options?: { keepMicAndAudioCtx?: boolean; nextFsm?: LiveVoiceFsmState }) => {
@@ -2493,13 +2771,10 @@ export function InteractiveVoiceCallOverlay({
       pendingHotSwapFlagForNextTurnRef.current = false;
       turnToolsCalledRef.current = [];
       sessionTurnCountRef.current = 0;
-      activeSessionIndexRef.current = 1;
-      standbySessionIndexRef.current = 2;
       activeSessionStartedAtRef.current = 0;
-      standbyReadyRef.current = false;
-      standbyMemoryInjectedRef.current = false;
       standbyPrewarmingRef.current = false;
       micLockedRef.current = false;
+      isPlaybackDrainedRef.current = true;
       receivedAudioAfterToolRef.current = false;
       speechProfilerRef.current = createSpeechEndProfilerState();
       lastSpeechEndedAtRef.current = 0;
@@ -2514,9 +2789,9 @@ export function InteractiveVoiceCallOverlay({
         }
       }
 
-      if (standbySessionRef.current) {
-        const sb = standbySessionRef.current;
-        standbySessionRef.current = null;
+      if (standbySlotRef.current) {
+        const sb = standbySlotRef.current.session;
+        standbySlotRef.current = null;
         try {
           sb.close();
         } catch {
@@ -2535,6 +2810,26 @@ export function InteractiveVoiceCallOverlay({
       }
 
       if (keepAudio) return;
+
+      if (livePlaybackWorkletNodeRef.current) {
+        try {
+          livePlaybackWorkletNodeRef.current.port.onmessage = null;
+          livePlaybackWorkletNodeRef.current.disconnect();
+        } catch {
+          // ignore
+        }
+        livePlaybackWorkletNodeRef.current = null;
+      }
+      playbackRingBufferReadyRef.current = false;
+
+      if (livePlaybackWorkletUrlRef.current) {
+        try {
+          URL.revokeObjectURL(livePlaybackWorkletUrlRef.current);
+        } catch {
+          // ignore
+        }
+        livePlaybackWorkletUrlRef.current = null;
+      }
 
       if (liveWorkletNodeRef.current) {
         try {
@@ -2642,11 +2937,33 @@ export function InteractiveVoiceCallOverlay({
 
   /**
    * Synchronous 0ms deterministic memory prompt builder combining:
-   * 1) `[RINGKASAN FAKTA]` (`longTermSummaryRef.current`)
-   * 2) `[TABEL FORMULA AKTIF]` (`latestFormulaTableRef.current`)
-   * 3) `[12 PESAN DIALOG TERAKHIR]` (verbatim last 12 turns with `User:` / `Asisten:`)
+   * 1) `[RINGKASAN FAKTA JANGKA PANJANG]` (persisted per chat room + local fallback)
+   * 2) `[TABEL FORMULA AKTIF]` (from `latestFormulaTableRef` OR auto-extracted from chat history)
+   * 3) `[16 PESAN DIALOG TERAKHIR]` (sanitized last 16 turns with `User:` / `Formylab AI:`)
    */
   const getDeterministicMemoryPrompt = useCallback((): string => {
+    if (!longTermSummaryRef.current) {
+      try {
+        const key = getVoiceMemoryStorageKey(
+          chatSessionIdRef.current,
+          userEmailRef.current
+        );
+        const saved = localStorage.getItem(key);
+        if (saved && saved.trim()) {
+          longTermSummaryRef.current = saved.trim();
+        }
+      } catch {
+        // ignore storage errors
+      }
+    }
+    if (!latestFormulaTableRef.current) {
+      const recoveredTable = extractLatestFormulaTableFromMessages(
+        recentMessagesRef.current
+      );
+      if (recoveredTable) {
+        latestFormulaTableRef.current = recoveredTable;
+      }
+    }
     return buildDeterministicMemoryPrompt({
       longTermSummary: longTermSummaryRef.current,
       latestFormulaTable: latestFormulaTableRef.current,
@@ -2934,17 +3251,26 @@ export function InteractiveVoiceCallOverlay({
                   body: JSON.stringify({ query }),
                 });
                 const data = (await res.json().catch(() => ({}))) as {
+                  ok?: boolean;
                   success?: boolean;
                   summary?: string;
                   sources?: unknown[];
+                  fallbackNote?: string;
+                  model?: string;
                   error?: string;
                 };
-                if (!res.ok || !data.success) {
+
+                const isSearchOk = Boolean(data.ok || data.success) && Boolean(data.summary);
+                if (!isSearchOk) {
+                  const fallbackMsg =
+                    data.fallbackNote ||
+                    "Pencarian langsung sedang sibuk, jawab berdasarkan pengetahuan terkini yang kamu ketahui.";
+                  console.log(
+                    `[VOICE S#${activeSessionIndexRef.current} T#${turnNum}] /api/live-search -> fallback (HTTP ${res.status}${data.error ? `: ${data.error.slice(0, 80)}` : ""})`
+                  );
                   return {
-                    status: "error",
-                    resultMessage:
-                      data.error ||
-                      "Pencarian web sementara gagal. Sampaikan secara jujur ke pengguna.",
+                    status: "ok",
+                    resultMessage: fallbackMsg,
                   };
                 }
 
@@ -2956,6 +3282,10 @@ export function InteractiveVoiceCallOverlay({
                       .map((s) => normalizeWebSourceCitation(s))
                       .filter((s): s is WebSourceCitation => s !== null)
                   : [];
+
+                console.log(
+                  `[VOICE S#${activeSessionIndexRef.current} T#${turnNum}] /api/live-search -> ok (${cleanSources.length} sources${data.model ? `, ${data.model}` : ""})`
+                );
 
                 if (cleanSources.length > 0) {
                   turnPendingSourcesRef.current = mergeUniqueWebSources(
@@ -3061,13 +3391,15 @@ export function InteractiveVoiceCallOverlay({
         const currentGen = sessionGenerationRef.current;
         try {
           targetSession.sendToolResponse({ functionResponses });
-          // 100% ANTI-DEADLOCK: Immediately clear "Live · Menyiapkan Tabel..." -> "Live · Mendengarkan"
+          // Clear spinner immediately so UI never hangs on "Live · Menyiapkan Tabel...",
+          // while keeping mic locked until Gemini speaks OR the 8,000ms recovery timeout fires!
           receivedAudioAfterToolRef.current = false;
           isServerTurnCompleteRef.current = false;
+          micLockedRef.current = true;
+          micUnlockAtRef.current = Number.POSITIVE_INFINITY;
           setFsm("LISTENING");
 
-          // Arm 2,200ms recovery timer: if server doesn't start speaking confirmation audio
-          // within 2.2s, force FSM -> LISTENING, unlock mic, and show short chat confirmation
+          // Arm 8,000ms recovery timer (cancelled instantly when first audio/modelTurn arrives)
           clearToolRecoveryTimer();
           toolRecoveryTimerRef.current = setTimeout(() => {
             toolRecoveryTimerRef.current = null;
@@ -3081,14 +3413,16 @@ export function InteractiveVoiceCallOverlay({
             if (
               receivedAudioAfterToolRef.current ||
               fsmStateRef.current === "AI_SPEAKING" ||
+              !isPlaybackDrainedRef.current ||
               activePlaybackNodesRef.current > 0
             ) {
               return;
             }
             console.warn(
-              `[VOICE S#${activeSessionIndexRef.current} T#${turnNum}] Tool recovery 2.2s: tidak ada audio konfirmasi — memaksa LISTENING & membuka mikrofon`
+              `[VOICE S#${activeSessionIndexRef.current} T#${turnNum}] Tool recovery 8s: tidak ada audio konfirmasi — membuka mikrofon`
             );
             isServerTurnCompleteRef.current = true;
+            isPlaybackDrainedRef.current = true;
             micLockedRef.current = false;
             micUnlockAtRef.current = 0;
             setFsm("LISTENING");
@@ -3096,6 +3430,7 @@ export function InteractiveVoiceCallOverlay({
               const confirmId = ensureAssistantMessageId();
               assistantTurnTextRef.current = fallbackConfirmationText;
               onLiveAssistantStreamRef.current?.(confirmId, fallbackConfirmationText);
+              emitPendingSourcesAsync(confirmId);
               finalizeCurrentTurnAsync();
             }
             handleTurnFullyUnlocked(turnNum);
@@ -3104,6 +3439,7 @@ export function InteractiveVoiceCallOverlay({
           micLockedRef.current = false;
           micUnlockAtRef.current = 0;
           isServerTurnCompleteRef.current = true;
+          isPlaybackDrainedRef.current = true;
           setFsm("LISTENING");
         }
       } else {
@@ -3321,8 +3657,12 @@ export function InteractiveVoiceCallOverlay({
                   return;
                 }
 
-                // 3. ZERO-WAIT 24kHz PCM Output Playback FIRST
+                // 3. 24kHz Ring Buffer Playback FIRST + immediate tool-recovery cancellation on modelTurn
                 const parts = content.modelTurn?.parts;
+                if (content.modelTurn) {
+                  clearToolRecoveryTimer();
+                  receivedAudioAfterToolRef.current = true;
+                }
                 if (Array.isArray(parts)) {
                   let receivedAudio = false;
                   for (const part of parts) {
@@ -3360,13 +3700,13 @@ export function InteractiveVoiceCallOverlay({
                   }
                 }
 
-                // 5. Streaming User Speech Transcription (strip <noise>, drop non-Latin noise hallucinations like Thai/CJK/Arabic, strip leading punctuation)
+                // 5. Streaming User Speech Transcription (STRICT non-Latin filter + clean spacing)
                 if (content.inputTranscription?.text) {
                   const rawUserChunk = content.inputTranscription.text;
                   if (isNonLatinHallucinationFragment(rawUserChunk)) {
-                    // Ignore short non-Latin script mic-noise hallucinations (e.g. "ฮัลโหล")
+                    // Strictly drop any non-Latin script hallucination (e.g. "安静。", "ฮัลโหล")
                   } else {
-                    // User started a new utterance -> seal previous AI bubble from late fragments
+                    // User started a genuine Latin utterance -> seal previous AI bubble from late fragments
                     lastCommittedAiMessageIdRef.current = null;
                     lastCommittedAiTextRef.current = "";
 
@@ -3375,8 +3715,11 @@ export function InteractiveVoiceCallOverlay({
                       currentUserMessageIdRef.current = null;
                       userTurnTextRef.current = "";
                     }
-                    userTurnTextRef.current += rawUserChunk;
-                    const cleanedInput = sanitizeLiveUserTranscript(
+                    userTurnTextRef.current = appendTranscriptFragment(
+                      userTurnTextRef.current,
+                      rawUserChunk
+                    );
+                    const cleanedInput = sanitizeUserTranscript(
                       userTurnTextRef.current
                     );
                     if (cleanedInput.length > 0) {
@@ -3387,17 +3730,20 @@ export function InteractiveVoiceCallOverlay({
                   }
                 }
 
-                // 6. Streaming AI Speech Transcription (80ms throttle + late-fragment merge into SAME bubble)
+                // 6. Streaming AI Speech Transcription (ONE single bubble per turn + clean spacing)
                 if (content.outputTranscription?.text) {
+                  const rawAiChunk = content.outputTranscription.text;
                   if (
                     !currentAiMessageIdRef.current &&
                     !assistantTurnTextRef.current &&
                     lastCommittedAiMessageIdRef.current
                   ) {
-                    // Late trailing outputTranscription arrived 100-500ms after turnComplete:
-                    // merge directly into the SAME AI bubble instead of splitting!
-                    lastCommittedAiTextRef.current +=
-                      content.outputTranscription.text;
+                    // Late trailing outputTranscription arrived after turnComplete:
+                    // merge cleanly into the SAME AI bubble with proper spacing!
+                    lastCommittedAiTextRef.current = appendTranscriptFragment(
+                      lastCommittedAiTextRef.current,
+                      rawAiChunk
+                    );
                     const mergedClean = sanitizeLiveTranscriptText(
                       lastCommittedAiTextRef.current
                     );
@@ -3412,8 +3758,10 @@ export function InteractiveVoiceCallOverlay({
                     }
                   } else {
                     commitUserTurnIfPending();
-                    assistantTurnTextRef.current +=
-                      content.outputTranscription.text;
+                    assistantTurnTextRef.current = appendTranscriptFragment(
+                      assistantTurnTextRef.current,
+                      rawAiChunk
+                    );
                     if (
                       sanitizeLiveTranscriptText(assistantTurnTextRef.current)
                         .length > 0
@@ -3425,16 +3773,30 @@ export function InteractiveVoiceCallOverlay({
                   }
                 }
 
-                // 7. Turn Complete -> finalize chat text & unlock mic after 220ms Echo Guard tail
+                // 7. Turn Complete -> flush short ring buffer audio, finalize chat text,
+                //    and unlock mic ONLY after ring buffer is 100% drained + 350ms room-echo guard!
                 if (content.turnComplete) {
                   const finishedTurn =
                     activePlaybackTurnNumberRef.current ||
                     activeTurnNumberRef.current;
                   isServerTurnCompleteRef.current = true;
                   clearTurnWatchdogTimer();
+                  clearToolRecoveryTimer();
                   finalizeCurrentTurnAsync();
 
+                  // Tell Playback RingBuffer worklet to flush any short buffered audio (<120ms) immediately
+                  if (livePlaybackWorkletNodeRef.current) {
+                    try {
+                      livePlaybackWorkletNodeRef.current.port.postMessage({
+                        type: "turnComplete",
+                      });
+                    } catch {
+                      // ignore
+                    }
+                  }
+
                   if (
+                    isPlaybackDrainedRef.current &&
                     activePlaybackNodesRef.current === 0 &&
                     fsmStateRef.current !== "TOOL_EXECUTING"
                   ) {
@@ -3452,9 +3814,8 @@ export function InteractiveVoiceCallOverlay({
                   errEvent?.message || "WebSocket error pada sesi Live.";
                 unexpectedCloseReason = reason;
 
-                if (standbySessionRef.current === mySession) {
-                  standbySessionRef.current = null;
-                  standbyReadyRef.current = false;
+                if (standbySlotRef.current?.session === mySession) {
+                  standbySlotRef.current = null;
                   return;
                 }
                 if (activeSessionRef.current !== mySession) return;
@@ -3470,9 +3831,8 @@ export function InteractiveVoiceCallOverlay({
                 unexpectedCloseReason = closeEvent?.reason || "";
 
                 // Silent cleanup if a background standby session closed before swap
-                if (standbySessionRef.current === mySession) {
-                  standbySessionRef.current = null;
-                  standbyReadyRef.current = false;
+                if (standbySlotRef.current?.session === mySession) {
+                  standbySlotRef.current = null;
                   return;
                 }
 
@@ -3497,8 +3857,8 @@ export function InteractiveVoiceCallOverlay({
                 stopAllPlayback();
                 finalizeCurrentTurnAsync();
 
-                // Module 1 Recovery 1: Instant failover to pre-warmed standby session if ready!
-                if (standbyReadyRef.current && standbySessionRef.current) {
+                // Recovery 1: Instant failover to pre-warmed standby session if ready!
+                if (standbySlotRef.current?.ready) {
                   const swapped = performAtomicHotSwapIfReadyRef.current();
                   if (swapped) {
                     setFsm("LISTENING");
@@ -3506,7 +3866,7 @@ export function InteractiveVoiceCallOverlay({
                   }
                 }
 
-                // Module 1 Recovery 2: Seamless auto-reconnect up to 2x preserving text memory
+                // Recovery 2: Seamless auto-reconnect up to 2x preserving deterministic text memory
                 if (autoReconnectCountRef.current < LIVE_MAX_AUTO_RECONNECTS) {
                   autoReconnectCountRef.current += 1;
                   void reconnectActiveSessionInPlaceRef.current();
@@ -3615,6 +3975,7 @@ export function InteractiveVoiceCallOverlay({
       throw finalErr;
     },
     [
+      clearToolRecoveryTimer,
       clearTurnWatchdogTimer,
       commitUserTurnIfPending,
       emitPendingSourcesAsync,
@@ -3633,37 +3994,39 @@ export function InteractiveVoiceCallOverlay({
   );
 
   /**
-   * Module 1: Atomic Hot-Swap (< 5ms)
-   * Switches `activeSessionRef` -> `standbySessionRef`, increments `sessionGenerationRef`,
-   * resets `sessionTurnCountRef = 0`, silently closes old WebSocket WITHOUT touching
-   * `MediaStream`, `AudioWorkletNode`, or `AudioContext`!
+   * Module 4: Atomic Hot-Swap (< 5ms) with Monotonic Session IDs (`nextSessionIdRef`)
+   * Guarantees `fromIdx !== toIdx` (NEVER `S#3 -> S#3`) and switches sessions without
+   * touching `MediaStream`, Input/Playback `AudioWorkletNode`, or `AudioContext`!
    */
   const performAtomicHotSwapIfReady = useCallback((): boolean => {
+    const standbySlot = standbySlotRef.current;
     if (
-      !standbyReadyRef.current ||
-      !standbyMemoryInjectedRef.current ||
-      !standbySessionRef.current ||
+      !standbySlot ||
+      !standbySlot.ready ||
+      !standbySlot.memoryInjected ||
       !callActiveRef.current
     ) {
       return false;
     }
     if (
       !isServerTurnCompleteRef.current ||
+      !isPlaybackDrainedRef.current ||
       activePlaybackNodesRef.current > 0 ||
       fsmStateRef.current === "TOOL_EXECUTING"
     ) {
+      return false;
+    }
+    if (standbySlot.id === activeSessionIndexRef.current) {
       return false;
     }
 
     const swapStart = performance.now();
     const oldSession = activeSessionRef.current;
     const fromIdx = activeSessionIndexRef.current;
-    const toIdx = standbySessionIndexRef.current;
+    const toIdx = standbySlot.id;
 
-    activeSessionRef.current = standbySessionRef.current;
-    standbySessionRef.current = null;
-    standbyReadyRef.current = false;
-    standbyMemoryInjectedRef.current = false;
+    activeSessionRef.current = standbySlot.session;
+    standbySlotRef.current = null;
     activeSessionIndexRef.current = toIdx;
     activeSessionStartedAtRef.current = Date.now();
     sessionTurnCountRef.current = 0;
@@ -3689,33 +4052,30 @@ export function InteractiveVoiceCallOverlay({
   }, []);
 
   /**
-   * Silent Background Pre-Warming of `standbySessionRef`
-   * Triggered when `sessionTurnCountRef >= 7` OR active session age >= 120 seconds.
-   * Always synchronously injects the full 3-block Deterministic Memory Prompt.
+   * Silent Background Pre-Warming of `standbySlotRef`
+   * Triggered when `sessionTurnCountRef >= 7` OR active session age >= 150 seconds.
+   * Allocates a strictly monotonic session ID via `++nextSessionIdRef.current`.
    */
   const prepareStandbySession = useCallback(async () => {
     if (
       !isMountedRef.current ||
       !callActiveRef.current ||
-      standbyReadyRef.current ||
-      standbyPrewarmingRef.current ||
-      standbySessionRef.current
+      standbySlotRef.current ||
+      standbyPrewarmingRef.current
     ) {
       return;
     }
 
     standbyPrewarmingRef.current = true;
-    standbyMemoryInjectedRef.current = false;
     const pipelineGen = audioPipelineGenerationRef.current;
     const currentIdx = activeSessionIndexRef.current;
-    const nextIdx = currentIdx + 1;
+    const nextIdx = ++nextSessionIdRef.current;
     const memoryText = getDeterministicMemoryPrompt();
     const hasConversationData =
       recentMessagesRef.current.length > 0 ||
       latestFormulaTableRef.current !== null ||
       longTermSummaryRef.current.length > 0;
 
-    // Guard: never hot-swap with an empty memory prompt when conversation data exists
     if (hasConversationData && !memoryText.trim()) {
       standbyPrewarmingRef.current = false;
       return;
@@ -3742,10 +4102,13 @@ export function InteractiveVoiceCallOverlay({
         return;
       }
 
-      standbySessionRef.current = opened.session;
-      standbySessionIndexRef.current = nextIdx;
-      standbyMemoryInjectedRef.current = !hasConversationData || memoryText.trim().length > 0;
-      standbyReadyRef.current = true;
+      const memoryInjected = !hasConversationData || memoryText.trim().length > 0;
+      standbySlotRef.current = {
+        id: nextIdx,
+        session: opened.session,
+        ready: true,
+        memoryInjected,
+      };
 
       console.log(
         `[VOICE S#${currentIdx}] Standby S#${nextIdx} pre-warmed (deterministic memory: ${memoryText.length} chars)`
@@ -3754,9 +4117,10 @@ export function InteractiveVoiceCallOverlay({
       // If active session already passed Turn #8 while standby was warming and is now idle, swap immediately
       if (
         sessionTurnCountRef.current >= LIVE_HOTSWAP_TARGET_TURN &&
-        standbyMemoryInjectedRef.current &&
+        memoryInjected &&
         fsmStateRef.current === "LISTENING" &&
         isServerTurnCompleteRef.current &&
+        isPlaybackDrainedRef.current &&
         activePlaybackNodesRef.current === 0
       ) {
         performAtomicHotSwapIfReady();
@@ -3774,12 +4138,12 @@ export function InteractiveVoiceCallOverlay({
 
   /**
    * Seamless In-Place Auto-Reconnect (up to 2 retries on unexpected WS drop)
-   * Preserves mic/AudioWorklet/AudioContext and injects the full 3-block memory prompt seamlessly.
+   * Uses monotonic `++nextSessionIdRef.current`, keeps mic/RingBuffer alive, and injects full memory.
    */
   const reconnectActiveSessionInPlace = useCallback(async () => {
     if (!isMountedRef.current || !callActiveRef.current) return;
     const pipelineGen = audioPipelineGenerationRef.current;
-    const nextIdx = activeSessionIndexRef.current + 1;
+    const nextIdx = ++nextSessionIdRef.current;
     const memoryText = getDeterministicMemoryPrompt();
     setFsm("CONNECTING");
 
@@ -3810,16 +4174,15 @@ export function InteractiveVoiceCallOverlay({
       sessionTurnCountRef.current = 0;
       sessionGenerationRef.current += 1;
       micLockedRef.current = false;
+      isPlaybackDrainedRef.current = true;
+      isServerTurnCompleteRef.current = true;
       setLiveError("");
       setFsm("LISTENING");
       console.log(
         `[VOICE S#${nextIdx}] Connected (voice: ${opened.voiceName}, tools: ALL 4 AUTO)`
       );
     } catch (err: unknown) {
-      if (
-        err instanceof Error &&
-        err.message === "SESSION_CANCELLED"
-      ) {
+      if (err instanceof Error && err.message === "SESSION_CANCELLED") {
         return;
       }
       if (
@@ -3850,11 +4213,108 @@ export function InteractiveVoiceCallOverlay({
   }, [reconnectActiveSessionInPlace]);
 
   /**
-   * Pure Off-Main-Thread 16kHz Int16 PCM Mic Capture Pipeline (exact 640-sample / 40ms packets):
-   * - Guarded by `audioPipelineGenerationRef` so Atomic Hot-Swap NEVER interrupts the mic stream!
-   * - Smart Echo Guard & Strict Turn Lock: holds mic uplink while FSM is `AI_SPEAKING`,
-   *   `TOOL_EXECUTING`, `CONNECTING`, or `ERROR`, or while playback nodes > 0 + 220ms tail.
-   * - ZERO manual `audioStreamEnd`, ZERO `activityStart`/`activityEnd`, ZERO silence gate.
+   * Module 1: Attach 24kHz Circular Ring Buffer Playback AudioWorklet to Output AudioContext.
+   */
+  const attachPlaybackRingBuffer = useCallback(
+    async (
+      outCtx: AudioContext,
+      outAnalyser: AnalyserNode,
+      pipelineGen: number
+    ) => {
+      playbackRingBufferReadyRef.current = false;
+      if (
+        typeof AudioWorkletNode === "undefined" ||
+        !outCtx.audioWorklet ||
+        typeof outCtx.audioWorklet.addModule !== "function"
+      ) {
+        return;
+      }
+
+      try {
+        const blob = new Blob([PCM_PLAYBACK_RINGBUFFER_WORKLET_CODE], {
+          type: "application/javascript",
+        });
+        const url = URL.createObjectURL(blob);
+        livePlaybackWorkletUrlRef.current = url;
+        await outCtx.audioWorklet.addModule(url);
+
+        if (
+          !callActiveRef.current ||
+          audioPipelineGenerationRef.current !== pipelineGen ||
+          outCtx.state === "closed"
+        ) {
+          try {
+            URL.revokeObjectURL(url);
+          } catch {
+            // ignore
+          }
+          if (livePlaybackWorkletUrlRef.current === url) {
+            livePlaybackWorkletUrlRef.current = null;
+          }
+          return;
+        }
+
+        const playbackNode = new AudioWorkletNode(
+          outCtx,
+          "formylab-live-pcm-playback",
+          {
+            numberOfInputs: 0,
+            numberOfOutputs: 1,
+            outputChannelCount: [1],
+          }
+        );
+        livePlaybackWorkletNodeRef.current = playbackNode;
+        playbackNode.connect(outAnalyser);
+
+        playbackNode.port.onmessage = (event: MessageEvent) => {
+          const payload = event.data as { type?: string } | null;
+          if (!payload || payload.type !== "bufferDrained") return;
+          if (
+            !isMountedRef.current ||
+            !callActiveRef.current ||
+            audioPipelineGenerationRef.current !== pipelineGen
+          ) {
+            return;
+          }
+          isPlaybackDrainedRef.current = true;
+          const currentGen = sessionGenerationRef.current;
+          const turnNum = activePlaybackTurnNumberRef.current;
+
+          if (isServerTurnCompleteRef.current) {
+            scheduleEchoGuardUnlock(currentGen, turnNum);
+          } else {
+            // Network jitter mid-turn: NEVER unlock mic! Arm 10s emergency watchdog only.
+            micLockedRef.current = true;
+            micUnlockAtRef.current = Number.POSITIVE_INFINITY;
+            armTurnWatchdog(currentGen, turnNum);
+          }
+        };
+
+        playbackRingBufferReadyRef.current = true;
+        console.log(
+          `[VOICE] Playback RingBuffer ready (prebuffer: ${LIVE_PLAYBACK_PREBUFFER_MS}ms)`
+        );
+      } catch {
+        playbackRingBufferReadyRef.current = false;
+        if (livePlaybackWorkletUrlRef.current) {
+          try {
+            URL.revokeObjectURL(livePlaybackWorkletUrlRef.current);
+          } catch {
+            // ignore
+          }
+          livePlaybackWorkletUrlRef.current = null;
+        }
+      }
+    },
+    [armTurnWatchdog, scheduleEchoGuardUnlock]
+  );
+
+  /**
+   * Module 2: Clean 16kHz Int16 PCM Mic Capture Pipeline:
+   * - 100Hz High-Pass BiquadFilterNode (`Q = 0.7`) between mic source & input worklet.
+   * - Continuous fractional-phase accumulator resampler emitting exact 320-sample (20ms) packets.
+   * - Strict Zero Self-Interruption Echo Guard: holds mic uplink whenever
+   *   `!isServerTurnCompleteRef`, `!isPlaybackDrainedRef`, `micLockedRef`, or within 350ms echo tail!
    */
   const attachMicCapturePipeline = useCallback(
     async (stream: MediaStream, pipelineGen: number) => {
@@ -3882,11 +4342,11 @@ export function InteractiveVoiceCallOverlay({
       const micSource = inputCtx.createMediaStreamSource(stream);
       liveMicSourceRef.current = micSource;
 
-      // 85Hz High-Pass BiquadFilterNode removes laptop fan / AC rumble without cutting human voice
+      // 100Hz High-Pass BiquadFilterNode (Q = 0.7) filters out AC/fan rumble cleanly
       const highpassFilter = inputCtx.createBiquadFilter();
       highpassFilter.type = "highpass";
       highpassFilter.frequency.value = LIVE_HIGHPASS_CUTOFF_HZ;
-      highpassFilter.Q.value = 0.707;
+      highpassFilter.Q.value = LIVE_HIGHPASS_Q;
       liveHighpassFilterRef.current = highpassFilter;
       micSource.connect(highpassFilter);
 
@@ -3911,10 +4371,14 @@ export function InteractiveVoiceCallOverlay({
           return;
         }
 
-        // Strict Turn Lock & Smart Echo Guard (pause mic uplink during AI_SPEAKING / TOOL_EXECUTING + 120ms tail)
+        // Strict Zero Self-Interruption Echo Guard:
+        // NEVER send mic frames while server turn isn't complete, playback ring buffer isn't drained,
+        // FSM isn't LISTENING, or 350ms room-echo guard tail is still active!
         const nowPerf = performance.now();
         if (
           micLockedRef.current ||
+          !isServerTurnCompleteRef.current ||
+          !isPlaybackDrainedRef.current ||
           fsmStateRef.current !== "LISTENING" ||
           activePlaybackNodesRef.current > 0 ||
           nowPerf < micUnlockAtRef.current
@@ -4073,7 +4537,7 @@ export function InteractiveVoiceCallOverlay({
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
-          autoGainControl: true,
+          autoGainControl: false, // Prevents browser from boosting AC/fan noise while user is quiet
           channelCount: 1,
         },
       });
@@ -4117,7 +4581,7 @@ export function InteractiveVoiceCallOverlay({
 
     let outCtx: AudioContext;
     try {
-      outCtx = new AudioCtx({ sampleRate: 24000 });
+      outCtx = new AudioCtx({ sampleRate: LIVE_PLAYBACK_SAMPLE_RATE });
     } catch {
       outCtx = new AudioCtx();
     }
@@ -4142,11 +4606,16 @@ export function InteractiveVoiceCallOverlay({
     liveOutputAnalyserRef.current = outAnalyser;
     liveNextPlayTimeRef.current = 0;
     isServerTurnCompleteRef.current = true;
+    isPlaybackDrainedRef.current = true;
     activePlaybackNodesRef.current = 0;
     micUnlockAtRef.current = 0;
 
+    // Initialize 24kHz Ring Buffer Playback AudioWorklet + 16kHz Mic Capture Pipeline in parallel
     try {
-      await attachMicCapturePipeline(micStream, pipelineGen);
+      await Promise.all([
+        attachPlaybackRingBuffer(outCtx, outAnalyser, pipelineGen),
+        attachMicCapturePipeline(micStream, pipelineGen),
+      ]);
     } catch (err: unknown) {
       if (audioPipelineGenerationRef.current !== pipelineGen) return;
       disconnectAllVoiceSessions({ nextFsm: "ERROR" });
@@ -4167,11 +4636,14 @@ export function InteractiveVoiceCallOverlay({
       return;
     }
 
+    // Module 4: Inject FULL deterministic memory from second 1 (including persisted summary,
+    // recovered active formula table, and last 16 clean dialog messages)!
+    const primarySessionId = ++nextSessionIdRef.current;
     const initialMemory = getDeterministicMemoryPrompt();
     try {
       const opened = await openGeminiLiveSession({
         purpose: "primary",
-        sessionIndex: 1,
+        sessionIndex: primarySessionId,
         audioPipelineGen: pipelineGen,
         memorySummary: initialMemory,
       });
@@ -4191,18 +4663,20 @@ export function InteractiveVoiceCallOverlay({
       }
 
       activeSessionRef.current = opened.session;
-      activeSessionIndexRef.current = 1;
+      activeSessionIndexRef.current = primarySessionId;
       activeSessionStartedAtRef.current = Date.now();
       sessionTurnCountRef.current = 0;
       micLockedRef.current = false;
+      isPlaybackDrainedRef.current = true;
+      isServerTurnCompleteRef.current = true;
       setLiveError("");
       setFsm("LISTENING");
 
       console.log(
-        `[VOICE S#1] Connected (voice: ${opened.voiceName}, tools: ALL 4 AUTO)`
+        `[VOICE S#${primarySessionId}] Connected (voice: ${opened.voiceName}, tools: ALL 4 AUTO, memory: ${initialMemory.length} chars)`
       );
 
-      // Age-based background pre-warming timer (pre-warm standby if session reaches 120s age)
+      // Age-based background pre-warming timer (pre-warm standby if session reaches 150s age)
       clearPrewarmInterval();
       prewarmIntervalRef.current = setInterval(() => {
         if (
@@ -4216,7 +4690,7 @@ export function InteractiveVoiceCallOverlay({
         const ageMs = Date.now() - activeSessionStartedAtRef.current;
         if (
           ageMs >= LIVE_STANDBY_MAX_AGE_MS &&
-          !standbyReadyRef.current &&
+          !standbySlotRef.current &&
           !standbyPrewarmingRef.current
         ) {
           void prepareStandbySessionRef.current();
@@ -4244,6 +4718,7 @@ export function InteractiveVoiceCallOverlay({
     }
   }, [
     attachMicCapturePipeline,
+    attachPlaybackRingBuffer,
     clearPrewarmInterval,
     disconnectAllVoiceSessions,
     getDeterministicMemoryPrompt,
@@ -4411,8 +4886,13 @@ export function InteractiveVoiceCallOverlay({
     if (liveInputCtxRef.current?.state === "suspended") {
       liveInputCtxRef.current.resume().catch(() => {});
     }
-    // Instant Manual Barge-In: clicking the orb while AI is speaking stops audio & unlocks mic immediately
-    if (fsmState === "AI_SPEAKING" || activePlaybackNodesRef.current > 0) {
+    // Instant Manual Barge-In: clicking the orb while AI is speaking stops RingBuffer audio (5ms fade-out) & unlocks mic immediately
+    if (
+      fsmState === "AI_SPEAKING" ||
+      !isPlaybackDrainedRef.current ||
+      activePlaybackNodesRef.current > 0 ||
+      micLockedRef.current
+    ) {
       const interruptedTurn = activePlaybackTurnNumberRef.current;
       stopAllPlayback();
       finalizeCurrentTurnAsync();

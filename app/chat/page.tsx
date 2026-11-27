@@ -82,7 +82,12 @@ import {
   saveStoredSessions,
 } from "../../lib/chatStorage";
 import { ACTIVE_USER_STORAGE_KEY, UserAccount } from "../../lib/auth";
-import { getScopedChatStorageKey } from "../../components/liveVoiceHelpers";
+import {
+  getScopedChatStorageKey,
+  isValidAutoSessionTitle,
+  sanitizeSidebarSessionTitle,
+  sanitizeUserTranscript,
+} from "../../components/liveVoiceHelpers";
 
 export default function ChatPage() {
   const router = useRouter();
@@ -132,6 +137,7 @@ export default function ChatPage() {
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const activeSessionIdRef = useRef<string>(activeSessionId);
   const selectedModelRef = useRef<AiModelId>(selectedModel);
+  const [activeUserEmail, setActiveUserEmail] = useState<string | null>(null);
   const activeUserEmailRef = useRef<string | null>(null);
 
   const persistSessions = useCallback((nextSessions: ChatSession[]) => {
@@ -231,6 +237,7 @@ export default function ChatPage() {
       }
 
       activeUserEmailRef.current = resolvedEmail;
+      setActiveUserEmail(resolvedEmail);
 
       let loadedSessions: ChatSession[] = [];
       if (resolvedEmail) {
@@ -254,9 +261,25 @@ export default function ChatPage() {
       }
 
       if (loadedSessions.length > 0) {
-        setSessions(loadedSessions);
-        setActiveSessionId(loadedSessions[0].id);
-        setSelectedModel(getModelOption(loadedSessions[0].model).id);
+        let hadDirtyTitle = false;
+        const cleanedSessions = loadedSessions.map((sess) => {
+          const cleanTitle = sanitizeSidebarSessionTitle(
+            sess.title,
+            sess.messages,
+            "Obrolan Baru"
+          );
+          if (cleanTitle !== sess.title) {
+            hadDirtyTitle = true;
+            return { ...sess, title: cleanTitle };
+          }
+          return sess;
+        });
+        if (hadDirtyTitle) {
+          persistSessions(cleanedSessions);
+        }
+        setSessions(cleanedSessions);
+        setActiveSessionId(cleanedSessions[0].id);
+        setSelectedModel(getModelOption(cleanedSessions[0].model).id);
       } else {
         const def = createDefaultSession();
         persistSessions([def]);
@@ -540,15 +563,19 @@ export default function ChatPage() {
       attachments: attachments.length > 0 ? attachments : undefined,
     };
 
-    const isFirstUserMessage =
+    const needsAutoTitle =
+      activeSession.title === "Obrolan Baru" ||
       activeSession.messages.filter((m) => m.role === "user").length === 0;
-    const newTitle = isFirstUserMessage
-      ? generateSessionTitle(
-          text || attachments[0]?.textPreview || "",
-          isVoiceNote || isVoiceCall,
-          attachments.length > 0
-        )
-      : activeSession.title;
+    const candidateTitleText = text || attachments[0]?.textPreview || "";
+    const newTitle =
+      needsAutoTitle &&
+      (isValidAutoSessionTitle(candidateTitleText) || attachments.length > 0)
+        ? generateSessionTitle(
+            candidateTitleText,
+            isVoiceNote || isVoiceCall,
+            attachments.length > 0
+          )
+        : activeSession.title;
 
     const updatedMessages = [...activeSession.messages, userMsg];
 
@@ -870,7 +897,7 @@ export default function ChatPage() {
 
   const handleLiveUserStream = useCallback(
     (turnId: string, spokenText: string) => {
-      const trimmed = spokenText.trim();
+      const trimmed = sanitizeUserTranscript(spokenText);
       if (!turnId || !trimmed) return;
       const targetId = activeSessionIdRef.current;
 
@@ -879,23 +906,23 @@ export default function ChatPage() {
         prev.map((sess) => {
           if (sess.id !== targetId) return sess;
           const existingIdx = sess.messages.findIndex((m) => m.id === turnId);
+          const canUpdateTitle =
+            isValidAutoSessionTitle(trimmed) &&
+            (sess.title === "Obrolan Baru" ||
+              sess.messages.filter((m) => m.role === "user").length <= 1);
           if (existingIdx !== -1) {
             const updatedMsgs = sess.messages.map((m, i) =>
               i === existingIdx ? { ...m, content: trimmed } : m
             );
-            const isOnlyUserMsg =
-              updatedMsgs.filter((m) => m.role === "user").length === 1;
             return {
               ...sess,
-              title: isOnlyUserMsg
+              title: canUpdateTitle
                 ? generateSessionTitle(trimmed, true, false)
                 : sess.title,
               messages: updatedMsgs,
             };
           }
-          const isFirstUser =
-            sess.messages.filter((m) => m.role === "user").length === 0;
-          const nextTitle = isFirstUser
+          const nextTitle = canUpdateTitle
             ? generateSessionTitle(trimmed, true, false)
             : sess.title;
           const userMsg: ChatMessage = {
@@ -976,7 +1003,7 @@ export default function ChatPage() {
     }) => {
       const targetId = activeSessionIdRef.current;
       const modelBadge = selectedModelRef.current;
-      const cleanUser = payload.userText?.trim() || "";
+      const cleanUser = sanitizeUserTranscript(payload.userText || "");
       const cleanAi = payload.assistantText?.trim() || "";
 
       // Finalize turn text and persist to per-account localStorage ONCE on turnComplete
@@ -998,7 +1025,11 @@ export default function ChatPage() {
                 timestamp: "Suara",
               });
             }
-            if (msgs.filter((m) => m.role === "user").length === 1) {
+            if (
+              isValidAutoSessionTitle(cleanUser) &&
+              (sess.title === "Obrolan Baru" ||
+                msgs.filter((m) => m.role === "user").length === 1)
+            ) {
               nextTitle = generateSessionTitle(cleanUser, true, false);
             }
           }
@@ -1954,22 +1985,24 @@ export default function ChatPage() {
                               />
                               <span>Google Search</span>
                             </span>
-                            {messageSourcesMap[msg.id]?.map((src, sIdx) => (
-                              <a
-                                key={`${src.url}-${sIdx}`}
-                                href={src.url}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                title={src.title}
-                                className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-medium text-[#0B2B26] hover:text-[#0E807E] bg-white/75 hover:bg-white border border-[#0B2B26]/12 hover:border-[#0E807E]/35 backdrop-blur-md shadow-[inset_0_1px_1px_rgba(255,255,255,0.9)] transition-all max-w-[200px]"
-                              >
-                                <span className="truncate">{src.domain}</span>
-                                <ExternalLink
-                                  className="w-2.5 h-2.5 text-[#0E807E] shrink-0"
-                                  aria-hidden="true"
-                                />
-                              </a>
-                            ))}
+                            {messageSourcesMap[msg.id]
+                              ?.filter((src) => /^https?:\/\//i.test(src.url))
+                              .map((src, sIdx) => (
+                                <a
+                                  key={`${src.url}-${sIdx}`}
+                                  href={src.url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  title={src.title}
+                                  className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-medium text-[#0B2B26] hover:text-[#0E807E] bg-white/75 hover:bg-white border border-[#0B2B26]/12 hover:border-[#0E807E]/35 backdrop-blur-md shadow-[inset_0_1px_1px_rgba(255,255,255,0.9)] transition-all max-w-[200px]"
+                                >
+                                  <span className="truncate">{src.domain}</span>
+                                  <ExternalLink
+                                    className="w-2.5 h-2.5 text-[#0E807E] shrink-0"
+                                    aria-hidden="true"
+                                  />
+                                </a>
+                              ))}
                           </div>
                         )}
 
@@ -2048,6 +2081,8 @@ export default function ChatPage() {
                       role: m.role,
                       content: m.content,
                     }))}
+                    chatSessionId={activeSession?.id}
+                    userEmail={activeUserEmail}
                     onLiveUserStream={handleLiveUserStream}
                     onLiveAssistantStream={handleLiveAssistantStream}
                     onLiveRemoveMessage={handleLiveRemoveMessage}

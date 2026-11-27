@@ -32,14 +32,15 @@ const ALLOWED_VOICES = new Set<LiveVoiceName>([
   "Puck",
 ]);
 
-// 100% Pure Native Server VAD — fast endpointing (180ms silence, 80ms prefix padding)
+// 100% Pure Native Server VAD — START_SENSITIVITY_LOW prevents room hum/echo hallucinations,
+// END_SENSITIVITY_HIGH with 220ms silence & 100ms prefix padding ensures crisp turn handoff
 const SDK_SERVER_VAD_CONFIG = {
   automaticActivityDetection: {
     disabled: false,
-    startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
+    startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_LOW,
     endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_HIGH,
-    prefixPaddingMs: 80,
-    silenceDurationMs: 180,
+    prefixPaddingMs: 100,
+    silenceDurationMs: 220,
   },
   activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
 };
@@ -47,10 +48,10 @@ const SDK_SERVER_VAD_CONFIG = {
 const WS_SERVER_VAD_CONFIG = {
   automaticActivityDetection: {
     disabled: false,
-    startOfSpeechSensitivity: "START_SENSITIVITY_HIGH",
+    startOfSpeechSensitivity: "START_SENSITIVITY_LOW",
     endOfSpeechSensitivity: "END_SENSITIVITY_HIGH",
-    prefixPaddingMs: 80,
-    silenceDurationMs: 180,
+    prefixPaddingMs: 100,
+    silenceDurationMs: 220,
   },
   activityHandling: "START_OF_ACTIVITY_INTERRUPTS",
 };
@@ -79,12 +80,12 @@ export async function POST(req: NextRequest) {
     try {
       const body = await req.json();
       if (typeof body?.memorySummary === "string" && body.memorySummary.trim()) {
-        memorySummary = body.memorySummary.trim().slice(0, 6500);
+        memorySummary = body.memorySummary.trim().slice(0, 7500);
       } else if (
         typeof body?.recentContext === "string" &&
         body.recentContext.trim()
       ) {
-        memorySummary = body.recentContext.trim().slice(0, 6500);
+        memorySummary = body.recentContext.trim().slice(0, 7500);
       }
       if (
         typeof body?.voiceName === "string" &&

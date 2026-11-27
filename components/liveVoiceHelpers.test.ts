@@ -5,9 +5,17 @@ import {
   LIVE_ECHO_GUARD_TAIL_MS,
   LIVE_FSM_STATUS_LABELS,
   LIVE_HIGHPASS_CUTOFF_HZ,
+  LIVE_HIGHPASS_Q,
   LIVE_HOTSWAP_TARGET_TURN,
   LIVE_INPUT_CHUNK_SAMPLES,
   LIVE_MAX_AUTO_RECONNECTS,
+  LIVE_MEMORY_RECENT_MESSAGES,
+  LIVE_PLAYBACK_FADE_IN_MS,
+  LIVE_PLAYBACK_FADE_OUT_MS,
+  LIVE_PLAYBACK_PREBUFFER_MS,
+  LIVE_PLAYBACK_PREBUFFER_SAMPLES,
+  LIVE_PLAYBACK_RING_SECONDS,
+  LIVE_PLAYBACK_SAMPLE_RATE,
   LIVE_SPEECH_QUIET_CONFIRM_MS,
   LIVE_STANDBY_MAX_AGE_MS,
   LIVE_STANDBY_PREWARM_TURN,
@@ -17,6 +25,7 @@ import {
   LIVE_TRANSCRIPT_THROTTLE_MS,
   LIVE_TURN_WATCHDOG_MS,
   LIVE_VOICE_OPTIONS,
+  appendTranscriptFragment,
   base64PcmToFloat32,
   buildConversationMemorySummary,
   buildDeterministicMemoryPrompt,
@@ -25,18 +34,26 @@ import {
   classifyLiveVoicePillars,
   computeInt16PcmRms,
   createContinuousResampler,
+  createPlaybackRingBufferEngine,
   createSpeechEndProfilerState,
   downsampleFloat32ToInt16Pcm,
+  extractLatestFormulaTableFromMessages,
+  extractLocalFactSummaryFallback,
   formatLiveConnectionError,
   getScopedChatStorageKey,
+  getVoiceMemoryStorageKey,
   hasGoogleSearchGrounding,
+  hasNonLatinScript,
   int16PcmToBase64,
   isNonLatinHallucinationFragment,
+  isValidAutoSessionTitle,
   observeMicRmsForProfiler,
   parsePcmSampleRate,
   recallChatHistoryLocal,
   sanitizeLiveTranscriptText,
   sanitizeLiveUserTranscript,
+  sanitizeSidebarSessionTitle,
+  sanitizeUserTranscript,
   summarizeVoiceMetrics,
 } from "./liveVoiceHelpers";
 import {
@@ -49,19 +66,27 @@ import {
   validateAndBalanceFormulationRows,
 } from "./chatNoteUtils";
 
-test("Live Voice constants match low-latency audio (320 samples / 20ms, 85Hz highpass, 120ms echo tail), Turn 7/8 120s rotation, and 2.2s tool recovery", () => {
+test("Live Voice constants match 5-module upgrade (120ms 24kHz ring buffer, 350ms echo tail, 100Hz highpass, 8s tool recovery, 10s watchdog, Turn 7/8 150s rotation, 16-turn memory)", () => {
   assert.equal(LIVE_INPUT_CHUNK_SAMPLES, 320); // exact 20ms @ 16kHz
-  assert.equal(LIVE_HIGHPASS_CUTOFF_HZ, 85);
+  assert.equal(LIVE_HIGHPASS_CUTOFF_HZ, 100);
+  assert.equal(LIVE_HIGHPASS_Q, 0.7);
+  assert.equal(LIVE_PLAYBACK_SAMPLE_RATE, 24000);
+  assert.equal(LIVE_PLAYBACK_PREBUFFER_MS, 120);
+  assert.equal(LIVE_PLAYBACK_PREBUFFER_SAMPLES, 2880);
+  assert.equal(LIVE_PLAYBACK_RING_SECONDS, 30);
+  assert.equal(LIVE_PLAYBACK_FADE_IN_MS, 3);
+  assert.equal(LIVE_PLAYBACK_FADE_OUT_MS, 5);
   assert.equal(LIVE_TRANSCRIPT_THROTTLE_MS, 80);
-  assert.equal(LIVE_ECHO_GUARD_TAIL_MS, 120);
+  assert.equal(LIVE_ECHO_GUARD_TAIL_MS, 350);
   assert.equal(LIVE_SPEECH_QUIET_CONFIRM_MS, 260);
   assert.equal(LIVE_STANDBY_PREWARM_TURN, 7);
   assert.equal(LIVE_HOTSWAP_TARGET_TURN, 8);
-  assert.equal(LIVE_STANDBY_MAX_AGE_MS, 120_000);
-  assert.equal(LIVE_TURN_WATCHDOG_MS, 5_000);
-  assert.equal(LIVE_TOOL_RECOVERY_MS, 2_200);
+  assert.equal(LIVE_STANDBY_MAX_AGE_MS, 150_000);
+  assert.equal(LIVE_TURN_WATCHDOG_MS, 10_000);
+  assert.equal(LIVE_TOOL_RECOVERY_MS, 8_000);
   assert.equal(LIVE_TOOL_TIMEOUT_MS, 20_000);
   assert.equal(LIVE_MAX_AUTO_RECONNECTS, 2);
+  assert.equal(LIVE_MEMORY_RECENT_MESSAGES, 16);
 
   assert.deepEqual(LIVE_CONTEXT_WINDOW_COMPRESSION, {
     triggerTokens: "12000",
@@ -77,6 +102,77 @@ test("Live Voice constants match low-latency audio (320 samples / 20ms, 85Hz hig
   assert.equal(LIVE_FSM_STATUS_LABELS.LISTENING, "Live · Mendengarkan");
   assert.equal(LIVE_FSM_STATUS_LABELS.AI_SPEAKING, "Live · AI Berbicara");
   assert.equal(LIVE_FSM_STATUS_LABELS.TOOL_EXECUTING, "Live · Menyiapkan Aksi...");
+});
+
+test("createPlaybackRingBufferEngine enforces 120ms prebuffer, 3ms fade-in, short-reply turnComplete flush, edge-triggered bufferDrained, and 5ms fade-out stop", () => {
+  const engine = createPlaybackRingBufferEngine(24000, 120, 30);
+
+  // Push 1000 samples (< 2880 prebuffer threshold): output stays silent until threshold or turnComplete
+  engine.push(new Float32Array(1000).fill(0.5));
+  const beforePrebuffer = engine.pullBlock(128);
+  assert.equal(beforePrebuffer.playing, false);
+  assert.equal(beforePrebuffer.drainedEvent, false);
+  assert.equal(beforePrebuffer.output[0], 0);
+  assert.equal(beforePrebuffer.bufferedSamples, 1000);
+
+  // Push 2000 more samples (total 3000 >= 2880): starts playing with 3ms (72-sample) fade-in ramp
+  engine.push(new Float32Array(2000).fill(0.5));
+  const firstPlayBlock = engine.pullBlock(128);
+  assert.equal(firstPlayBlock.playing, true);
+  assert.equal(firstPlayBlock.drainedEvent, false);
+  assert.equal(firstPlayBlock.output[0], 0); // click-free 0-crossing fade-in start
+  assert.ok(firstPlayBlock.output[1] > 0 && firstPlayBlock.output[1] < 0.05); // smooth linear ramp
+  assert.ok(Math.abs(firstPlayBlock.output[100] - 0.5) < 0.001); // full gain after 72 samples
+
+  // Drain buffer to empty: emits edge-triggered drainedEvent EXACTLY ONCE on empty
+  let drainCount = 0;
+  while (engine.getBufferedSamples() > 0) {
+    const step = engine.pullBlock(128);
+    if (step.drainedEvent) drainCount += 1;
+  }
+  assert.equal(drainCount, 1);
+  // Subsequent empty pulls do NOT re-emit drainedEvent
+  assert.equal(engine.pullBlock(128).drainedEvent, false);
+  assert.equal(engine.pullBlock(128).drainedEvent, false);
+
+  // Short reply (< 2880 samples) stays held until markTurnComplete(), then flushes immediately and drains once
+  engine.push(new Float32Array(256).fill(0.4));
+  assert.equal(engine.pullBlock(128).playing, false);
+  engine.markTurnComplete();
+  const shortFirst = engine.pullBlock(128);
+  assert.equal(shortFirst.playing, true);
+  assert.ok(shortFirst.output[127] > 0.35);
+  const shortSecond = engine.pullBlock(128);
+  assert.equal(shortSecond.drainedEvent, true);
+
+  // Barge-in stopWithFadeOut() ramps smoothly down to 0 and clears buffer
+  engine.push(new Float32Array(4000).fill(0.6));
+  assert.equal(engine.pullBlock(128).playing, true);
+  engine.stopWithFadeOut();
+  const fadeBlock = engine.pullBlock(128);
+  assert.ok(fadeBlock.output[0] > fadeBlock.output[60]);
+  assert.equal(fadeBlock.output[127], 0);
+  assert.equal(engine.getBufferedSamples(), 0);
+});
+
+test("appendTranscriptFragment merges chunks cleanly without glued words like fokuskan?Atau or tertentuSorry", () => {
+  assert.equal(
+    appendTranscriptFragment("fokuskan?", "Atau mungkin"),
+    "fokuskan? Atau mungkin"
+  );
+  assert.equal(
+    appendTranscriptFragment("ada tren tertentu", "Sorry kepotong."),
+    "ada tren tertentu Sorry kepotong."
+  );
+  assert.equal(
+    appendTranscriptFragment("Halo, mau bikin", " serum niacinamide."),
+    "Halo, mau bikin serum niacinamide."
+  );
+  assert.equal(
+    appendTranscriptFragment("Moisturizer", ", cocok untuk kulit sensitif."),
+    "Moisturizer, cocok untuk kulit sensitif."
+  );
+  assert.equal(appendTranscriptFragment("", "Oke siap."), "Oke siap.");
 });
 
 test("buildLiveVoiceFunctionDeclarations permanently registers all 4 unified skills with simplified hybrid create_formula_table schema", () => {
@@ -113,9 +209,8 @@ test("validateAndBalanceFormulationRows guarantees exact 100.00% sum via Aqua au
   ];
 
   const balanced = validateAndBalanceFormulationRows(FORMULATION_REQUIRED_COLUMNS, rawRows);
-  assert.equal(balanced.rows.length, 5); // stripped the duplicate Total row
+  assert.equal(balanced.rows.length, 5);
   assert.equal(balanced.totalPercentage, "100.00%");
-  // Aqua should have been adjusted from 70% -> 84.20% so sum is exact 100.00%
   assert.equal(balanced.rows[0][2], "84.20%");
 
   const numericSum = balanced.rows.reduce(
@@ -124,7 +219,6 @@ test("validateAndBalanceFormulationRows guarantees exact 100.00% sum via Aqua au
   );
   assert.ok(Math.abs(numericSum - 100) < 0.001);
 
-  // Also handles overshooting > 100% by scaling or trimming Aqua cleanly
   const overRows: string[][] = [
     ["A", "Water (Aqua)", "85%", "Solvent", "-"],
     ["B", "Butylene Glycol", "10%", "Humectant", "-"],
@@ -135,7 +229,7 @@ test("validateAndBalanceFormulationRows guarantees exact 100.00% sum via Aqua au
   assert.equal(balancedOver.rows[0][2], "78.00%");
 });
 
-test("buildDeterministicMemoryPrompt emits [RINGKASAN FAKTA], [TABEL FORMULA AKTIF], and [12 PESAN DIALOG TERAKHIR]", () => {
+test("buildDeterministicMemoryPrompt emits [RINGKASAN FAKTA JANGKA PANJANG], [TABEL FORMULA AKTIF] (with auto-recovery), and [16 PESAN DIALOG TERAKHIR] using Formylab AI label", () => {
   const table = normalizeFormulaTableArtifact({
     title: "Moisturizer Barrier Kulit Sensitif",
     subtitle: "Target pH 5.3 · Gel-cream",
@@ -159,27 +253,52 @@ test("buildDeterministicMemoryPrompt emits [RINGKASAN FAKTA], [TABEL FORMULA AKT
   });
   assert.ok(table);
 
-  const recentMessages = Array.from({ length: 15 }, (_, idx) => ({
-    role: (idx % 2 === 0 ? "user" : "assistant") as "user" | "assistant",
-    content: `Pesan ke-${idx + 1} tentang formula moisturizer sensitif.`,
-  }));
+  const recentMessages = [
+    ...Array.from({ length: 18 }, (_, idx) => ({
+      role: (idx % 2 === 0 ? "user" : "assistant") as "user" | "assistant",
+      content:
+        idx === 4
+          ? "安静。" // must be dropped from memory injection
+          : `Pesan ke-${idx + 1} tentang formula moisturizer sensitif.`,
+    })),
+    {
+      role: "assistant" as const,
+      content: encodeFormulaTableMessage(table!),
+    },
+  ];
+
+  // Auto-recovery of table from messages when latestFormulaTable is null
+  const recovered = extractLatestFormulaTableFromMessages(recentMessages);
+  assert.equal(recovered?.title, "Moisturizer Barrier Kulit Sensitif");
 
   const prompt = buildDeterministicMemoryPrompt({
     longTermSummary: "Nama user: Nadia. Fokus: moisturizer barrier kulit sensitif.",
-    latestFormulaTable: table,
+    latestFormulaTable: null,
     recentMessages,
   });
 
-  assert.ok(prompt.includes("[RINGKASAN FAKTA]"));
+  assert.ok(prompt.includes("[RINGKASAN FAKTA JANGKA PANJANG]"));
   assert.ok(prompt.includes("Nama user: Nadia"));
   assert.ok(prompt.includes("[TABEL FORMULA AKTIF]"));
   assert.ok(prompt.includes("Moisturizer Barrier Kulit Sensitif"));
   assert.ok(prompt.includes("Alpha-Arbutin"));
-  assert.ok(prompt.includes("[12 PESAN DIALOG TERAKHIR]"));
-  assert.equal(prompt.includes("Pesan ke-1 "), false); // only last 12 kept
-  assert.ok(prompt.includes("User: Pesan ke-5"));
-  assert.ok(prompt.includes("Asisten: Pesan ke-4"));
-  assert.ok(prompt.includes("Pesan ke-15"));
+  assert.ok(prompt.includes("[16 PESAN DIALOG TERAKHIR]"));
+  assert.equal(prompt.includes("安静"), false);
+  assert.equal(prompt.includes("Pesan ke-1 "), false);
+  assert.ok(prompt.includes("User: Pesan ke-7"));
+  assert.ok(prompt.includes("Formylab AI: Pesan ke-8"));
+
+  // Local fact extractor works without LLM call
+  const localSummary = extractLocalFactSummaryFallback(
+    [
+      { role: "user", content: "Halo nama saya Bima, aku mau bikin serum kulit sensitif pakai Niacinamide dan Ceramide." },
+      { role: "assistant", content: "Siap Bima, kita racik serum yang lembut." },
+    ],
+    table
+  );
+  assert.ok(localSummary.includes("Bima"));
+  assert.ok(localSummary.includes("Niacinamide"));
+  assert.ok(localSummary.includes("Moisturizer Barrier Kulit Sensitif"));
 });
 
 test("recallChatHistoryLocal finds older messages and active table locally in <1ms", () => {
@@ -300,16 +419,22 @@ test("summarizeVoiceMetrics computes Turn #1-3 vs Turn #4+ averages and hot-swap
   assert.equal(summary.hotSwapCount, 1);
 });
 
-test("sanitizeLiveUserTranscript & isNonLatinHallucinationFragment drop Thai/CJK/Arabic/Cyrillic/Korean hallucinations while keeping Indonesian & INCI", () => {
-  assert.equal(isNonLatinHallucinationFragment("ฮัลโหล"), true);
-  assert.equal(isNonLatinHallucinationFragment("안녕하세요"), true);
-  assert.equal(isNonLatinHallucinationFragment("مرحبا"), true);
-  assert.equal(isNonLatinHallucinationFragment("Привет"), true);
-  assert.equal(isNonLatinHallucinationFragment("こんにちは"), true);
-  assert.equal(isNonLatinHallucinationFragment("Buatin resep moisturizer niacinamide"), false);
+test("sanitizeUserTranscript strictly rejects ANY non-Latin script (including 安静。 and mixed strings) while keeping clean Indonesian & INCI", () => {
+  assert.equal(hasNonLatinScript("安静。"), true);
+  assert.equal(hasNonLatinScript("halo 安静"), true);
+  assert.equal(hasNonLatinScript("ฮัลโหล"), true);
+  assert.equal(hasNonLatinScript("안녕하세요"), true);
+  assert.equal(hasNonLatinScript("مرحبا"), true);
+  assert.equal(hasNonLatinScript("Привет"), true);
+  assert.equal(hasNonLatinScript("こんにちは"), true);
+  assert.equal(hasNonLatinScript("Buatin resep moisturizer niacinamide 5%"), false);
 
-  assert.equal(sanitizeLiveUserTranscript("ฮัลโหล"), "");
-  assert.equal(sanitizeLiveUserTranscript("  ฮัลโหล <noise> "), "");
+  assert.equal(isNonLatinHallucinationFragment("安静。"), true);
+  assert.equal(sanitizeUserTranscript("安静。"), "");
+  assert.equal(sanitizeUserTranscript("halo 安静"), "");
+  assert.equal(sanitizeUserTranscript("ฮัลโหล"), "");
+  assert.equal(sanitizeUserTranscript("  ฮัลโหล <noise> "), "");
+  assert.equal(sanitizeLiveUserTranscript("安静。"), "");
   assert.equal(sanitizeLiveTranscriptText("<noise>"), "");
   assert.equal(sanitizeLiveTranscriptText("  <inaudible>  <noise> "), "");
   assert.equal(
@@ -317,14 +442,44 @@ test("sanitizeLiveUserTranscript & isNonLatinHallucinationFragment drop Thai/CJK
     "Buatin resep moisturizer"
   );
   assert.equal(
-    sanitizeLiveUserTranscript(". Oke, langsung buat resepnya."),
+    sanitizeUserTranscript(". Oke, langsung buat resepnya."),
     "Oke, langsung buat resepnya."
   );
   assert.equal(
-    sanitizeLiveUserTranscript("... , !? ; :  Buatin moisturizer Butylene Glycol."),
+    sanitizeUserTranscript("... , !? ; :  Buatin moisturizer Butylene Glycol."),
     "Buatin moisturizer Butylene Glycol."
   );
-  assert.equal(sanitizeLiveUserTranscript("... <noise> , "), "");
+  assert.equal(sanitizeUserTranscript("... <noise> , "), "");
+});
+
+test("isValidAutoSessionTitle & sanitizeSidebarSessionTitle reject short mumbles and clean legacy non-Latin titles", () => {
+  assert.equal(isValidAutoSessionTitle("Oh."), false);
+  assert.equal(isValidAutoSessionTitle("Halo."), false);
+  assert.equal(isValidAutoSessionTitle("Oke."), false);
+  assert.equal(isValidAutoSessionTitle("安静。"), false);
+  assert.equal(isValidAutoSessionTitle("hmm"), false);
+  assert.equal(isValidAutoSessionTitle("Tren bahan aktif skincare 2026"), true);
+
+  assert.equal(
+    sanitizeSidebarSessionTitle("安静。", [
+      { role: "user", content: "安静。" },
+      { role: "user", content: "Halo." },
+      { role: "user", content: "Buatin resep moisturizer untuk kulit sensitif" },
+    ]),
+    "Buatin resep moisturizer untuk kulit s..."
+  );
+
+  assert.equal(
+    sanitizeSidebarSessionTitle("安静。", [
+      { role: "user", content: "Oh." },
+    ]),
+    "Obrolan Baru"
+  );
+
+  assert.equal(
+    sanitizeSidebarSessionTitle("Formulasi Serum Barrier"),
+    "Formulasi Serum Barrier"
+  );
 });
 
 test("classifyLiveVoicePillars classifies 0ms locally with Interactive/Generative/Analytical", () => {
@@ -352,7 +507,6 @@ test("classifyLiveVoicePillars classifies 0ms locally with Interactive/Generativ
 });
 
 test("createContinuousResampler streams 128-sample blocks from 48kHz & 44.1kHz into exact 320-sample (20ms) packets with smooth phase continuity", () => {
-  // 48kHz -> 16kHz (ratio 3.0): 440Hz sine wave across 30 blocks of 128 samples (3840 samples = 80ms = 4 packets of 320 samples)
   const resampler48 = createContinuousResampler(48000, 16000, 320);
   const packets48: Int16Array[] = [];
   let sampleCursor = 0;
@@ -368,8 +522,7 @@ test("createContinuousResampler streams 128-sample blocks from 48kHz & 44.1kHz i
   for (const pkt of packets48) {
     assert.equal(pkt.length, 320);
   }
-  // Verify smooth waveform continuity across packet boundaries (no clicks/jumps)
-  const maxAllowedDelta = Math.round(0.5 * 32767 * (2 * Math.PI * 440 / 16000) * 1.4);
+  const maxAllowedDelta = Math.round(0.5 * 32767 * ((2 * Math.PI * 440) / 16000) * 1.4);
   for (let p = 1; p < packets48.length; p++) {
     const prevLast = packets48[p - 1][319];
     const nextFirst = packets48[p][0];
@@ -379,7 +532,6 @@ test("createContinuousResampler streams 128-sample blocks from 48kHz & 44.1kHz i
     );
   }
 
-  // 44.1kHz -> 16kHz fractional ratio (2.75625): verify steady packet output without drift
   const resampler44 = createContinuousResampler(44100, 16000, 320);
   const packets44: Int16Array[] = [];
   for (let b = 0; b < 40; b++) {
@@ -413,12 +565,12 @@ test("parsePcmSampleRate extracts rate from mimeType or falls back cleanly", () 
   assert.equal(parsePcmSampleRate(undefined, 24000), 24000);
 });
 
-test("buildLiveVoiceSystemInstruction enforces Indonesian language lock, all 4 automatic skills, and deterministic memory injection", () => {
+test("buildLiveVoiceSystemInstruction enforces ATURAN BAHASA MUTLAK lock, natural GPT-Voice pacing, all 4 automatic skills, and deterministic memory injection", () => {
   const prompt = buildLiveVoiceSystemInstruction(
-    "[RINGKASAN FAKTA]\nUser: Sari\n\n[12 PESAN DIALOG TERAKHIR]\nUser: Halo\nAsisten: Halo Sari!"
+    "[RINGKASAN FAKTA JANGKA PANJANG]\nUser: Sari\n\n[16 PESAN DIALOG TERAKHIR]\nUser: Halo\nFormylab AI: Halo Sari!"
   );
-  assert.ok(prompt.startsWith("BAHASA UTAMA: User selalu berbicara dalam Bahasa Indonesia"));
-  assert.ok(prompt.includes("1 sampai 2 kalimat"));
+  assert.ok(prompt.startsWith("ATURAN BAHASA MUTLAK: User selalu berbicara dalam Bahasa Indonesia"));
+  assert.ok(prompt.includes("2 sampai 3 kalimat"));
   assert.ok(prompt.includes("create_formula_table"));
   assert.ok(prompt.includes("save_to_google_docs"));
   assert.ok(prompt.includes("search_web_info"));
@@ -455,7 +607,7 @@ test("formatLiveConnectionError returns clear Indonesian diagnostics", () => {
   assert.ok(formatLiveConnectionError("timeout").includes("batas waktu"));
 });
 
-test("getScopedChatStorageKey scopes keys per normalized user email", () => {
+test("getScopedChatStorageKey and getVoiceMemoryStorageKey scope keys cleanly per user & room", () => {
   assert.equal(
     getScopedChatStorageKey("formylab_chat_sessions", "User@Example.COM"),
     "formylab_chat_sessions::user@example.com"
@@ -463,6 +615,10 @@ test("getScopedChatStorageKey scopes keys per normalized user email", () => {
   assert.equal(
     getScopedChatStorageKey("formylab_chat_sessions", ""),
     "formylab_chat_sessions"
+  );
+  assert.equal(
+    getVoiceMemoryStorageKey("chat-123", "User@Example.COM"),
+    "formylab_voice_memory_v1::user@example.com::chat-123"
   );
 });
 
