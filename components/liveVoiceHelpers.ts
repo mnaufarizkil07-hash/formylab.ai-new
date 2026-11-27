@@ -52,23 +52,30 @@ export const LIVE_FSM_STATUS_LABELS: Record<LiveVoiceFsmState, string> = {
   ERROR: "Koneksi Live Terputus",
 };
 
-// Audio capture & playback ring buffer constants
+// Audio capture, adaptive soft attenuator & playback ring buffer constants
 export const LIVE_INPUT_TARGET_SAMPLE_RATE = 16000;
 export const LIVE_INPUT_CHUNK_SAMPLES = 320; // exact 20ms @ 16kHz
-export const LIVE_HIGHPASS_CUTOFF_HZ = 100;
+export const LIVE_HIGHPASS_CUTOFF_HZ = 70;
 export const LIVE_HIGHPASS_Q = 0.7;
+export const LIVE_INPUT_NOISE_CALIBRATION_MS = 300;
+export const LIVE_INPUT_PREROLL_MS = 160; // 8 frames @ 20ms = 2560 samples @ 16kHz
+export const LIVE_INPUT_HANG_TIME_MS = 650;
+export const LIVE_INPUT_QUIET_ATTENUATION = 0.08;
+export const LIVE_INPUT_MIN_SPEECH_RMS = 0.008;
+export const LIVE_INPUT_NOISE_MULTIPLIER = 1.8;
+export const LIVE_INPUT_RMS_REPORT_INTERVAL_MS = 60;
 
 export const LIVE_PLAYBACK_SAMPLE_RATE = 24000;
-export const LIVE_PLAYBACK_PREBUFFER_MS = 120;
-export const LIVE_PLAYBACK_PREBUFFER_SAMPLES = 2880; // exact 120ms @ 24kHz
+export const LIVE_PLAYBACK_PREBUFFER_MS = 45;
+export const LIVE_PLAYBACK_PREBUFFER_SAMPLES = 1080; // exact 45ms @ 24kHz
 export const LIVE_PLAYBACK_RING_SECONDS = 30;
 export const LIVE_PLAYBACK_FADE_IN_MS = 3;
 export const LIVE_PLAYBACK_FADE_OUT_MS = 5;
 
 // Echo guard, watchdogs, memory & rotation constants
 export const LIVE_TRANSCRIPT_THROTTLE_MS = 80;
-export const LIVE_ECHO_GUARD_TAIL_MS = 350;
-export const LIVE_SPEECH_QUIET_CONFIRM_MS = 260;
+export const LIVE_ECHO_GUARD_TAIL_MS = 150;
+export const LIVE_SPEECH_QUIET_CONFIRM_MS = 180;
 export const LIVE_STANDBY_PREWARM_TURN = 7;
 export const LIVE_HOTSWAP_TARGET_TURN = 8;
 export const LIVE_STANDBY_MAX_AGE_MS = 150_000;
@@ -78,12 +85,27 @@ export const LIVE_TOOL_TIMEOUT_MS = 20_000;
 export const LIVE_MAX_AUTO_RECONNECTS = 2;
 export const LIVE_MEMORY_RECENT_MESSAGES = 16;
 
-export const LIVE_CONTEXT_WINDOW_COMPRESSION = {
-  triggerTokens: "12000",
-  slidingWindow: {
-    targetTokens: "6000",
-  },
-} as const;
+export type LiveThinkingConfigValue =
+  | { thinkingBudget: 0 }
+  | { thinkingLevel: "minimal" };
+
+/**
+ * Returns the exact low-latency anti-thinking config matching the active Live model:
+ * - `gemini-2.5-flash-native-audio-*` -> `{ thinkingBudget: 0 }`
+ * - `gemini-3.*-live*` -> `{ thinkingLevel: "minimal" }`
+ */
+export function getLiveThinkingConfigForModel(
+  modelId: string
+): LiveThinkingConfigValue | undefined {
+  const normalized = (modelId || "").trim();
+  if (/^gemini-2\.5-flash-native-audio/i.test(normalized) || /^gemini-2\.5/i.test(normalized)) {
+    return { thinkingBudget: 0 };
+  }
+  if (/^gemini-3\.[^/]*-live/i.test(normalized)) {
+    return { thinkingLevel: "minimal" };
+  }
+  return undefined;
+}
 
 export const NON_LATIN_HALLUCINATION_SCRIPT_RE =
   /[\u0E00-\u0E7F\u0600-\u06FF\u0400-\u04FF\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7AF]/;
@@ -724,20 +746,18 @@ export function buildLiveVoiceSystemInstruction(
   memorySummary?: string
 ): string {
   const lines = [
-    "ATURAN BAHASA MUTLAK: User selalu berbicara dalam Bahasa Indonesia (sesekali menyebut istilah bahan kosmetik/INCI berbahasa Inggris). Selalu tafsirkan ucapan user sebagai Bahasa Indonesia dan SELALU balas dalam Bahasa Indonesia lisan yang sangat natural. Abaikan noise/suara singkat yang tidak jelas tanpa perlu merespons atau meminta maaf.",
+    "ATURAN BAHASA MUTLAK: User selalu berbicara dalam Bahasa Indonesia (sesekali menyebut istilah kosmetik/INCI). Selalu tafsirkan ucapan user sebagai Bahasa Indonesia dan SELALU balas dalam Bahasa Indonesia lisan yang hangat, akrab, cepat, dan natural seperti rekan senior R&D Formylab.ai di telepon. Abaikan noise singkat tak jelas tanpa merespons atau meminta maaf.",
     "",
-    "Kamu adalah rekan senior R&D kosmetik Formylab.ai yang sedang mengobrol santai lewat telepon dengan pengguna.",
-    "Gaya bicara wajib mengalir mulus, hangat, dan manusiawi ala GPT Voice (BUKAN kaku seperti membaca teks formal):",
-    "- Gunakan Bahasa Indonesia percakapan sehari-hari yang ramah, akrab, dan to the point (misal 'Oke siap', 'Nah kalau buat kulit sensitif...', 'Boleh banget, jadi gini...').",
-    "- Gunakan tanda baca koma dan titik secara alami untuk jeda napas, maksimal 2 sampai 3 kalimat padat per giliran bicara.",
-    "- DILARANG membacakan simbol markdown, tanda kurung, atau daftar tabel/persentase panjang lewat suara.",
-    "- Jangan pernah menyapa user dengan nama bahan kosmetik.",
+    "Gaya bicara:",
+    "- Langsung ke inti, 1 sampai 2 kalimat padat per giliran dengan jeda koma dan titik alami ala GPT Voice.",
+    "- DILARANG membacakan simbol markdown, tanda kurung, atau daftar tabel panjang.",
+    "- Jangan menyapa user memakai nama bahan kosmetik.",
     "",
-    "KEMAMPUAN TOOL OTOMATIS (SELALU AKTIF TANPA TOMBOL TERPISAH):",
-    "- Jika user menanyakan tren skincare/kosmetik terbaru, harga bahan terkini, regulasi BPOM/Halal terbaru, berita, atau fakta eksternal, langsung panggil `search_web_info` tanpa ragu lalu sampaikan intinya dengan santai seolah baru saja mengecek data terbaru. Untuk obrolan biasa atau konsep dasar, jawab langsung tanpa memanggil search agar tetap super cepat.",
-    "- Kapan pun user minta tabel resep detail, formula lengkap, atau perbandingan bahan, JANGAN PERNAH menolak—langsung panggil `create_formula_table` dengan `topic`, `key_ingredients`, `constraints`, dan `table_type` ('formulation' | 'comparison' | 'general'). Setelah tabel tampil di room chat, sampaikan ringkasan 1 sampai 2 kalimat hangat lewat suara.",
-    "- Kapan pun user minta simpan ke Google Docs atau Google Drive, langsung panggil `save_to_google_docs` (set `include_latest_table: true` jika merujuk tabel terakhir di chat).",
-    "- Kapan pun user menanyakan sesuatu yang dibahas jauh sebelumnya di chat ini, langsung panggil `recall_chat_history` dengan kata kunci terkait.",
+    "Tool otomatis (selalu aktif):",
+    "- `search_web_info`: panggil untuk tren skincare/kosmetik terbaru, harga bahan terkini, regulasi BPOM/Halal terbaru, atau fakta web; untuk obrolan biasa jawab langsung.",
+    "- `create_formula_table`: JANGAN PERNAH menolak saat user minta tabel resep detail atau perbandingan bahan; langsung panggil dengan `topic`, `key_ingredients`, `constraints`, `table_type` ('formulation' | 'comparison' | 'general'), lalu ringkas 1 sampai 2 kalimat lewat suara.",
+    "- `save_to_google_docs`: panggil saat user minta simpan ke Google Docs/Drive (`include_latest_table: true` untuk tabel terakhir).",
+    "- `recall_chat_history`: panggil saat user menanyakan bahasan lama di chat ini.",
   ];
 
   const cleanMemory =
@@ -747,7 +767,7 @@ export function buildLiveVoiceSystemInstruction(
     lines.push("[MEMORI PERCAKAPAN SEBELUMNYA]");
     lines.push(cleanMemory);
     lines.push(
-      "Lanjutkan percakapan secara mulus tanpa mengulang salam pembuka jika konteks di atas sudah berjalan. Ingat penuh nama user, topik sebelumnya, bahan yang dipilih, dan tabel formula aktif di atas."
+      "Lanjutkan mulus tanpa ulang salam jika konteks sudah berjalan; ingat nama user, topik, bahan, dan tabel aktif."
     );
   }
 
@@ -1236,8 +1256,213 @@ export function getVoiceMemoryStorageKey(
 }
 
 /**
+ * Pure TypeScript Adaptive Soft Attenuator + 160ms Pre-Roll Buffer + 650ms Hang-Time
+ * + 60ms RMS Telemetry engine (mirrors `FormylabLivePcmCaptureProcessor` in the input
+ * AudioWorkletNode) so quiet room hum is gently attenuated to 0.08x (never hard-muted)
+ * while normal speech ("halo") immediately flushes 160ms pre-roll at 1.0x full volume.
+ */
+export interface AdaptiveSoftAttenuatorFrameResult {
+  packets: Array<{
+    pcm: Int16Array;
+    rawRms: number;
+    threshold: number;
+    isPreRoll: boolean;
+  }>;
+  rmsTelemetry: {
+    rms: number;
+    noiseFloor: number;
+    threshold: number;
+    speaking: boolean;
+  } | null;
+  gateOpen: boolean;
+  noiseFloor: number;
+  threshold: number;
+}
+
+export interface AdaptiveSoftAttenuator {
+  processFrame: (raw20msFrame: Float32Array) => AdaptiveSoftAttenuatorFrameResult;
+  reset: () => void;
+}
+
+export function createAdaptiveSoftAttenuator(options?: {
+  frameDurationMs?: number;
+  calibrationMs?: number;
+  preRollMs?: number;
+  hangTimeMs?: number;
+  quietGain?: number;
+  minSpeechRms?: number;
+  noiseMultiplier?: number;
+  rmsReportIntervalMs?: number;
+}): AdaptiveSoftAttenuator {
+  const frameDurationMs = options?.frameDurationMs ?? 20;
+  const calibrationFrames = Math.max(
+    1,
+    Math.round((options?.calibrationMs ?? LIVE_INPUT_NOISE_CALIBRATION_MS) / frameDurationMs)
+  );
+  const preRollMaxFrames = Math.max(
+    1,
+    Math.round((options?.preRollMs ?? LIVE_INPUT_PREROLL_MS) / frameDurationMs)
+  );
+  const hangTimeMs = options?.hangTimeMs ?? LIVE_INPUT_HANG_TIME_MS;
+  const quietGain = options?.quietGain ?? LIVE_INPUT_QUIET_ATTENUATION;
+  const minSpeechRms = options?.minSpeechRms ?? LIVE_INPUT_MIN_SPEECH_RMS;
+  const noiseMultiplier = options?.noiseMultiplier ?? LIVE_INPUT_NOISE_MULTIPLIER;
+  const rmsReportIntervalMs =
+    options?.rmsReportIntervalMs ?? LIVE_INPUT_RMS_REPORT_INTERVAL_MS;
+
+  let calibratedCount = 0;
+  let calibrationSum = 0;
+  let noiseFloor = 0.004;
+  let gateOpen = false;
+  let hangRemainingMs = 0;
+  let currentGain = quietGain;
+  let preRollQueue: Array<{ samples: Float32Array; rawRms: number }> = [];
+  let rmsAccumMs = 0;
+  let rmsWindowPeak = 0;
+
+  const encodeWithSmoothGain = (
+    src: Float32Array,
+    targetGain: number
+  ): Int16Array => {
+    const out = new Int16Array(src.length);
+    const step = src.length > 0 ? (targetGain - currentGain) / Math.min(src.length, 48) : 0;
+    let g = currentGain;
+    for (let i = 0; i < src.length; i++) {
+      if (i < 48) {
+        g += step;
+      } else {
+        g = targetGain;
+      }
+      const v = Math.max(-1, Math.min(1, src[i] * g));
+      out[i] = v < 0 ? Math.round(v * 0x8000) : Math.round(v * 0x7fff);
+    }
+    currentGain = targetGain;
+    return out;
+  };
+
+  return {
+    reset() {
+      calibratedCount = 0;
+      calibrationSum = 0;
+      noiseFloor = 0.004;
+      gateOpen = false;
+      hangRemainingMs = 0;
+      currentGain = quietGain;
+      preRollQueue = [];
+      rmsAccumMs = 0;
+      rmsWindowPeak = 0;
+    },
+    processFrame(raw20msFrame: Float32Array): AdaptiveSoftAttenuatorFrameResult {
+      let sumSq = 0;
+      for (let i = 0; i < raw20msFrame.length; i++) {
+        const s = raw20msFrame[i];
+        sumSq += s * s;
+      }
+      const rawRms =
+        raw20msFrame.length > 0 ? Math.sqrt(sumSq / raw20msFrame.length) : 0;
+
+      // Auto-calibrate noise floor during first 300ms (15 frames @ 20ms)
+      if (calibratedCount < calibrationFrames) {
+        calibrationSum += Math.min(0.03, rawRms);
+        calibratedCount += 1;
+        noiseFloor = Math.max(
+          0.0015,
+          Math.min(0.025, calibrationSum / calibratedCount)
+        );
+      }
+
+      const threshold = Math.max(noiseFloor * noiseMultiplier, minSpeechRms);
+      const packets: AdaptiveSoftAttenuatorFrameResult["packets"] = [];
+
+      if (rawRms >= threshold) {
+        hangRemainingMs = hangTimeMs;
+        if (!gateOpen) {
+          gateOpen = true;
+          // Flush 160ms pre-roll buffer at full 1.0x volume so word onset ("halo") is 100% preserved
+          for (const buffered of preRollQueue) {
+            packets.push({
+              pcm: encodeWithSmoothGain(buffered.samples, 1.0),
+              rawRms: buffered.rawRms,
+              threshold,
+              isPreRoll: true,
+            });
+          }
+          preRollQueue = [];
+        }
+        packets.push({
+          pcm: encodeWithSmoothGain(raw20msFrame, 1.0),
+          rawRms,
+          threshold,
+          isPreRoll: false,
+        });
+      } else if (gateOpen) {
+        // Hold 1.0x full volume during 650ms hang-time so short words & endings never clip
+        hangRemainingMs -= frameDurationMs;
+        packets.push({
+          pcm: encodeWithSmoothGain(raw20msFrame, 1.0),
+          rawRms,
+          threshold,
+          isPreRoll: false,
+        });
+        if (hangRemainingMs <= 0) {
+          gateOpen = false;
+          hangRemainingMs = 0;
+        }
+      } else {
+        // Gently adapt noise floor while quiet
+        if (calibratedCount >= calibrationFrames) {
+          noiseFloor = Math.max(
+            0.0015,
+            Math.min(0.025, noiseFloor * 0.96 + rawRms * 0.04)
+          );
+        }
+        // Store unattenuated frame in 160ms circular pre-roll ring
+        preRollQueue.push({
+          samples: new Float32Array(raw20msFrame),
+          rawRms,
+        });
+        if (preRollQueue.length > preRollMaxFrames) {
+          preRollQueue.shift();
+        }
+        // Softly attenuate background hum to 0.08x (NOT hard mute 0)
+        packets.push({
+          pcm: encodeWithSmoothGain(raw20msFrame, quietGain),
+          rawRms,
+          threshold,
+          isPreRoll: false,
+        });
+      }
+
+      rmsAccumMs += frameDurationMs;
+      if (rawRms > rmsWindowPeak) {
+        rmsWindowPeak = rawRms;
+      }
+
+      let rmsTelemetry: AdaptiveSoftAttenuatorFrameResult["rmsTelemetry"] = null;
+      if (rmsAccumMs >= rmsReportIntervalMs) {
+        rmsTelemetry = {
+          rms: rmsWindowPeak,
+          noiseFloor,
+          threshold,
+          speaking: gateOpen,
+        };
+        rmsAccumMs = 0;
+        rmsWindowPeak = 0;
+      }
+
+      return {
+        packets,
+        rmsTelemetry,
+        gateOpen,
+        noiseFloor,
+        threshold,
+      };
+    },
+  };
+}
+
+/**
  * Computes normalized RMS amplitude [0..1] from a 16-bit signed PCM frame.
- * Used strictly for read-only latency profiling (NEVER modifies or gates audio).
  */
 export function computeInt16PcmRms(samples: Int16Array): number {
   if (!samples || samples.length === 0) return 0;
@@ -1252,51 +1477,71 @@ export function computeInt16PcmRms(samples: Int16Array): number {
 export interface SpeechEndProfilerState {
   noiseFloor: number;
   userSpeaking: boolean;
+  hasDetectedSpeechInTurn: boolean;
+  peakRmsInTurn: number;
   quietSinceMs: number | null;
   lastSpeechEndedAtMs: number;
+  speechStartedEvent: boolean;
+  speechEndedEvent: boolean;
 }
 
 export function createSpeechEndProfilerState(
-  initialNoiseFloor = 0.008
+  initialNoiseFloor = 0.004
 ): SpeechEndProfilerState {
   return {
-    noiseFloor: Math.max(0.003, Math.min(0.03, initialNoiseFloor)),
+    noiseFloor: Math.max(0.0015, Math.min(0.025, initialNoiseFloor)),
     userSpeaking: false,
+    hasDetectedSpeechInTurn: false,
+    peakRmsInTurn: 0,
     quietSinceMs: null,
     lastSpeechEndedAtMs: 0,
+    speechStartedEvent: false,
+    speechEndedEvent: false,
   };
 }
 
 /**
- * Pure read-only RMS speech-end profiler for millisecond latency diagnostics.
- * Records `lastSpeechEndedAtMs` when user speech drops to quiet level.
- * NEVER modifies audio and NEVER sends manual VAD signals.
+ * Accurate RMS speech-start / speech-end profiler for Console latency telemetry.
+ * - Sets `speechStartedEvent = true` once speech crosses threshold on the active turn.
+ * - Updates `lastSpeechEndedAtMs` & `speechEndedEvent = true` ONLY when RMS drops below
+ *   threshold for `quietConfirmMs` (180ms) AFTER speech was detected on this turn.
  */
 export function observeMicRmsForProfiler(
   state: SpeechEndProfilerState,
   rms: number,
   nowMs: number,
-  quietConfirmMs = LIVE_SPEECH_QUIET_CONFIRM_MS
+  quietConfirmMs = LIVE_SPEECH_QUIET_CONFIRM_MS,
+  thresholdOverride?: number
 ): SpeechEndProfilerState {
-  const speechThreshold = Math.max(0.018, state.noiseFloor * 2.4);
+  const speechThreshold =
+    typeof thresholdOverride === "number" && thresholdOverride > 0
+      ? thresholdOverride
+      : Math.max(LIVE_INPUT_MIN_SPEECH_RMS, state.noiseFloor * LIVE_INPUT_NOISE_MULTIPLIER);
 
   if (rms >= speechThreshold) {
+    const justStarted = !state.hasDetectedSpeechInTurn;
     return {
       ...state,
       userSpeaking: true,
+      hasDetectedSpeechInTurn: true,
+      peakRmsInTurn: Math.max(state.peakRmsInTurn, rms),
       quietSinceMs: null,
+      speechStartedEvent: justStarted,
+      speechEndedEvent: false,
     };
   }
 
   const nextNoiseFloor = Math.max(
-    0.003,
-    Math.min(0.03, state.noiseFloor * 0.94 + rms * 0.06)
+    0.0015,
+    Math.min(0.025, state.noiseFloor * 0.94 + rms * 0.06)
   );
 
   if (!state.userSpeaking) {
     return {
       ...state,
       noiseFloor: nextNoiseFloor,
+      speechStartedEvent: false,
+      speechEndedEvent: false,
     };
   }
 
@@ -1305,8 +1550,12 @@ export function observeMicRmsForProfiler(
     return {
       noiseFloor: nextNoiseFloor,
       userSpeaking: false,
+      hasDetectedSpeechInTurn: state.hasDetectedSpeechInTurn,
+      peakRmsInTurn: state.peakRmsInTurn,
       quietSinceMs: null,
       lastSpeechEndedAtMs: quietSince,
+      speechStartedEvent: false,
+      speechEndedEvent: true,
     };
   }
 
@@ -1314,5 +1563,7 @@ export function observeMicRmsForProfiler(
     ...state,
     noiseFloor: nextNoiseFloor,
     quietSinceMs: quietSince,
+    speechStartedEvent: false,
+    speechEndedEvent: false,
   };
 }

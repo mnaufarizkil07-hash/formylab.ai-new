@@ -40,13 +40,19 @@ import {
   isGoogleDriveConnected,
 } from "../lib/googleDocsClient";
 import {
-  LIVE_CONTEXT_WINDOW_COMPRESSION,
   LIVE_ECHO_GUARD_TAIL_MS,
   LIVE_FSM_STATUS_LABELS,
   LIVE_HIGHPASS_CUTOFF_HZ,
   LIVE_HIGHPASS_Q,
   LIVE_HOTSWAP_TARGET_TURN,
   LIVE_INPUT_CHUNK_SAMPLES,
+  LIVE_INPUT_HANG_TIME_MS,
+  LIVE_INPUT_MIN_SPEECH_RMS,
+  LIVE_INPUT_NOISE_CALIBRATION_MS,
+  LIVE_INPUT_NOISE_MULTIPLIER,
+  LIVE_INPUT_PREROLL_MS,
+  LIVE_INPUT_QUIET_ATTENUATION,
+  LIVE_INPUT_RMS_REPORT_INTERVAL_MS,
   LIVE_INPUT_TARGET_SAMPLE_RATE,
   LIVE_MAX_AUTO_RECONNECTS,
   LIVE_PLAYBACK_FADE_IN_MS,
@@ -62,6 +68,7 @@ import {
   LIVE_TURN_WATCHDOG_MS,
   LIVE_VOICE_OPTIONS,
   LiveMemoryMessage,
+  LiveThinkingConfigValue,
   LiveVoiceFsmState,
   LiveVoiceName,
   SpeechEndProfilerState,
@@ -71,11 +78,13 @@ import {
   buildDeterministicMemoryPrompt,
   classifyLiveVoicePillars,
   computeInt16PcmRms,
+  createAdaptiveSoftAttenuator,
   createContinuousResampler,
   createSpeechEndProfilerState,
   extractLatestFormulaTableFromMessages,
   extractLocalFactSummaryFallback,
   formatLiveConnectionError,
+  getLiveThinkingConfigForModel,
   getVoiceMemoryStorageKey,
   hasGoogleSearchGrounding,
   int16PcmToBase64,
@@ -799,12 +808,8 @@ interface LiveTokenApiResponse {
   voiceName?: LiveVoiceName;
   systemInstruction?: string;
   tools?: Tool[];
-  thinkingConfig?: LiveConnectConfig["thinkingConfig"];
+  thinkingConfig?: LiveThinkingConfigValue | LiveConnectConfig["thinkingConfig"];
   realtimeInputConfig?: LiveConnectConfig["realtimeInputConfig"];
-  contextWindowCompression?: {
-    triggerTokens: string;
-    slidingWindow: { targetTokens: string };
-  };
   remainingCandidatesCount?: number;
   error?: string;
 }
@@ -1007,11 +1012,14 @@ function getRecentlyFailedLiveModels(): string[] {
 }
 
 /**
- * Pure Off-Main-Thread 16kHz Int16 PCM Mic Capture AudioWorklet (100% Native Server VAD):
- * - Continuous fractional-phase accumulator resampler storing `_lastSample` & `_phase`
- *   across 128-sample blocks (zero boundary clicks/dropouts across 48kHz / 44.1kHz -> 16kHz).
- * - Emits tight, uninterrupted 20ms packets (exact 320 samples @ 16kHz) directly to Gemini Live API.
- * - Zero client-side silence gate, zero RMS mute, zero manual turn signals.
+ * Off-Main-Thread 16kHz Int16 PCM Mic Capture AudioWorklet with Adaptive Soft Noise Attenuator:
+ * - Continuous fractional-phase accumulator resampler (320 samples / 20ms @ 16kHz).
+ * - Auto-calibrates room noiseFloor during first 300ms (15 frames).
+ * - Quiet background (< Math.max(noiseFloor * 1.8, 0.008)) is softly attenuated to 0.08x (never hard-muted)
+ *   while buffering raw audio into a 160ms pre-roll ring (8 frames).
+ * - The instant speech hits threshold, flushes 160ms pre-roll + live audio at 1.0x full volume,
+ *   and holds 1.0x for 650ms hang-time so short words ("halo", "oke") are never clipped.
+ * - Reports peak RMS every 60ms to animate the green orb smoothly while LISTENING.
  */
 const PCM_CAPTURE_WORKLET_CODE = `
 class FormylabLivePcmCaptureProcessor extends AudioWorkletProcessor {
@@ -1020,22 +1028,130 @@ class FormylabLivePcmCaptureProcessor extends AudioWorkletProcessor {
     this._targetRate = ${LIVE_INPUT_TARGET_SAMPLE_RATE};
     this._ratio = Math.max(0.25, sampleRate / this._targetRate);
     this._packetSamples = ${LIVE_INPUT_CHUNK_SAMPLES}; // exact 20ms @ 16kHz (320 samples)
-    this._out = new Int16Array(this._packetSamples);
-    this._outIndex = 0;
+    this._frameMs = 20;
+    this._rawFrame = new Float32Array(this._packetSamples);
+    this._rawIndex = 0;
     // Continuous virtual stream V[0] = _lastSample, V[1..len] = ch[0..len-1]
     this._phase = 0.0;
     this._lastSample = 0.0;
+
+    // Adaptive Soft Attenuator + 160ms Pre-Roll + 650ms Hang-Time
+    this._calibrationFrames = Math.max(1, Math.round(${LIVE_INPUT_NOISE_CALIBRATION_MS} / this._frameMs));
+    this._calibratedCount = 0;
+    this._calibrationSum = 0;
+    this._noiseFloor = 0.004;
+    this._minSpeechRms = ${LIVE_INPUT_MIN_SPEECH_RMS};
+    this._noiseMult = ${LIVE_INPUT_NOISE_MULTIPLIER};
+    this._quietGain = ${LIVE_INPUT_QUIET_ATTENUATION};
+    this._preRollMaxFrames = Math.max(1, Math.round(${LIVE_INPUT_PREROLL_MS} / this._frameMs));
+    this._preRollQueue = [];
+    this._hangTimeMs = ${LIVE_INPUT_HANG_TIME_MS};
+    this._hangRemainingMs = 0;
+    this._gateOpen = false;
+    this._currentGain = this._quietGain;
+
+    // 60ms RMS telemetry for real-time green orb pulsing
+    this._rmsIntervalMs = ${LIVE_INPUT_RMS_REPORT_INTERVAL_MS};
+    this._rmsAccumMs = 0;
+    this._rmsWindowPeak = 0;
+  }
+
+  _encodeWithSmoothGain(src, targetGain) {
+    const out = new Int16Array(src.length);
+    const rampLen = Math.min(src.length, 48);
+    const step = rampLen > 0 ? (targetGain - this._currentGain) / rampLen : 0;
+    let g = this._currentGain;
+    for (let i = 0; i < src.length; i++) {
+      if (i < rampLen) {
+        g += step;
+      } else {
+        g = targetGain;
+      }
+      const v = Math.max(-1, Math.min(1, src[i] * g));
+      out[i] = v < 0 ? Math.round(v * 0x8000) : Math.round(v * 0x7fff);
+    }
+    this._currentGain = targetGain;
+    return out;
+  }
+
+  _emitPacket(pcm, rawRms, threshold, isPreRoll) {
+    this.port.postMessage(
+      { type: "pcm", pcm, rawRms, threshold, isPreRoll },
+      [pcm.buffer]
+    );
+  }
+
+  _processCompleteFrame(frame) {
+    let sumSq = 0;
+    for (let i = 0; i < frame.length; i++) {
+      const s = frame[i];
+      sumSq += s * s;
+    }
+    const rawRms = frame.length > 0 ? Math.sqrt(sumSq / frame.length) : 0;
+
+    if (this._calibratedCount < this._calibrationFrames) {
+      this._calibrationSum += Math.min(0.03, rawRms);
+      this._calibratedCount += 1;
+      this._noiseFloor = Math.max(0.0015, Math.min(0.025, this._calibrationSum / this._calibratedCount));
+    }
+
+    const threshold = Math.max(this._noiseFloor * this._noiseMult, this._minSpeechRms);
+
+    if (rawRms >= threshold) {
+      this._hangRemainingMs = this._hangTimeMs;
+      if (!this._gateOpen) {
+        this._gateOpen = true;
+        for (let q = 0; q < this._preRollQueue.length; q++) {
+          const item = this._preRollQueue[q];
+          const prePcm = this._encodeWithSmoothGain(item.samples, 1.0);
+          this._emitPacket(prePcm, item.rawRms, threshold, true);
+        }
+        this._preRollQueue = [];
+      }
+      const livePcm = this._encodeWithSmoothGain(frame, 1.0);
+      this._emitPacket(livePcm, rawRms, threshold, false);
+    } else if (this._gateOpen) {
+      this._hangRemainingMs -= this._frameMs;
+      const hangPcm = this._encodeWithSmoothGain(frame, 1.0);
+      this._emitPacket(hangPcm, rawRms, threshold, false);
+      if (this._hangRemainingMs <= 0) {
+        this._gateOpen = false;
+        this._hangRemainingMs = 0;
+      }
+    } else {
+      if (this._calibratedCount >= this._calibrationFrames) {
+        this._noiseFloor = Math.max(0.0015, Math.min(0.025, this._noiseFloor * 0.96 + rawRms * 0.04));
+      }
+      this._preRollQueue.push({ samples: new Float32Array(frame), rawRms });
+      if (this._preRollQueue.length > this._preRollMaxFrames) {
+        this._preRollQueue.shift();
+      }
+      const quietPcm = this._encodeWithSmoothGain(frame, this._quietGain);
+      this._emitPacket(quietPcm, rawRms, threshold, false);
+    }
+
+    this._rmsAccumMs += this._frameMs;
+    if (rawRms > this._rmsWindowPeak) {
+      this._rmsWindowPeak = rawRms;
+    }
+    if (this._rmsAccumMs >= this._rmsIntervalMs) {
+      this.port.postMessage({
+        type: "rms",
+        rms: this._rmsWindowPeak,
+        noiseFloor: this._noiseFloor,
+        threshold,
+        speaking: this._gateOpen,
+      });
+      this._rmsAccumMs = 0;
+      this._rmsWindowPeak = 0;
+    }
   }
 
   _pushSample(floatVal) {
-    const clamped = Math.max(-1, Math.min(1, floatVal));
-    this._out[this._outIndex++] =
-      clamped < 0 ? Math.round(clamped * 0x8000) : Math.round(clamped * 0x7fff);
-    if (this._outIndex >= this._packetSamples) {
-      const packet = this._out;
-      this._out = new Int16Array(this._packetSamples);
-      this._outIndex = 0;
-      this.port.postMessage(packet, [packet.buffer]);
+    this._rawFrame[this._rawIndex++] = Math.max(-1, Math.min(1, floatVal));
+    if (this._rawIndex >= this._packetSamples) {
+      this._processCompleteFrame(this._rawFrame);
+      this._rawIndex = 0;
     }
   }
 
@@ -2622,7 +2738,10 @@ export function InteractiveVoiceCallOverlay({
           const quietRefTs =
             lastSpeechEndedAtRef.current > 0
               ? lastSpeechEndedAtRef.current
-              : speechProfilerRef.current.quietSinceMs ?? 0;
+              : speechProfilerRef.current.hasDetectedSpeechInTurn &&
+                  speechProfilerRef.current.quietSinceMs
+                ? speechProfilerRef.current.quietSinceMs
+                : 0;
           const sinceSilenceMs =
             quietRefTs > 0 ? Math.max(0, Math.round(nowPerf - quietRefTs)) : 0;
 
@@ -2630,7 +2749,7 @@ export function InteractiveVoiceCallOverlay({
           currentTurnQueueDelayMsRef.current = LIVE_PLAYBACK_PREBUFFER_MS;
 
           console.log(
-            `[VOICE S#${activeSessionIndexRef.current} T#${turnNum}] 1st audio: +${sinceSilenceMs}ms | ring-prebuffer: ${LIVE_PLAYBACK_PREBUFFER_MS}ms`
+            `[VOICE S#${activeSessionIndexRef.current} T#${turnNum}] 1st audio: +${sinceSilenceMs}ms | prebuffer: ${LIVE_PLAYBACK_PREBUFFER_MS}ms`
           );
 
           speechProfilerRef.current = createSpeechEndProfilerState(
@@ -3493,7 +3612,6 @@ export function InteractiveVoiceCallOverlay({
         excludeModels?: string[];
         disableThinkingConfig?: boolean;
         disableCustomVad?: boolean;
-        disableContextCompression?: boolean;
       }): Promise<LiveTokenApiResponse> => {
         const abortController = new AbortController();
         if (isStandby) {
@@ -3516,9 +3634,6 @@ export function InteractiveVoiceCallOverlay({
                 ? { disableThinkingConfig: true }
                 : {}),
               ...(opts?.disableCustomVad ? { disableCustomVad: true } : {}),
-              ...(opts?.disableContextCompression
-                ? { disableContextCompression: true }
-                : {}),
             }),
           });
           const data = (await res.json().catch(() => ({}))) as LiveTokenApiResponse;
@@ -3546,7 +3661,6 @@ export function InteractiveVoiceCallOverlay({
       let lastCloseCode: number | undefined = undefined;
       let disableThinkingConfig = false;
       let disableCustomVad = false;
-      let disableContextCompression = false;
 
       const MAX_LIVE_ATTEMPTS = 7;
 
@@ -3559,7 +3673,6 @@ export function InteractiveVoiceCallOverlay({
           excludeModels: excludedModels,
           disableThinkingConfig,
           disableCustomVad,
-          disableContextCompression,
         });
 
         if (!isStillValid()) {
@@ -3577,6 +3690,10 @@ export function InteractiveVoiceCallOverlay({
           break;
         }
 
+        const resolvedThinkingConfig = disableThinkingConfig
+          ? undefined
+          : tokenCfg.thinkingConfig ?? getLiveThinkingConfigForModel(tokenCfg.model);
+
         const liveConfig: LiveConnectConfig = {
           responseModalities: [Modality.AUDIO],
           speechConfig: {
@@ -3593,9 +3710,6 @@ export function InteractiveVoiceCallOverlay({
           ...(Array.isArray(tokenCfg.tools) && tokenCfg.tools.length > 0
             ? { tools: tokenCfg.tools }
             : {}),
-          ...(tokenCfg.thinkingConfig
-            ? { thinkingConfig: tokenCfg.thinkingConfig }
-            : {}),
           ...(tokenCfg.realtimeInputConfig
             ? { realtimeInputConfig: tokenCfg.realtimeInputConfig }
             : {}),
@@ -3603,10 +3717,11 @@ export function InteractiveVoiceCallOverlay({
           outputAudioTranscription: {},
         };
 
-        // Keep Context Window Compression active (Turns #1-#8 constant latency without affective dialog)
-        if (!disableContextCompression) {
-          (liveConfig as Record<string, unknown>).contextWindowCompression =
-            tokenCfg.contextWindowCompression || LIVE_CONTEXT_WINDOW_COMPRESSION;
+        // Model-aware anti-thinking config (safe cast for thinkingLevel: "minimal" on gemini-3.*-live)
+        // Note: contextWindowCompression intentionally omitted — Hot-Swap every 8 turns keeps context lightweight!
+        if (resolvedThinkingConfig) {
+          (liveConfig as Record<string, unknown>).thinkingConfig =
+            resolvedThinkingConfig;
         }
 
         const ai = new GoogleGenAI({
@@ -3924,22 +4039,14 @@ export function InteractiveVoiceCallOverlay({
           const isConfigRejection =
             parsedCode === 1007 ||
             parsedCode === 1008 ||
-            /invalid argument|unsupported|not supported|thinking|activity|compression|sliding/i.test(
+            /invalid argument|unsupported|not supported|thinking|activity/i.test(
               lastErrorReason
             );
 
           if (
             isConfigRejection &&
-            !disableContextCompression &&
-            /compression|sliding/i.test(lastErrorReason)
-          ) {
-            disableContextCompression = true;
-            continue;
-          }
-          if (
-            isConfigRejection &&
             !disableThinkingConfig &&
-            tokenCfg.thinkingConfig
+            resolvedThinkingConfig
           ) {
             disableThinkingConfig = true;
             continue;
@@ -3952,10 +4059,6 @@ export function InteractiveVoiceCallOverlay({
             disableCustomVad = true;
             continue;
           }
-          if (isConfigRejection && !disableContextCompression) {
-            disableContextCompression = true;
-            continue;
-          }
 
           if (tokenCfg.model && !excludedModels.includes(tokenCfg.model)) {
             excludedModels.push(tokenCfg.model);
@@ -3965,7 +4068,6 @@ export function InteractiveVoiceCallOverlay({
           }
           disableThinkingConfig = false;
           disableCustomVad = false;
-          disableContextCompression = false;
         }
       }
 
@@ -4179,7 +4281,7 @@ export function InteractiveVoiceCallOverlay({
       setLiveError("");
       setFsm("LISTENING");
       console.log(
-        `[VOICE S#${nextIdx}] Connected (voice: ${opened.voiceName}, tools: ALL 4 AUTO)`
+        `[VOICE S#${nextIdx}] Connected (model: ${opened.model}, voice: ${opened.voiceName}, tools: ALL 4 AUTO)`
       );
     } catch (err: unknown) {
       if (err instanceof Error && err.message === "SESSION_CANCELLED") {
@@ -4342,7 +4444,7 @@ export function InteractiveVoiceCallOverlay({
       const micSource = inputCtx.createMediaStreamSource(stream);
       liveMicSourceRef.current = micSource;
 
-      // 100Hz High-Pass BiquadFilterNode (Q = 0.7) filters out AC/fan rumble cleanly
+      // 70Hz High-Pass BiquadFilterNode (Q = 0.7) filters out sub-vocal rumble while preserving full low vocal fundamentals
       const highpassFilter = inputCtx.createBiquadFilter();
       highpassFilter.type = "highpass";
       highpassFilter.frequency.value = LIVE_HIGHPASS_CUTOFF_HZ;
@@ -4359,7 +4461,35 @@ export function InteractiveVoiceCallOverlay({
         activeAnalyserRef.current = micAnalyser;
       }
 
-      const sendPcmChunkToActiveSession = (int16: Int16Array) => {
+      const handleRmsTelemetryForOrb = (rms: number, threshold: number) => {
+        if (
+          !callActiveRef.current ||
+          audioPipelineGenerationRef.current !== pipelineGen ||
+          isMicMutedRef.current ||
+          fsmStateRef.current !== "LISTENING" ||
+          micLockedRef.current
+        ) {
+          return;
+        }
+        // Drive real-time green orb pulse so user gets instant visual feedback when speaking
+        const normalizedPulse = Math.min(
+          1,
+          Math.max(0, (rms - threshold * 0.45) * 9.5)
+        );
+        if (normalizedPulse > 0.02) {
+          speechPulseRef.current = Math.max(
+            speechPulseRef.current * 0.72,
+            normalizedPulse
+          );
+        }
+      };
+
+      const sendPcmChunkToActiveSession = (
+        int16: Int16Array,
+        rawRmsOverride?: number,
+        thresholdOverride?: number,
+        isPreRoll = false
+      ) => {
         const activeSession = activeSessionRef.current;
         if (
           !activeSession ||
@@ -4373,7 +4503,7 @@ export function InteractiveVoiceCallOverlay({
 
         // Strict Zero Self-Interruption Echo Guard:
         // NEVER send mic frames while server turn isn't complete, playback ring buffer isn't drained,
-        // FSM isn't LISTENING, or 350ms room-echo guard tail is still active!
+        // FSM isn't LISTENING, or 150ms room-echo guard tail is still active!
         const nowPerf = performance.now();
         if (
           micLockedRef.current ||
@@ -4386,16 +4516,30 @@ export function InteractiveVoiceCallOverlay({
           return;
         }
 
-        // Read-only RMS latency profiler (never modifies PCM samples, never sends manual VAD signals)
-        const rms = computeInt16PcmRms(int16);
-        const nextProfiler = observeMicRmsForProfiler(
-          speechProfilerRef.current,
-          rms,
-          nowPerf
-        );
-        speechProfilerRef.current = nextProfiler;
-        if (nextProfiler.lastSpeechEndedAtMs > 0) {
-          lastSpeechEndedAtRef.current = nextProfiler.lastSpeechEndedAtMs;
+        // Accurate RMS speech start/end profiler on live (non-preroll) frames
+        if (!isPreRoll) {
+          const measuredRms =
+            typeof rawRmsOverride === "number"
+              ? rawRmsOverride
+              : computeInt16PcmRms(int16);
+          const nextProfiler = observeMicRmsForProfiler(
+            speechProfilerRef.current,
+            measuredRms,
+            nowPerf,
+            undefined,
+            thresholdOverride
+          );
+          speechProfilerRef.current = nextProfiler;
+
+          if (nextProfiler.speechStartedEvent) {
+            console.log(
+              `[VOICE] Speech detected (peak RMS: ${nextProfiler.peakRmsInTurn.toFixed(2)})`
+            );
+          }
+          if (nextProfiler.speechEndedEvent && nextProfiler.lastSpeechEndedAtMs > 0) {
+            lastSpeechEndedAtRef.current = nextProfiler.lastSpeechEndedAtMs;
+            console.log("[VOICE] Speech ended -> waiting AI...");
+          }
         }
 
         const base64Audio = int16PcmToBase64(int16);
@@ -4448,8 +4592,32 @@ export function InteractiveVoiceCallOverlay({
           liveWorkletNodeRef.current = workletNode;
           workletNode.port.onmessage = (event: MessageEvent) => {
             const payload = event.data;
+            if (!payload) return;
             if (payload instanceof Int16Array) {
               sendPcmChunkToActiveSession(payload);
+              return;
+            }
+            if (typeof payload === "object") {
+              if (payload.type === "rms" && typeof payload.rms === "number") {
+                handleRmsTelemetryForOrb(
+                  payload.rms,
+                  typeof payload.threshold === "number"
+                    ? payload.threshold
+                    : LIVE_INPUT_MIN_SPEECH_RMS
+                );
+              } else if (
+                payload.type === "pcm" &&
+                payload.pcm instanceof Int16Array
+              ) {
+                sendPcmChunkToActiveSession(
+                  payload.pcm,
+                  typeof payload.rawRms === "number" ? payload.rawRms : undefined,
+                  typeof payload.threshold === "number"
+                    ? payload.threshold
+                    : undefined,
+                  payload.isPreRoll === true
+                );
+              }
             }
           };
 
@@ -4489,13 +4657,32 @@ export function InteractiveVoiceCallOverlay({
           LIVE_INPUT_TARGET_SAMPLE_RATE,
           LIVE_INPUT_CHUNK_SAMPLES
         );
+        const fallbackAttenuator = createAdaptiveSoftAttenuator();
 
         scriptNode.onaudioprocess = (ev: AudioProcessingEvent) => {
           const ch0 = ev.inputBuffer.getChannelData(0);
           if (ch0 && ch0.length > 0) {
             const packets = fallbackResampler.pushBlock(ch0);
             for (const pkt of packets) {
-              sendPcmChunkToActiveSession(pkt);
+              const floatFrame = new Float32Array(pkt.length);
+              for (let i = 0; i < pkt.length; i++) {
+                floatFrame[i] = pkt[i] / 32768;
+              }
+              const res = fallbackAttenuator.processFrame(floatFrame);
+              if (res.rmsTelemetry) {
+                handleRmsTelemetryForOrb(
+                  res.rmsTelemetry.rms,
+                  res.rmsTelemetry.threshold
+                );
+              }
+              for (const outPkt of res.packets) {
+                sendPcmChunkToActiveSession(
+                  outPkt.pcm,
+                  outPkt.rawRms,
+                  outPkt.threshold,
+                  outPkt.isPreRoll
+                );
+              }
             }
           }
         };
@@ -4537,7 +4724,7 @@ export function InteractiveVoiceCallOverlay({
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
-          autoGainControl: false, // Prevents browser from boosting AC/fan noise while user is quiet
+          autoGainControl: true, // Keeps normal speaking volume healthy; quiet hum handled by 0.08x soft attenuator
           channelCount: 1,
         },
       });
@@ -4673,7 +4860,7 @@ export function InteractiveVoiceCallOverlay({
       setFsm("LISTENING");
 
       console.log(
-        `[VOICE S#${primarySessionId}] Connected (voice: ${opened.voiceName}, tools: ALL 4 AUTO, memory: ${initialMemory.length} chars)`
+        `[VOICE S#${primarySessionId}] Connected (model: ${opened.model}, voice: ${opened.voiceName}, tools: ALL 4 AUTO)`
       );
 
       // Age-based background pre-warming timer (pre-warm standby if session reaches 150s age)

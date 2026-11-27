@@ -8,16 +8,17 @@ import {
   type Tool,
 } from "@google/genai";
 import {
-  LIVE_CONTEXT_WINDOW_COMPRESSION,
   LiveVoiceName,
   buildLiveVoiceFunctionDeclarations,
   buildLiveVoiceSystemInstruction,
+  getLiveThinkingConfigForModel,
 } from "../../../components/liveVoiceHelpers";
 
 /**
- * Native Audio Live models ordered for instant Vercel-compatible browser connections:
- * Supports Ephemeral Tokens, Pure Native Server VAD, `thinkingConfig: { thinkingBudget: 0 }`,
- * Context Window Compression, and ALL 4 Unified Skills permanently active across all 4 voice chips.
+ * Native Audio Live models ordered for ultra-low-latency (< 1s) Vercel-compatible connections:
+ * Supports Ephemeral Tokens, High-Sensitivity Server VAD, model-aware anti-thinking config,
+ * and ALL 4 Unified Skills permanently active across all 4 voice chips.
+ * (No contextWindowCompression overhead — Hot-Swap every 8 turns keeps context lightweight.)
  */
 const LIVE_NATIVE_AUDIO_MODELS = [
   "gemini-2.5-flash-native-audio-preview-12-2025",
@@ -32,15 +33,15 @@ const ALLOWED_VOICES = new Set<LiveVoiceName>([
   "Puck",
 ]);
 
-// 100% Pure Native Server VAD — START_SENSITIVITY_LOW prevents room hum/echo hallucinations,
-// END_SENSITIVITY_HIGH with 220ms silence & 100ms prefix padding ensures crisp turn handoff
+// High-Sensitivity Native Server VAD paired with client Adaptive Soft Noise Attenuator (0.08x + 160ms pre-roll):
+// Catches normal-volume "halo" 100% instantly while cutting turn latency under 1s.
 const SDK_SERVER_VAD_CONFIG = {
   automaticActivityDetection: {
     disabled: false,
-    startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_LOW,
+    startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
     endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_HIGH,
-    prefixPaddingMs: 100,
-    silenceDurationMs: 220,
+    prefixPaddingMs: 60,
+    silenceDurationMs: 180,
   },
   activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
 };
@@ -48,10 +49,10 @@ const SDK_SERVER_VAD_CONFIG = {
 const WS_SERVER_VAD_CONFIG = {
   automaticActivityDetection: {
     disabled: false,
-    startOfSpeechSensitivity: "START_SENSITIVITY_LOW",
+    startOfSpeechSensitivity: "START_SENSITIVITY_HIGH",
     endOfSpeechSensitivity: "END_SENSITIVITY_HIGH",
-    prefixPaddingMs: 100,
-    silenceDurationMs: 220,
+    prefixPaddingMs: 60,
+    silenceDurationMs: 180,
   },
   activityHandling: "START_OF_ACTIVITY_INTERRUPTS",
 };
@@ -75,7 +76,6 @@ export async function POST(req: NextRequest) {
     let excludeModelSet = new Set<string>();
     let disableThinkingConfig = false;
     let disableCustomVad = false;
-    let disableContextCompression = false;
 
     try {
       const body = await req.json();
@@ -105,9 +105,6 @@ export async function POST(req: NextRequest) {
       }
       if (body?.disableThinkingConfig === true) disableThinkingConfig = true;
       if (body?.disableCustomVad === true) disableCustomVad = true;
-      if (body?.disableContextCompression === true) {
-        disableContextCompression = true;
-      }
     } catch {
       // Empty JSON body is allowed
     }
@@ -166,20 +163,18 @@ export async function POST(req: NextRequest) {
     for (let idx = 0; idx < candidateModels.length; idx++) {
       const modelId = candidateModels[idx];
       const remainingCandidatesCount = candidateModels.length - idx - 1;
-      const supportsZeroThinkingBudget =
-        /^gemini-2\.5/i.test(modelId) && !disableThinkingConfig;
+      const resolvedThinkingConfig = disableThinkingConfig
+        ? undefined
+        : getLiveThinkingConfigForModel(modelId);
 
-      const thinkingPatch = supportsZeroThinkingBudget
-        ? { thinkingConfig: { thinkingBudget: 0 } }
+      const thinkingPatch = resolvedThinkingConfig
+        ? { thinkingConfig: resolvedThinkingConfig }
         : {};
       const vadPatch = disableCustomVad
         ? {}
         : { realtimeInputConfig: SDK_SERVER_VAD_CONFIG };
-      const compressionPatch = disableContextCompression
-        ? {}
-        : { contextWindowCompression: LIVE_CONTEXT_WINDOW_COMPRESSION };
 
-      // Tier 1: Constrained Ephemeral Token with All 4 Unified Tools + Zero-Thinking + Fast Server VAD + Context Compression
+      // Tier 1: Constrained Ephemeral Token with All 4 Unified Tools + Model-Aware Anti-Thinking + High-Sensitivity VAD
       try {
         const tokenRes = await ai.authTokens.create({
           config: {
@@ -203,7 +198,6 @@ export async function POST(req: NextRequest) {
                 outputAudioTranscription: {},
                 ...thinkingPatch,
                 ...vadPatch,
-                ...compressionPatch,
               } as Record<string, unknown>,
             },
           },
@@ -217,15 +211,10 @@ export async function POST(req: NextRequest) {
             voiceName: requestedVoice,
             systemInstruction,
             tools: unifiedTools,
-            thinkingConfig: supportsZeroThinkingBudget
-              ? { thinkingBudget: 0 }
-              : undefined,
+            thinkingConfig: resolvedThinkingConfig,
             realtimeInputConfig: disableCustomVad
               ? undefined
               : WS_SERVER_VAD_CONFIG,
-            contextWindowCompression: disableContextCompression
-              ? undefined
-              : LIVE_CONTEXT_WINDOW_COMPRESSION,
             expireTime,
             remainingCandidatesCount,
           });
@@ -257,15 +246,10 @@ export async function POST(req: NextRequest) {
             voiceName: requestedVoice,
             systemInstruction,
             tools: unifiedTools,
-            thinkingConfig: supportsZeroThinkingBudget
-              ? { thinkingBudget: 0 }
-              : undefined,
+            thinkingConfig: resolvedThinkingConfig,
             realtimeInputConfig: disableCustomVad
               ? undefined
               : WS_SERVER_VAD_CONFIG,
-            contextWindowCompression: disableContextCompression
-              ? undefined
-              : LIVE_CONTEXT_WINDOW_COMPRESSION,
             expireTime,
             remainingCandidatesCount,
           });

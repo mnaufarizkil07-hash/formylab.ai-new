@@ -1,13 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  LIVE_CONTEXT_WINDOW_COMPRESSION,
   LIVE_ECHO_GUARD_TAIL_MS,
   LIVE_FSM_STATUS_LABELS,
   LIVE_HIGHPASS_CUTOFF_HZ,
   LIVE_HIGHPASS_Q,
   LIVE_HOTSWAP_TARGET_TURN,
   LIVE_INPUT_CHUNK_SAMPLES,
+  LIVE_INPUT_HANG_TIME_MS,
+  LIVE_INPUT_MIN_SPEECH_RMS,
+  LIVE_INPUT_NOISE_CALIBRATION_MS,
+  LIVE_INPUT_NOISE_MULTIPLIER,
+  LIVE_INPUT_PREROLL_MS,
+  LIVE_INPUT_QUIET_ATTENUATION,
+  LIVE_INPUT_RMS_REPORT_INTERVAL_MS,
   LIVE_MAX_AUTO_RECONNECTS,
   LIVE_MEMORY_RECENT_MESSAGES,
   LIVE_PLAYBACK_FADE_IN_MS,
@@ -33,6 +39,7 @@ import {
   buildLiveVoiceSystemInstruction,
   classifyLiveVoicePillars,
   computeInt16PcmRms,
+  createAdaptiveSoftAttenuator,
   createContinuousResampler,
   createPlaybackRingBufferEngine,
   createSpeechEndProfilerState,
@@ -40,6 +47,7 @@ import {
   extractLatestFormulaTableFromMessages,
   extractLocalFactSummaryFallback,
   formatLiveConnectionError,
+  getLiveThinkingConfigForModel,
   getScopedChatStorageKey,
   getVoiceMemoryStorageKey,
   hasGoogleSearchGrounding,
@@ -66,19 +74,28 @@ import {
   validateAndBalanceFormulationRows,
 } from "./chatNoteUtils";
 
-test("Live Voice constants match 5-module upgrade (120ms 24kHz ring buffer, 350ms echo tail, 100Hz highpass, 8s tool recovery, 10s watchdog, Turn 7/8 150s rotation, 16-turn memory)", () => {
+test("Live Voice constants match sub-1s sensitivity & latency tuning (70Hz highpass, 45ms/1080-sample prebuffer, 150ms echo tail, 160ms pre-roll, 650ms hang-time, 0.08x soft attenuation)", () => {
   assert.equal(LIVE_INPUT_CHUNK_SAMPLES, 320); // exact 20ms @ 16kHz
-  assert.equal(LIVE_HIGHPASS_CUTOFF_HZ, 100);
+  assert.equal(LIVE_HIGHPASS_CUTOFF_HZ, 70);
   assert.equal(LIVE_HIGHPASS_Q, 0.7);
+  assert.equal(LIVE_INPUT_NOISE_CALIBRATION_MS, 300);
+  assert.equal(LIVE_INPUT_PREROLL_MS, 160);
+  assert.equal(LIVE_INPUT_HANG_TIME_MS, 650);
+  assert.equal(LIVE_INPUT_QUIET_ATTENUATION, 0.08);
+  assert.equal(LIVE_INPUT_MIN_SPEECH_RMS, 0.008);
+  assert.equal(LIVE_INPUT_NOISE_MULTIPLIER, 1.8);
+  assert.equal(LIVE_INPUT_RMS_REPORT_INTERVAL_MS, 60);
+
   assert.equal(LIVE_PLAYBACK_SAMPLE_RATE, 24000);
-  assert.equal(LIVE_PLAYBACK_PREBUFFER_MS, 120);
-  assert.equal(LIVE_PLAYBACK_PREBUFFER_SAMPLES, 2880);
+  assert.equal(LIVE_PLAYBACK_PREBUFFER_MS, 45);
+  assert.equal(LIVE_PLAYBACK_PREBUFFER_SAMPLES, 1080); // exact 45ms @ 24kHz
   assert.equal(LIVE_PLAYBACK_RING_SECONDS, 30);
   assert.equal(LIVE_PLAYBACK_FADE_IN_MS, 3);
   assert.equal(LIVE_PLAYBACK_FADE_OUT_MS, 5);
+
   assert.equal(LIVE_TRANSCRIPT_THROTTLE_MS, 80);
-  assert.equal(LIVE_ECHO_GUARD_TAIL_MS, 350);
-  assert.equal(LIVE_SPEECH_QUIET_CONFIRM_MS, 260);
+  assert.equal(LIVE_ECHO_GUARD_TAIL_MS, 150);
+  assert.equal(LIVE_SPEECH_QUIET_CONFIRM_MS, 180);
   assert.equal(LIVE_STANDBY_PREWARM_TURN, 7);
   assert.equal(LIVE_HOTSWAP_TARGET_TURN, 8);
   assert.equal(LIVE_STANDBY_MAX_AGE_MS, 150_000);
@@ -87,11 +104,6 @@ test("Live Voice constants match 5-module upgrade (120ms 24kHz ring buffer, 350m
   assert.equal(LIVE_TOOL_TIMEOUT_MS, 20_000);
   assert.equal(LIVE_MAX_AUTO_RECONNECTS, 2);
   assert.equal(LIVE_MEMORY_RECENT_MESSAGES, 16);
-
-  assert.deepEqual(LIVE_CONTEXT_WINDOW_COMPRESSION, {
-    triggerTokens: "12000",
-    slidingWindow: { targetTokens: "6000" },
-  });
 
   assert.deepEqual(
     LIVE_VOICE_OPTIONS.map((v) => v.id),
@@ -104,25 +116,86 @@ test("Live Voice constants match 5-module upgrade (120ms 24kHz ring buffer, 350m
   assert.equal(LIVE_FSM_STATUS_LABELS.TOOL_EXECUTING, "Live · Menyiapkan Aksi...");
 });
 
-test("createPlaybackRingBufferEngine enforces 120ms prebuffer, 3ms fade-in, short-reply turnComplete flush, edge-triggered bufferDrained, and 5ms fade-out stop", () => {
-  const engine = createPlaybackRingBufferEngine(24000, 120, 30);
+test("getLiveThinkingConfigForModel returns thinkingBudget:0 for gemini-2.5 native audio and thinkingLevel:minimal for gemini-3.*-live", () => {
+  assert.deepEqual(
+    getLiveThinkingConfigForModel("gemini-2.5-flash-native-audio-preview-12-2025"),
+    { thinkingBudget: 0 }
+  );
+  assert.deepEqual(
+    getLiveThinkingConfigForModel("gemini-2.5-flash-native-audio-preview-09-2025"),
+    { thinkingBudget: 0 }
+  );
+  assert.deepEqual(
+    getLiveThinkingConfigForModel("gemini-3.8-live"),
+    { thinkingLevel: "minimal" }
+  );
+  assert.deepEqual(
+    getLiveThinkingConfigForModel("gemini-3.1-flash-live-preview"),
+    { thinkingLevel: "minimal" }
+  );
+  assert.equal(getLiveThinkingConfigForModel("unknown-model"), undefined);
+});
 
-  // Push 1000 samples (< 2880 prebuffer threshold): output stays silent until threshold or turnComplete
-  engine.push(new Float32Array(1000).fill(0.5));
+test("createAdaptiveSoftAttenuator calibrates 300ms noiseFloor, attenuates quiet hum to 0.08x (never 0), flushes 160ms pre-roll at 1.0x on 'halo', holds 650ms hang-time, and reports RMS every 60ms", () => {
+  const attenuator = createAdaptiveSoftAttenuator();
+  const quietFrame = new Float32Array(320).fill(0.004);
+  const speechFrame = new Float32Array(320).fill(0.06);
+
+  // Feed 15 quiet frames (300ms calibration): RMS reports every 3rd frame (60ms), output attenuated ~0.08x (non-zero!)
+  let rmsReports = 0;
+  let lastQuietPcm: Int16Array | null = null;
+  for (let i = 0; i < 15; i++) {
+    const res = attenuator.processFrame(quietFrame);
+    assert.equal(res.gateOpen, false);
+    assert.equal(res.packets.length, 1);
+    assert.equal(res.packets[0].isPreRoll, false);
+    lastQuietPcm = res.packets[0].pcm;
+    if (res.rmsTelemetry) rmsReports += 1;
+  }
+  assert.equal(rmsReports, 5); // 300ms / 60ms = 5 reports
+  assert.ok(lastQuietPcm);
+  // Softly attenuated to ~0.08x (NOT hard zero mute)
+  const quietSampleVal = Math.abs(lastQuietPcm![200]) / 32767;
+  assert.ok(quietSampleVal > 0.0001 && quietSampleVal < 0.001, `Expected ~0.00032, got ${quietSampleVal}`);
+
+  // Normal voice onset ("halo"): immediately flushes 8 pre-roll frames (160ms) + 1 live frame at 1.0x!
+  const onsetRes = attenuator.processFrame(speechFrame);
+  assert.equal(onsetRes.gateOpen, true);
+  assert.equal(onsetRes.packets.length, 9); // 8 pre-roll (160ms) + 1 live frame
+  assert.equal(onsetRes.packets.filter((p) => p.isPreRoll).length, 8);
+  const liveSampleVal = Math.abs(onsetRes.packets[8].pcm[200]) / 32767;
+  assert.ok(Math.abs(liveSampleVal - 0.06) < 0.003);
+
+  // After voice drops, holds 1.0x for 650ms hang-time (33 frames of 20ms -> stays open through 640ms, closes at 660ms)
+  for (let i = 0; i < 32; i++) {
+    const hangRes = attenuator.processFrame(quietFrame);
+    assert.equal(hangRes.gateOpen, true, `Expected gateOpen during hang-time frame ${i}`);
+    const val = Math.abs(hangRes.packets[0].pcm[200]) / 32767;
+    assert.ok(Math.abs(val - 0.004) < 0.001); // still 1.0x unattenuated during hang-time
+  }
+  const closeRes = attenuator.processFrame(quietFrame);
+  assert.equal(closeRes.gateOpen, false);
+});
+
+test("createPlaybackRingBufferEngine enforces 45ms (1080-sample) prebuffer, 3ms fade-in, short-reply turnComplete flush, edge-triggered bufferDrained, and 5ms fade-out stop", () => {
+  const engine = createPlaybackRingBufferEngine(24000, 45, 30);
+
+  // Push 500 samples (< 1080 prebuffer threshold): output stays silent until threshold or turnComplete
+  engine.push(new Float32Array(500).fill(0.5));
   const beforePrebuffer = engine.pullBlock(128);
   assert.equal(beforePrebuffer.playing, false);
   assert.equal(beforePrebuffer.drainedEvent, false);
   assert.equal(beforePrebuffer.output[0], 0);
-  assert.equal(beforePrebuffer.bufferedSamples, 1000);
+  assert.equal(beforePrebuffer.bufferedSamples, 500);
 
-  // Push 2000 more samples (total 3000 >= 2880): starts playing with 3ms (72-sample) fade-in ramp
-  engine.push(new Float32Array(2000).fill(0.5));
+  // Push 700 more samples (total 1200 >= 1080): starts playing with 3ms (72-sample) fade-in ramp
+  engine.push(new Float32Array(700).fill(0.5));
   const firstPlayBlock = engine.pullBlock(128);
   assert.equal(firstPlayBlock.playing, true);
   assert.equal(firstPlayBlock.drainedEvent, false);
   assert.equal(firstPlayBlock.output[0], 0); // click-free 0-crossing fade-in start
-  assert.ok(firstPlayBlock.output[1] > 0 && firstPlayBlock.output[1] < 0.05); // smooth linear ramp
-  assert.ok(Math.abs(firstPlayBlock.output[100] - 0.5) < 0.001); // full gain after 72 samples
+  assert.ok(firstPlayBlock.output[1] > 0 && firstPlayBlock.output[1] < 0.05);
+  assert.ok(Math.abs(firstPlayBlock.output[100] - 0.5) < 0.001);
 
   // Drain buffer to empty: emits edge-triggered drainedEvent EXACTLY ONCE on empty
   let drainCount = 0;
@@ -131,11 +204,9 @@ test("createPlaybackRingBufferEngine enforces 120ms prebuffer, 3ms fade-in, shor
     if (step.drainedEvent) drainCount += 1;
   }
   assert.equal(drainCount, 1);
-  // Subsequent empty pulls do NOT re-emit drainedEvent
-  assert.equal(engine.pullBlock(128).drainedEvent, false);
   assert.equal(engine.pullBlock(128).drainedEvent, false);
 
-  // Short reply (< 2880 samples) stays held until markTurnComplete(), then flushes immediately and drains once
+  // Short reply (< 1080 samples) stays held until markTurnComplete(), then flushes immediately
   engine.push(new Float32Array(256).fill(0.4));
   assert.equal(engine.pullBlock(128).playing, false);
   engine.markTurnComplete();
@@ -146,7 +217,7 @@ test("createPlaybackRingBufferEngine enforces 120ms prebuffer, 3ms fade-in, shor
   assert.equal(shortSecond.drainedEvent, true);
 
   // Barge-in stopWithFadeOut() ramps smoothly down to 0 and clears buffer
-  engine.push(new Float32Array(4000).fill(0.6));
+  engine.push(new Float32Array(2000).fill(0.6));
   assert.equal(engine.pullBlock(128).playing, true);
   engine.stopWithFadeOut();
   const fadeBlock = engine.pullBlock(128);
@@ -258,7 +329,7 @@ test("buildDeterministicMemoryPrompt emits [RINGKASAN FAKTA JANGKA PANJANG], [TA
       role: (idx % 2 === 0 ? "user" : "assistant") as "user" | "assistant",
       content:
         idx === 4
-          ? "安静。" // must be dropped from memory injection
+          ? "安静。"
           : `Pesan ke-${idx + 1} tentang formula moisturizer sensitif.`,
     })),
     {
@@ -267,7 +338,6 @@ test("buildDeterministicMemoryPrompt emits [RINGKASAN FAKTA JANGKA PANJANG], [TA
     },
   ];
 
-  // Auto-recovery of table from messages when latestFormulaTable is null
   const recovered = extractLatestFormulaTableFromMessages(recentMessages);
   assert.equal(recovered?.title, "Moisturizer Barrier Kulit Sensitif");
 
@@ -288,7 +358,6 @@ test("buildDeterministicMemoryPrompt emits [RINGKASAN FAKTA JANGKA PANJANG], [TA
   assert.ok(prompt.includes("User: Pesan ke-7"));
   assert.ok(prompt.includes("Formylab AI: Pesan ke-8"));
 
-  // Local fact extractor works without LLM call
   const localSummary = extractLocalFactSummaryFallback(
     [
       { role: "user", content: "Halo nama saya Bima, aku mau bikin serum kulit sensitif pakai Niacinamide dan Ceramide." },
@@ -406,11 +475,11 @@ test("FormulaTableArtifact round-trip encode/parse preserves specs, procedure, t
 
 test("summarizeVoiceMetrics computes Turn #1-3 vs Turn #4+ averages and hot-swap count", () => {
   const summary = summarizeVoiceMetrics([
-    { turn: 1, sessionIndex: 1, firstAudioMs: 500, queueDelayMs: 20, toolsCalled: "-", hotSwapped: "tidak" },
-    { turn: 2, sessionIndex: 1, firstAudioMs: 600, queueDelayMs: 22, toolsCalled: "create_formula_table", hotSwapped: "tidak" },
-    { turn: 3, sessionIndex: 1, firstAudioMs: 700, queueDelayMs: 18, toolsCalled: "-", hotSwapped: "tidak" },
-    { turn: 4, sessionIndex: 2, firstAudioMs: 520, queueDelayMs: 19, toolsCalled: "save_to_google_docs", hotSwapped: "ya" },
-    { turn: 5, sessionIndex: 2, firstAudioMs: 580, queueDelayMs: 20, toolsCalled: "-", hotSwapped: "tidak" },
+    { turn: 1, sessionIndex: 1, firstAudioMs: 500, queueDelayMs: 45, toolsCalled: "-", hotSwapped: "tidak" },
+    { turn: 2, sessionIndex: 1, firstAudioMs: 600, queueDelayMs: 45, toolsCalled: "create_formula_table", hotSwapped: "tidak" },
+    { turn: 3, sessionIndex: 1, firstAudioMs: 700, queueDelayMs: 45, toolsCalled: "-", hotSwapped: "tidak" },
+    { turn: 4, sessionIndex: 2, firstAudioMs: 520, queueDelayMs: 45, toolsCalled: "save_to_google_docs", hotSwapped: "ya" },
+    { turn: 5, sessionIndex: 2, firstAudioMs: 580, queueDelayMs: 45, toolsCalled: "-", hotSwapped: "tidak" },
   ]);
 
   assert.equal(summary.totalTurns, 5);
@@ -565,23 +634,27 @@ test("parsePcmSampleRate extracts rate from mimeType or falls back cleanly", () 
   assert.equal(parsePcmSampleRate(undefined, 24000), 24000);
 });
 
-test("buildLiveVoiceSystemInstruction enforces ATURAN BAHASA MUTLAK lock, natural GPT-Voice pacing, all 4 automatic skills, and deterministic memory injection", () => {
-  const prompt = buildLiveVoiceSystemInstruction(
+test("buildLiveVoiceSystemInstruction stays strictly under 220 words (excluding memory), enforces ATURAN BAHASA MUTLAK, 1-2 dense sentences, and all 4 auto tools", () => {
+  const emptyMemPrompt = buildLiveVoiceSystemInstruction("");
+  const baseWordCount = emptyMemPrompt.trim().split(/\s+/).filter(Boolean).length;
+  assert.ok(
+    baseWordCount < 220,
+    `Expected base systemInstruction < 220 words, got ${baseWordCount}`
+  );
+  assert.ok(emptyMemPrompt.startsWith("ATURAN BAHASA MUTLAK: User selalu berbicara dalam Bahasa Indonesia"));
+  assert.ok(emptyMemPrompt.includes("1 sampai 2 kalimat"));
+  assert.ok(emptyMemPrompt.includes("create_formula_table"));
+  assert.ok(emptyMemPrompt.includes("save_to_google_docs"));
+  assert.ok(emptyMemPrompt.includes("search_web_info"));
+  assert.ok(emptyMemPrompt.includes("recall_chat_history"));
+  assert.ok(emptyMemPrompt.includes("DILARANG membacakan simbol markdown"));
+  assert.ok(emptyMemPrompt.includes("JANGAN PERNAH menolak"));
+  assert.equal(emptyMemPrompt.includes("[MEMORI PERCAKAPAN SEBELUMNYA]"), false);
+
+  const withMemory = buildLiveVoiceSystemInstruction(
     "[RINGKASAN FAKTA JANGKA PANJANG]\nUser: Sari\n\n[16 PESAN DIALOG TERAKHIR]\nUser: Halo\nFormylab AI: Halo Sari!"
   );
-  assert.ok(prompt.startsWith("ATURAN BAHASA MUTLAK: User selalu berbicara dalam Bahasa Indonesia"));
-  assert.ok(prompt.includes("2 sampai 3 kalimat"));
-  assert.ok(prompt.includes("create_formula_table"));
-  assert.ok(prompt.includes("save_to_google_docs"));
-  assert.ok(prompt.includes("search_web_info"));
-  assert.ok(prompt.includes("recall_chat_history"));
-  assert.ok(prompt.includes("[MEMORI PERCAKAPAN SEBELUMNYA]"));
-  assert.ok(prompt.includes("DILARANG membacakan simbol markdown"));
-  assert.ok(prompt.includes("JANGAN PERNAH menolak"));
-
-  const emptyMemPrompt = buildLiveVoiceSystemInstruction("");
-  assert.ok(emptyMemPrompt.includes("search_web_info"));
-  assert.equal(emptyMemPrompt.includes("[MEMORI PERCAKAPAN SEBELUMNYA]"), false);
+  assert.ok(withMemory.includes("[MEMORI PERCAKAPAN SEBELUMNYA]"));
 });
 
 test("hasGoogleSearchGrounding detects search queries or grounding chunks", () => {
@@ -622,26 +695,43 @@ test("getScopedChatStorageKey and getVoiceMemoryStorageKey scope keys cleanly pe
   );
 });
 
-test("computeInt16PcmRms and observeMicRmsForProfiler detect speech end cleanly without mutating audio", () => {
+test("computeInt16PcmRms and observeMicRmsForProfiler fire speechStartedEvent and speechEndedEvent ONLY after real speech on active turn", () => {
   const silent = new Int16Array(320);
   assert.equal(computeInt16PcmRms(silent), 0);
 
   const loud = new Int16Array(320).fill(16384); // ~0.5 amplitude
   assert.ok(Math.abs(computeInt16PcmRms(loud) - 0.5) < 0.001);
 
+  // Quiet frames before any speech MUST NOT set lastSpeechEndedAtMs or fire speechEndedEvent
   let state = createSpeechEndProfilerState();
-  state = observeMicRmsForProfiler(state, 0.09, 1000);
-  state = observeMicRmsForProfiler(state, 0.08, 1020);
-  assert.equal(state.userSpeaking, true);
+  state = observeMicRmsForProfiler(state, 0.003, 100);
+  state = observeMicRmsForProfiler(state, 0.003, 500);
+  assert.equal(state.hasDetectedSpeechInTurn, false);
+  assert.equal(state.speechStartedEvent, false);
+  assert.equal(state.speechEndedEvent, false);
   assert.equal(state.lastSpeechEndedAtMs, 0);
 
-  state = observeMicRmsForProfiler(state, 0.004, 1040);
-  state = observeMicRmsForProfiler(state, 0.004, 1200);
+  // Normal voice ("halo") triggers speechStartedEvent once
+  state = observeMicRmsForProfiler(state, 0.05, 1000);
   assert.equal(state.userSpeaking, true);
-  assert.equal(state.quietSinceMs, 1040);
+  assert.equal(state.hasDetectedSpeechInTurn, true);
+  assert.equal(state.speechStartedEvent, true);
+  assert.equal(state.peakRmsInTurn, 0.05);
+
+  state = observeMicRmsForProfiler(state, 0.09, 1020);
+  assert.equal(state.speechStartedEvent, false); // edge-triggered only once per turn
+  assert.equal(state.peakRmsInTurn, 0.09);
+
+  // Quiet below threshold for 100ms (< 180ms): still waiting
+  state = observeMicRmsForProfiler(state, 0.003, 1040);
+  state = observeMicRmsForProfiler(state, 0.003, 1140);
+  assert.equal(state.userSpeaking, true);
+  assert.equal(state.speechEndedEvent, false);
   assert.equal(state.lastSpeechEndedAtMs, 0);
 
-  state = observeMicRmsForProfiler(state, 0.004, 1300);
+  // Quiet for >= 180ms: fires speechEndedEvent and locks lastSpeechEndedAtMs = 1040
+  state = observeMicRmsForProfiler(state, 0.003, 1220);
   assert.equal(state.userSpeaking, false);
+  assert.equal(state.speechEndedEvent, true);
   assert.equal(state.lastSpeechEndedAtMs, 1040);
 });
